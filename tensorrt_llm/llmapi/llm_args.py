@@ -1766,6 +1766,10 @@ class TorchLlmArgs(BaseLlmArgs):
             return 'pytorch'
         return v
 
+    enable_sleep: bool = Field(
+        default=False,
+        description="Enable extra setup to support sleep feature.")
+
     @field_validator('load_format', mode='before')
     @classmethod
     def convert_load_format(cls, v):
@@ -1925,7 +1929,8 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
             enable_min_latency=self.enable_min_latency,
-            stream_interval=self.stream_interval)
+            stream_interval=self.stream_interval,
+            enable_sleep=self.enable_sleep)
 
 
 def update_llm_args_with_extra_dict(

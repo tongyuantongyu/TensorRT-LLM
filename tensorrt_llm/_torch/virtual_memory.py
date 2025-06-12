@@ -39,7 +39,7 @@ def _virtual_address_helper(mark: str, mode: BackedMode):
         pop_virtual_address_allocator()
 
 
-def _scope(mark: str, mode: BackedMode = BackedMode.NONE):
+def _scope(mark: str, mode: BackedMode):
     """A context manager that routes allocations to virtual memory allocator
     using given mark and backed mode.
 
@@ -55,7 +55,7 @@ scope = contextmanager(_scope)
 
 
 @contextmanager
-def maybe_scope(enable: bool, mark: str, mode: BackedMode = BackedMode.NONE):
+def maybe_scope(enable: bool, mark: str, mode: BackedMode):
     if enable:
         yield from _scope(mark, mode)
     else:

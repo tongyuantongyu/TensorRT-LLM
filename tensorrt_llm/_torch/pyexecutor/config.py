@@ -91,6 +91,9 @@ class PyTorchConfig:
     # TODO: make this a per-request parameter
     stream_interval: int = 1
 
+    # Enable extra setup to support sleep feature.
+    enable_sleep: bool = False
+
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'backend',
