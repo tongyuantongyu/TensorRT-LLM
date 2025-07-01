@@ -33,9 +33,11 @@ def _get_torch_pluggable_virtual_memory_allocator():
 def _virtual_address_helper(mark: str, mode: BackedMode):
     stream = torch.cuda.current_stream()
     push_virtual_address_allocator(mark, mode, stream.cuda_stream)
+    print("enter ", mark)
     try:
         yield
     finally:
+        print("exit ", mark)
         pop_virtual_address_allocator()
 
 

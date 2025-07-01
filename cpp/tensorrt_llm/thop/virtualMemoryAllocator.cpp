@@ -25,6 +25,7 @@ extern "C"
         try
         {
             tensorrt_llm::runtime::getVirtualAddressAllocator().allocate(&ptr, size, device);
+            TLLM_LOG_INFO("Torch allocated @ %p, %zu bytes", ptr, size);
         }
         catch (std::exception const& e)
         {
@@ -45,6 +46,7 @@ extern "C"
         try
         {
             tensorrt_llm::runtime::cudaVirtualAddressAllocatorDeallocate(ptr, size);
+            TLLM_LOG_INFO("Torch deallocated @ %p, %zu bytes", ptr, size);
         }
         catch (std::exception const& e)
         {
