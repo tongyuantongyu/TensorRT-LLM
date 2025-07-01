@@ -30,9 +30,11 @@ def _get_torch_pluggable_virtual_memory_allocator():
 def _virtual_memory_helper(tag: str, mode: RestoreMode):
     stream = torch.cuda.current_stream()
     set_virtual_memory_allocator(tag, mode, stream.cuda_stream)
+    print(">>>> enter ", tag)
     try:
         yield
     finally:
+        print(">>>> exit ", tag)
         clear_virtual_memory_allocator()
 
 
