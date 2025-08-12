@@ -22,6 +22,7 @@ except ImportError:
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
+from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
                                  mpi_disabled, nvtx_range, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
@@ -46,7 +47,7 @@ from .handle_logits import HandleLogits
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse, get_draft_token_length)
+                          LlmResponse, get_draft_token_length, LlmResult, executor_request_to_llm_request, PyResult)
 from .model_engine import ModelEngine
 from .resource_manager import ResourceManager
 from .sampler import Sampler, SampleState, SampleStateTensors
@@ -209,6 +210,7 @@ class PyExecutor:
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
+        self.request_accumulator: List[RequestQueueItem] = []
 
         # response used data
         self.response_lock = threading.Lock()
@@ -271,6 +273,8 @@ class PyExecutor:
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
+        self.is_control_request = False
+        self.control_request_id = 0
 
         self.stats_lock = threading.Lock()
         self.stats = []
@@ -493,7 +497,10 @@ class PyExecutor:
             self,
             request: ExecutorRequest,
             query: Optional[List] = None,
-            result_wait_queue: "Optional[ray.actor.ActorHandle]" = None) -> int:
+            result_wait_queue: "Optional[ray.actor.ActorHandle]" = None,
+                        weight_ipc_handles: Optional[dict] = None,
+                        sleep_level: Optional[int] = None,
+                        wakeup_level: Optional[int] = None) -> int:
         """
         Enqueue a new request, query is only used in `StarAttention`.
         """
@@ -501,6 +508,20 @@ class PyExecutor:
         if result_wait_queue is not None:
             with self.response_cv:
                 self.result_wait_queues[req_id] = result_wait_queue
+        ##     if weight_ipc_handles is not None:
+        ##         self.request_queue.put(RequestQueueItem(UPDATE_WEIGHT_REQUEST_ID, None, False, None, weight_ipc_handles))
+        ##     elif sleep_level is not None:
+        ##         self.request_queue.put(RequestQueueItem(SLEEP_REQUEST_ID, None, False, None, None, sleep_level))
+        ##     elif wakeup_level is not None:
+        ##         self.request_queue.put(RequestQueueItem(WAKEUP_REQUEST_ID, None, False, None, None, None, wakeup_level))
+        ##     elif query is not None:
+        ##         self.request_queue.put(RequestQueueItem(req_id, request, query))
+        ##     else:
+        ##         self.request_queue.put(RequestQueueItem(req_id, request))
+        ##     #self.request_queue.put(RequestQueueItem(req_id, request, False, query, weight_ipc_handles, sleep_level, wakeup_level))
+        ##     self.next_req_id += 1
+        ## finally:
+        ##     self.enqueue_lock.release()
         return req_id
 
     def set_gather_responses(self, gather_all_responses):
@@ -802,6 +823,18 @@ class PyExecutor:
                 new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
                     break
+                if self.is_control_request:
+                    self.is_control_request = False
+                    assert len(new_requests) == 1, f"control request should be the only request in the list, but got {len(new_requests)}"
+                    if (new_requests[0].is_update_weight_request()):
+                        self._update_weight(new_requests[0])
+                    elif (new_requests[0].is_sleep_request()):
+                        self._sleep(new_requests[0])
+                    elif (new_requests[0].is_wakeup_request()):
+                        self._wakeup(new_requests[0])
+                    else:
+                        assert False, "Invalid control request"
+                    continue
 
                 if self.kv_cache_transceiver:
                     self._check_disagg_gen_transfer_status()
@@ -1098,6 +1131,18 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 if scheduled_batch is None:
                     break
+                if self.is_control_request:
+                    self.is_control_request = False
+                    assert len(new_requests) == 1, f"control request should be the only request in the list, but got {len(new_requests)}"
+                    if (new_requests[0].is_update_weight_request()):
+                        self._update_weight(new_requests[0])
+                    elif (new_requests[0].is_sleep_request()):
+                        self._sleep(new_requests[0])
+                    elif (new_requests[0].is_wakeup_request()):
+                        self._wakeup(new_requests[0])
+                    else:
+                        assert False, "Invalid control request"
+                    continue
 
                 self._pause_requests(scheduled_batch.paused_requests)
 
@@ -1218,6 +1263,67 @@ class PyExecutor:
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
+    def update_weights(self, weights):
+        # Load weights into the model
+        self.model_engine.model.load_weights(weights)
+        torch.cuda.synchronize()
+
+        # TODO: reset prefix cache
+
+    def update_weight_from_ipc_handles(self, handles):
+        """
+        Update model weights from IPC handles.
+
+        Args:
+            ipc_handles (dict): Dictionary mapping device UUIDs to parameter IPC handles.
+                {device_uuid: all_handles}
+        """
+        from tensorrt_llm._torch.utils import get_device_uuid
+        device_uuid = get_device_uuid(self.device_id)
+
+        if device_uuid not in handles:
+            raise ValueError(f"Device UUID {device_uuid} not found in ipc_handles")
+
+        try:
+            weights = {}
+            all_handles = handles[device_uuid]
+
+            for param_name, tensor_handle in all_handles:
+                func, args = tensor_handle
+                list_args = list(args)
+                list_args[6] = self.device_id  # Set target device
+                tensor = func(*list_args)
+                weights[param_name] = tensor
+
+            self.update_weights(weights)
+
+        except Exception as e:
+            logger.error(f"failed to update weights from ipc handles: {e}")
+            raise e
+
+    def _sleep(self, sleep_request):
+        self.is_sleep_request = False
+        self._enqueue_responses({sleep_request.id: LlmResponse(request_id=sleep_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True), client_id=sleep_request.id)})
+
+    def _wakeup(self, wakeup_request):
+        self.is_wakeup_request = False
+        self._enqueue_responses({wakeup_request.id: LlmResponse(request_id=wakeup_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True), client_id=wakeup_request.id)})
+
+    def _update_weight(self, update_weight_request):
+        self.is_update_weight_request = False
+
+        try:
+            self.update_weight_from_ipc_handles(update_weight_request.weight_ipc_handles)
+            update_weight_response = LlmResponse(request_id=update_weight_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True),     client_id=update_weight_request.id)
+            self._enqueue_responses({update_weight_request.id: update_weight_response})
+        except Exception as e:
+            print(
+                f"Error in update_weights_from_ipc_handles: {e}"
+            )
+            raise e
+            #update_weight_response = LlmResponse(request_id=update_weight_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=False), is_final=True), client_id=update_weight_request.id)
+            #self._enqueue_responses({update_weight_request.id: update_weight_response})
+
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -1234,6 +1340,18 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 if scheduled_batch is None:
                     break
+                if self.is_control_request:
+                    self.is_control_request = False
+                    assert len(new_requests) == 1, f"control request should be the only request in the list, but got {len(new_requests)}"
+                    if (new_requests[0].is_update_weight_request()):
+                        self._update_weight(new_requests[0])
+                    elif (new_requests[0].is_sleep_request()):
+                        self._sleep(new_requests[0])
+                    elif (new_requests[0].is_wakeup_request()):
+                        self._wakeup(new_requests[0])
+                    else:
+                        assert False, "Invalid control request"
+                    continue
                 # In gen-only benchmarking mode, wait until the number of scheduled generation
                 # requests reaches the required threshold before starting forward pass,
                 # to ensure consistent batch sizes for accurate performance measurement.

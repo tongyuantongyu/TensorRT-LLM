@@ -31,7 +31,7 @@ from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
 from .request import CancellingRequest, GenerationRequest
 from .result import IterationResult
 from .utils import (ErrorResponse, RequestError, WorkerCommIpcAddrs,
-                    has_event_loop)
+                    has_event_loop, is_update_weights_response, is_sleep_response, is_wakeup_response)
 
 __all__ = [
     "GenerationExecutorWorker",

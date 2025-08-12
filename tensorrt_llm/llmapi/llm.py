@@ -186,7 +186,7 @@ class BaseLLM:
         self.mpi_session = self.args.mpi_session
 
         if self.args.parallel_config.is_multi_gpu:
-            if get_device_count(
+            if os.getenv("RAY_LOCAL_RANK") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(
                     f"Only {get_device_count()} GPUs are available, but {self.args.parallel_config.world_size} are required."
@@ -674,6 +674,33 @@ class BaseLLM:
                                          llm_build_stats=weakref.proxy(
                                              self.llm_build_stats))
         self._engine_dir, self._hf_model_dir = model_loader()
+
+    def update_weights_from_ipc_handles_async(self, handles: dict):
+        result = self._executor.async_update_weights_from_ipc_handles(handles)
+        return result
+
+    def update_weights_from_ipc_handles(self, handles: dict):
+        result = self.update_weights_from_ipc_handles_async(handles)
+        result.result()
+        return result
+
+    def sleep_async(self, level: int = 1):
+        result = self._executor.async_sleep(level)
+        return result
+
+    def sleep(self, level: int):
+        result = self.sleep_async(level)
+        result.result()
+        return result
+
+    def wakeup_async(self):
+        result = self._executor.async_wakeup()
+        return result
+
+    def wakeup(self):
+        result = self.wakeup_async()
+        result.result()
+        return result
 
     @property
     def _on_trt_backend(self) -> bool:

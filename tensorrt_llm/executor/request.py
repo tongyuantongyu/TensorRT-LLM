@@ -126,12 +126,53 @@ class GenerationRequest:
         self.scheduling_params = scheduling_params
         self.cache_salt_id = cache_salt_id
         self.arrival_time = arrival_time
+        self.weight_ipc_handles: Optional[dict] = None
+        self.sleep_level: Optional[int] = None
+        self.wakeup_level: Optional[int] = None
 
     def set_id(self, id):
-        assert self.id is None, f"Request ID is already set: {self.id}"
-        self.id = id
+        if self.prompt_token_ids != []:
+            assert self.id is None, f"Request ID is already set: {self.id}"
+            self.id = id
         return self
 
+    def set_weight_ipc_handles(self, handles: dict):
+        assert self.prompt_token_ids == [], "Prompt token ids must be empty for weight update request"
+        self.id = -2
+        self.weight_ipc_handles: dict = handles
+        return self
+
+    def set_sleep_level(self, level: int):
+        assert self.prompt_token_ids == [], "Prompt token ids must be empty for sleep request"
+        self.id = -3
+        self.sleep_level = level
+        return self
+
+    def set_wakeup_level(self, level: int):
+        assert self.prompt_token_ids == [], "Prompt token ids must be empty for wakeup request"
+        self.id = -4
+        self.wakeup_level = level
+        return self
+
+    def is_shutdown_request(self) -> bool:
+        return self.id == -1
+
+    def is_weight_update_request(self) -> bool:
+        return self.id == -2
+
+    def is_sleep_request(self) -> bool:
+        return self.id == -3
+
+    def is_wakeup_request(self) -> bool:
+        return self.id == -4
+
+    def is_normal_request(self) -> bool:
+        return self.id > 0
+
+
+
+    def debug_print(self, message: str = ""):
+        print(f"GenerationRequest {self.id} {message}")
 
 class CancellingRequest:
     ''' The request to cancel a generation. '''

@@ -23,7 +23,7 @@ from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..sampling_params import LogprobParams, SamplingParams
-from .utils import ErrorResponse, has_event_loop, is_llm_response
+from .utils import ErrorResponse, has_event_loop, is_llm_response, is_update_weights_response, is_sleep_response, is_wakeup_response
 
 if TYPE_CHECKING:
     from .executor import GenerationExecutor
@@ -272,7 +272,8 @@ class GenerationResultBase:
                 self.aqueue = None
 
             ray.get(self.queue.register.remote(id))
-        else:
+        else:        self._success = False
+
             if has_event_loop():
                 self.aqueue = AsyncQueue()
                 self.queue = self.aqueue.sync_q
@@ -476,6 +477,7 @@ class GenerationResultBase:
                 response_result.deserialize()
 
             self._done = response_result.is_final
+            self._success = True # TODO: replace with response_result._py_result._success
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
@@ -521,6 +523,15 @@ class GenerationResultBase:
             if self._background_error_handler and (
                     handler := self._background_error_handler()):
                 handler()
+        elif is_update_weights_response(response):
+            self._success = response.result._py_result._success
+            self._done = True
+        elif is_sleep_response(response):
+            self._success = response.result._py_result._success
+            self._done = True
+        elif is_wakeup_response(response):
+            self._success = response.result._py_result._success
+            self._done = True
         elif isinstance(response, ErrorResponse):
             if self._background_error_handler is not None and (
                     handler := self._background_error_handler()):
@@ -712,6 +723,10 @@ class GenerationResult(GenerationResultBase):
     def finished(self) -> bool:
         return self._done
 
+    @property
+    def success(self) -> bool:
+        return self._success
+
     def clear_logprob_params(self) -> None:
         # Remove temporary attribute used in executor
         # for a cleaner external-facing output.
@@ -794,7 +809,7 @@ class GenerationResult(GenerationResultBase):
 
     def _repr_fields(self):
         return [
-            'request_id', 'prompt_token_ids', 'outputs', 'finished',
+            'request_id', 'prompt_token_ids', 'outputs', 'finished', 'success',
             "context_logits", "mm_embedding_handle"
         ]
 

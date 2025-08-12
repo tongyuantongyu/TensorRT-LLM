@@ -233,6 +233,7 @@ class PyResult:
                  return_context_logits: bool = False,
                  return_generation_logits: bool = False,
                  exclude_last_generation_logits: bool = False,
+                 success: bool = False,
                  use_chunked_generation_logits: bool = True,
                  chunk_size: int = 8):
         if streaming and use_chunked_generation_logits:
@@ -253,6 +254,7 @@ class PyResult:
             chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
         self._mm_embeddings = None
+        self._success = success
 
     def append_context_logits(self, context_logits: torch.Tensor):
         if self._context_logits:
@@ -342,8 +344,9 @@ class LlmResult:
         return getattr(result, item)
 
     def deserialize(self):
-        self._result = tensorrt_llm.bindings.executor.deserialize_result(
-            self._result)
+        if self._result is not None:
+            self._result = tensorrt_llm.bindings.executor.deserialize_result(
+                self._result)
 
     def get_result(self):
         if tmp_res := tensorrt_llm.bindings.executor.deserialize_result(

@@ -152,8 +152,16 @@ def is_llm_response(instance):
     #  tensorrt_llm._torch.pyexecutor.llm_request.LlmResponse
     # Avoid testing for "result", because an error bindings.executor.Response
     # throws when accessing its result property.
-    return hasattr(instance, "has_error")
+    return hasattr(instance, "has_error") and hasattr(instance, "request_id") and instance.request_id > 0
 
+def is_update_weights_response(instance):
+    return hasattr(instance, "result") and hasattr(instance, "request_id") and instance.request_id == -2
+
+def is_sleep_response(instance):
+    return hasattr(instance, "result") and hasattr(instance, "request_id") and instance.request_id == -3
+
+def is_wakeup_response(instance):
+    return hasattr(instance, "result") and hasattr(instance, "request_id") and instance.request_id == -4
 
 def print_alive_threads():
     assert enable_llm_debug(

@@ -213,6 +213,25 @@ class GenerationExecutor(ABC):
 
         return futures
 
+    def async_update_weights_from_ipc_handles(self, handles: dict):
+        update_weights_request = GenerationRequest([], SamplingParams(end_id=0))
+        update_weights_request.set_weight_ipc_handles(handles)
+        result = self.submit(update_weights_request)
+        return result
+
+    def async_sleep(self, level: int = 1):
+        sleep_request = GenerationRequest([], SamplingParams(end_id=0))
+        sleep_request.set_sleep_level(level)
+        result = self.submit(sleep_request)
+        return result
+
+    def async_wakeup(self):
+        sleep_request = GenerationRequest([], SamplingParams(end_id=0))
+        sleep_request.set_wakeup_level(1)
+        result = self.submit(sleep_request)
+        return result
+
+
     def _get_next_client_id(self):
         # (self._last_client_id + 1) % UINT64_MAX
         self._last_client_id = (self._last_client_id + 1) & ((1 << 64) - 1)
