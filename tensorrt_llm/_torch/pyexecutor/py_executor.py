@@ -446,6 +446,32 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_cancel_request(id)
 
+    def enqueue_sleep_request(self, id: int, sleep_level: int):
+        """
+        Enqueue a sleep request with provided request id and sleep level
+        Args:
+            id (int): The request id for which to sleep
+            sleep_level (int): The sleep level to apply to the request
+        """
+        self.executor_request_queue.enqueue_sleep_request(id, sleep_level)
+
+    def enqueue_wakeup_request(self, id: int, wakeup_level: int):
+        """
+        Enqueue a wakeup request with provided request id
+        Args:
+            id (int): The request id for which to wakeup
+        """
+        self.executor_request_queue.enqueue_wakeup_request(id, wakeup_level)
+
+    def enqueue_update_weight_request(self, id: int, weight_ipc_handles: dict):
+        """
+        Enqueue a update weight request with provided request id and weight ipc handles
+        Args:
+            id (int): The request id for which to update weight
+            weight_ipc_handles (dict): The weight ipc handles to update
+        """
+        self.executor_request_queue.enqueue_update_weight_request(id, weight_ipc_handles)
+
     def shutdown(self):
         """
         Signals the server to shutdown.
@@ -1303,11 +1329,11 @@ class PyExecutor:
 
     def _sleep(self, sleep_request):
         self.is_sleep_request = False
-        self._enqueue_responses({sleep_request.id: LlmResponse(request_id=sleep_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True), client_id=sleep_request.id)})
+        self._enqueue_responses([(sleep_request.id, LlmResponse(request_id=sleep_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True), client_id=sleep_request.id))])
 
     def _wakeup(self, wakeup_request):
         self.is_wakeup_request = False
-        self._enqueue_responses({wakeup_request.id: LlmResponse(request_id=wakeup_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True), client_id=wakeup_request.id)})
+        self._enqueue_responses([(wakeup_request.id, LlmResponse(request_id=wakeup_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True), client_id=wakeup_request.id))])
 
     def _update_weight(self, update_weight_request):
         self.is_update_weight_request = False
@@ -1315,7 +1341,7 @@ class PyExecutor:
         try:
             self.update_weight_from_ipc_handles(update_weight_request.weight_ipc_handles)
             update_weight_response = LlmResponse(request_id=update_weight_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True),     client_id=update_weight_request.id)
-            self._enqueue_responses({update_weight_request.id: update_weight_response})
+            self._enqueue_responses([(update_weight_request.id, update_weight_response)])
         except Exception as e:
             print(
                 f"Error in update_weights_from_ipc_handles: {e}"
@@ -1323,6 +1349,20 @@ class PyExecutor:
             raise e
             #update_weight_response = LlmResponse(request_id=update_weight_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=False), is_final=True), client_id=update_weight_request.id)
             #self._enqueue_responses({update_weight_request.id: update_weight_response})
+
+    def _handle_control_request(self):
+        if len(self.executor_request_queue.control_requests) > 0:
+            assert len(self.executor_request_queue.control_requests) == 1, f"control request should be the only request in the list, but got {len(self.executor_request_queue.control_requests)}"
+            control_request = self.executor_request_queue.control_requests.pop()
+            if (control_request.is_update_weight_request):
+                self._update_weight(control_request)
+            elif (control_request.is_sleep_request):
+                self._sleep(control_request)
+            elif (control_request.is_wakeup_request):
+                self._wakeup(control_request)
+            else:
+                assert False, "Invalid control request"
+
 
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
@@ -1338,6 +1378,8 @@ class PyExecutor:
                     iter_start_time = time.time()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                self._handle_control_request()
+
                 if scheduled_batch is None:
                     break
                 if self.is_control_request:

@@ -343,6 +343,7 @@ def nvml_context() -> Generator[None, None, None]:
 
 def device_id_to_physical_device_id(device_id: int) -> int:
     """Convert a logical device ID to a physical device ID considering CUDA_VISIBLE_DEVICES."""
+    import os
     if "CUDA_VISIBLE_DEVICES" in os.environ:
         device_ids = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
         try:
