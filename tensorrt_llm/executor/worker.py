@@ -416,6 +416,8 @@ def worker_main(
                         "Failed to deliver ready signal to proxy, continuing anyway"
                     )
                 while (req := request_queue.get()) is not None:
+                    ## I like this design for `isINstance(req, ControlRequest)`,
+                    ## but all requests should have Response, so I still reuse the GenerationRequest data path to return Responses.
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
                     elif isinstance(req, GenerationRequest):
