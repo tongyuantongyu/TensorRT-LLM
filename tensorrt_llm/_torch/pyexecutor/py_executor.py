@@ -52,6 +52,8 @@ from .model_engine import ModelEngine
 from .resource_manager import ResourceManager
 from .sampler import Sampler, SampleState, SampleStateTensors
 from .scheduler import RequestScheduler, ScheduledRequests
+from ..virtual_memory import (materialize_with_tag,
+                                     release_with_tag)
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -461,7 +463,7 @@ class PyExecutor:
         Args:
             id (int): The request id for which to wakeup
         """
-        self.executor_request_queue.enqueue_wakeup_request(id, wakeup_level)
+        self.executor_request_queue.enqueue_wakeup_request(id, wakeup_level=wakeup_level)
 
     def enqueue_update_weight_request(self, id: int, weight_ipc_handles: dict):
         """
@@ -486,6 +488,7 @@ class PyExecutor:
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
+
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -1329,16 +1332,37 @@ class PyExecutor:
 
     def _sleep(self, sleep_request):
         self.is_sleep_request = False
+        torch.cuda.synchronize()
+        if (sleep_request.sleep_level == 1):
+            tags = ("model",)
+        elif (sleep_request.sleep_level == 2):
+            tags = ("model", "kv_cache")
+        else:
+            tags = ("model", "draft_model", "kv_cache", "spec", "drafter", "extra")
+        print(f"PyExecutor sleep: {tags}")
+        release_with_tag(*tags)
+        torch.cuda.synchronize()
         self._enqueue_responses([(sleep_request.id, LlmResponse(request_id=sleep_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True), client_id=sleep_request.id))])
 
     def _wakeup(self, wakeup_request):
         self.is_wakeup_request = False
+        torch.cuda.synchronize()
+        if (wakeup_request.wakeup_level == 1):
+            tags = ("model",)
+        elif (wakeup_request.wakeup_level == 2):
+            tags = ("model", "kv_cache")
+        else:
+            tags = ("model", "draft_model", "kv_cache", "spec", "drafter", "extra")
+        print(f"PyExecutor wakeup: {tags}")
+        materialize_with_tag(*tags)
+        torch.cuda.synchronize()
         self._enqueue_responses([(wakeup_request.id, LlmResponse(request_id=wakeup_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True), client_id=wakeup_request.id))])
 
     def _update_weight(self, update_weight_request):
         self.is_update_weight_request = False
 
         try:
+            print(f"update_weight_from_ipc_handles: update_weight_request.id: {update_weight_request.id}")
             self.update_weight_from_ipc_handles(update_weight_request.weight_ipc_handles)
             update_weight_response = LlmResponse(request_id=update_weight_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True),     client_id=update_weight_request.id)
             self._enqueue_responses([(update_weight_request.id, update_weight_response)])
@@ -1352,8 +1376,9 @@ class PyExecutor:
 
     def _handle_control_request(self):
         if len(self.executor_request_queue.control_requests) > 0:
+            #print(f"control requests: {self.executor_request_queue.control_requests}")
             assert len(self.executor_request_queue.control_requests) == 1, f"control request should be the only request in the list, but got {len(self.executor_request_queue.control_requests)}"
-            control_request = self.executor_request_queue.control_requests.pop()
+            control_request = self.executor_request_queue.control_requests.pop(0)
             if (control_request.is_update_weight_request):
                 self._update_weight(control_request)
             elif (control_request.is_sleep_request):
@@ -1362,7 +1387,6 @@ class PyExecutor:
                 self._wakeup(control_request)
             else:
                 assert False, "Invalid control request"
-
 
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)

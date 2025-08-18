@@ -682,23 +682,24 @@ class BaseLLM:
     def update_weights_from_ipc_handles(self, handles: dict):
         result = self.update_weights_from_ipc_handles_async(handles)
         result.result()
+        print(f"update_weights_from_ipc_handles result: {result}")
         return result
 
     def sleep_async(self, level: int = 1):
         result = self._executor.async_sleep(level)
         return result
 
-    def sleep(self, level: int):
+    def sleep(self, level: int = 1):
         result = self.sleep_async(level)
         result.result()
         return result
 
-    def wakeup_async(self):
-        result = self._executor.async_wakeup()
+    def wakeup_async(self, level: int = 1):
+        result = self._executor.async_wakeup(level)
         return result
 
-    def wakeup(self):
-        result = self.wakeup_async()
+    def wakeup(self, level: int = 1):
+        result = self.wakeup_async(level)
         result.result()
         return result
 

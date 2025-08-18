@@ -306,7 +306,10 @@ class trtllm_interface:
         )
         if rank == 0:
             all_handles = {k: v for d in gathered_handles for k, v in d.items()}
-            self.llm.update_weights_from_ipc_handles(all_handles)
+            result = self.llm.update_weights_from_ipc_handles(all_handles)
+            return result
+        else:
+            return None
 
     def update_weights_from_tensor_generator(self, tensor_generator):
         device_uuid = report_device_id()
@@ -317,6 +320,7 @@ class trtllm_interface:
         converted_params = {}
         cur_handles = []
         gate_up = {}
+        stream_step = 0
         for name, param in tensor_generator:
             size_in_bytes = param.element_size() * param.numel()
             if isinstance(param, DTensor):
@@ -343,8 +347,11 @@ class trtllm_interface:
                     continue
 
             if size_in_bytes > cur_available_bytes:
+                stream_step += 1
                 device_handles = {device_uuid: cur_handles}
-                self.update_weights_from_ipc_handles(rank, device_handles)
+                print(f"stream_step: {stream_step}")
+                result = self.update_weights_from_ipc_handles(rank, device_handles)
+                print(f"update_weights_from_ipc_handles result: {result}")
                 cur_available_bytes = total_available_bytes
                 del converted_params
                 converted_params = {}
@@ -369,11 +376,42 @@ class trtllm_interface:
 
         if cur_handles:
             device_handles = {device_uuid: cur_handles}
-            self.update_weights_from_ipc_handles(rank, device_handles)
+            stream_step += 1
+            print(f"stream_step: {stream_step}")
+            result = self.update_weights_from_ipc_handles(rank, device_handles)
+            print(f"update_weights_from_ipc_handles result: {result}")
             cur_available_bytes = total_available_bytes
             del converted_params
             converted_params = {}
             cur_handles = []
+
+def get_current_process_memory_info() -> int:
+    """
+    Returns GPU memory usage for current process in bytes.
+    """
+    # Get current process ID
+    import pynvml
+    current_pid = os.getpid()
+    # Get device handle for GPU 0
+    device_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+    # Get running processes
+    processes = pynvml.nvmlDeviceGetComputeRunningProcesses(device_handle)
+
+    # Find current process
+    for process in processes:
+        if process.pid == current_pid:
+            return process.usedGpuMemory
+
+    return 0
+
+def get_current_mem_info(message: str = ""):
+    mem_allocated = torch.cuda.memory_allocated()
+    mem_reserved = torch.cuda.memory_reserved()
+    mem_free, mem_total = torch.cuda.mem_get_info()
+    process_mem_info = get_current_process_memory_info()
+    print(f"{message} mem_free: {mem_free:,}, mem_total: {mem_total:,}, mem_allocated: {mem_allocated:,}, mem_reserved: {mem_reserved:,}, process_mem_info: {process_mem_info:,}")
+    return mem_free, mem_total, mem_allocated, mem_reserved, process_mem_info
 
 def get_total_available_bytes(pg: dist.ProcessGroup, message: str = "") -> int:
     mem_allocated = torch.cuda.memory_allocated()
@@ -442,11 +480,36 @@ def main():
 
         ## load the model from fsdp
         ## then generate the output again
-        result = trtllm.llm.sleep(1)
+        get_current_mem_info("Before sleep")
+        result = trtllm.llm.sleep(2)
         print(f"sleep result: {result}")
+        get_current_mem_info("After sleep")
 
-        result = trtllm.llm.wakeup()
+        result = trtllm.llm.wakeup(2)
         print(f"wakeup result: {result}")
+        get_current_mem_info("After wakeup")
+
+    trtllm.update_weights_from_tensor_generator(fsdp.per_tensor_generator())
+
+    # generate the output again
+    if rank == 0:
+        outputs = trtllm.llm.generate(prompts, sampling_params)
+        for i, output in enumerate(outputs):
+            prompt = output.prompt
+            generated_text = output.outputs[0].text
+            print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+        ## load the model from fsdp
+        ## then generate the output again
+        get_current_mem_info("Before sleep")
+        result = trtllm.llm.sleep(2)
+        print(f"sleep result: {result}")
+        get_current_mem_info("After sleep")
+
+        result = trtllm.llm.wakeup(2)
+        print(f"wakeup result: {result}")
+        get_current_mem_info("After wakeup")
+
 
     trtllm.update_weights_from_tensor_generator(fsdp.per_tensor_generator())
 

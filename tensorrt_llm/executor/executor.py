@@ -225,9 +225,9 @@ class GenerationExecutor(ABC):
         result = self.submit(sleep_request)
         return result
 
-    def async_wakeup(self):
+    def async_wakeup(self, level: int = 1):
         sleep_request = GenerationRequest([], SamplingParams(end_id=0))
-        sleep_request.set_wakeup_level(1)
+        sleep_request.set_wakeup_level(level)
         result = self.submit(sleep_request)
         return result
 
