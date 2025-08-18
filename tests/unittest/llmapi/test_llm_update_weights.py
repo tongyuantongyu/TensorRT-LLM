@@ -406,11 +406,14 @@ def get_current_process_memory_info() -> int:
     return 0
 
 def get_current_mem_info(message: str = ""):
+    import nvsmi
     mem_allocated = torch.cuda.memory_allocated()
     mem_reserved = torch.cuda.memory_reserved()
     mem_free, mem_total = torch.cuda.mem_get_info()
     process_mem_info = get_current_process_memory_info()
     print(f"{message} mem_free: {mem_free:,}, mem_total: {mem_total:,}, mem_allocated: {mem_allocated:,}, mem_reserved: {mem_reserved:,}, process_mem_info: {process_mem_info:,}")
+    for gpu in nvsmi.get_gpus():
+        print(gpu)
     return mem_free, mem_total, mem_allocated, mem_reserved, process_mem_info
 
 def get_total_available_bytes(pg: dist.ProcessGroup, message: str = "") -> int:
