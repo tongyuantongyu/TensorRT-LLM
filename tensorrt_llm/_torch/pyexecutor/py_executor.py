@@ -1158,20 +1158,10 @@ class PyExecutor:
                     iter_start_time = time.time()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                self._handle_control_request()
+
                 if scheduled_batch is None:
                     break
-                if self.is_control_request:
-                    self.is_control_request = False
-                    assert len(new_requests) == 1, f"control request should be the only request in the list, but got {len(new_requests)}"
-                    if (new_requests[0].is_update_weight_request()):
-                        self._update_weight(new_requests[0])
-                    elif (new_requests[0].is_sleep_request()):
-                        self._sleep(new_requests[0])
-                    elif (new_requests[0].is_wakeup_request()):
-                        self._wakeup(new_requests[0])
-                    else:
-                        assert False, "Invalid control request"
-                    continue
 
                 self._pause_requests(scheduled_batch.paused_requests)
 
