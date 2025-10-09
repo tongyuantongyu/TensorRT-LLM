@@ -2391,6 +2391,9 @@ class PyExecutor:
                 if hasattr(self.drafter, "guided_decoder"):
                     self.guided_decoder.rollback_draft_tokens()
 
+    def reset_prefix_cache(self):
+        self.kv_cache_manager.reset_reuse_state()
+
 
 class DisaggPPTerminationHandler:
     """Handles termination synchronization across pipeline parallel ranks under disaggregated serving.

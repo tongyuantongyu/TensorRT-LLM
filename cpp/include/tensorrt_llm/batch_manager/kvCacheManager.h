@@ -829,7 +829,8 @@ public:
     void resetReuseState()
     {
         mContextBlocksByHash.clear();
-        mCachedBlocksRoot = std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tensorrt_llm::kernels::KVCacheIndex{0});
+        mCachedBlocksRoot
+            = std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tensorrt_llm::kernels::KVCacheIndex{0});
     }
 
 private:
@@ -1257,6 +1258,7 @@ public:
             manager.resetReuseState();
         }
     }
+
 private:
     [[nodiscard]] WindowBlockManager const& windowManagerByLayer(SizeType32 layerIdx) const
     {
