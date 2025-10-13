@@ -870,7 +870,6 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                 for new_name in params_map[names[-1]]:
                     fw = filter_weights('.'.join(names[:-1] + [new_name]),
                                         weights)
-                    # tmp fixes to enable partial updates in old path
                     if not fw:
                         continue
                     if new_name in ['k_proj', 'v_proj']:
@@ -904,11 +903,11 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "True") in ["True", "true", "1", "yes", "y"]:
-        for name, module in tqdm(list(model.named_modules()),
+        for name, module in tqdm(list(model.named_modules(remove_duplicate=False)),
                                  desc="Loading weights"):
             load_single_module(name, module)
     else:
-        all_modules = dict(model.named_modules())
+        all_modules = dict(model.named_modules(remove_duplicate=False))
         serial_load_modules = []
         if preload_weight_modules is not None:
             for module in preload_weight_modules:
@@ -924,9 +923,9 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                 del all_modules[module]
             pbar.close()
 
-        pbar = tqdm(list(model.named_modules()),
+        pbar = tqdm(list(model.named_modules(remove_duplicate=False)),
                     desc="Loading weights concurrently")
-        args_list = [(name, module) for name, module in model.named_modules()
+        args_list = [(name, module) for name, module in model.named_modules(remove_duplicate=False)
                      if name not in serial_load_modules]
         run_concurrently(load_single_module, args_list, pbar=pbar)
 
@@ -955,31 +954,33 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
             if weight_mapper.does_require_special_handling(module_name):
                 module_weights = weight_mapper.apply_callbacks(
                     module, module_name, module_names_breakdown, weights)
-                module.load_weights(weights=module_weights)
+                if module_weights:
+                    module.load_weights(weights=module_weights)
             else:
                 module_weights = weight_mapper.filter_weights(name, weights)
-                if weight_mapper.is_special_instance_module(module):
-                    weight_mapper.handle_special_instance_module(
-                        module, module_name, module_weights)
-
-                elif hasattr(module, 'load_weights'):
-                    if "linear_attn.conv1d" in name:
-                        module_weights['weight'] = module_weights[
-                            'weight'].squeeze(dim=1)
-                    module.load_weights(weights=[module_weights])
-                else:
-                    for n, p in module._parameters.items():
-                        if p is not None:
-                            weight_mapper.handle_manual_copy(
-                                module_name, module_weights, n, p)
+                if module_weights:
+                    if weight_mapper.is_special_instance_module(module):
+                        weight_mapper.handle_special_instance_module(
+                            module, module_name, module_weights)
+                    elif hasattr(module, 'load_weights'):
+                        if module_weights:
+                            if "linear_attn.conv1d" in name:
+                                module_weights['weight'] = module_weights[
+                                    'weight'].squeeze(dim=1)
+                            module.load_weights(weights=[module_weights])
+                    else:
+                        for n, p in module._parameters.items():
+                            if p is not None:
+                                weight_mapper.handle_manual_copy(
+                                    module_name, module_weights, n, p)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "True") in ["True", "true", "1", "yes", "y"]:
-        for name, module in tqdm(list(model.named_modules()),
+        for name, module in tqdm(list(model.named_modules(remove_duplicate=False)),
                                  desc="Loading weights"):
             load_single_module(name, module)
     else:
-        all_modules = dict(model.named_modules())
+        all_modules = dict(model.named_modules(remove_duplicate=False))
         serial_load_modules = []
         if preload_weight_modules is not None:
             for module in preload_weight_modules:
@@ -995,8 +996,8 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                 del all_modules[module]
             pbar.close()
 
-        pbar = tqdm(list(model.named_modules()),
+        pbar = tqdm(list(model.named_modules(remove_duplicate=False)),
                     desc="Loading weights concurrently")
-        args_list = [(name, module) for name, module in model.named_modules()
+        args_list = [(name, module) for name, module in model.named_modules(remove_duplicate=False)
                      if name not in serial_load_modules]
         run_concurrently(load_single_module, args_list, pbar=pbar)
