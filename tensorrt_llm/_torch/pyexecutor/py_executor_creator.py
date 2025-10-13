@@ -41,21 +41,7 @@ from .config_utils import is_mla
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
-from .py_executor import PyExecutor
-
-
-class ExecutorMemoryType(enum.StrEnum):
-    SAMPLER = "sampler"
-    DRAFTER = "drafter"
-    GUIDED_DECODER = "guided_decoder"
-    SPEC_RESOURCES = "spec_resource_manager"
-    INIT_KV_CACHE = "_no_capture_init_kv_cache"
-    INIT_EXTRA_RESOURCES = "_no_capture_init_extra_resources"
-    MODEL_EXTRA = "_no_capture_model_extra"  # TODO: fix crash on torch.cuda.empty_cache()
-    EXTRA_RESOURCES = "executor_extra"
-    KV_CACHE = "kv_cache"
-    MODEL_ENGINE_MAIN = "model"
-    MODEL_ENGINE_DRAFT = "draft_model"
+from .py_executor import PyExecutor, ExecutorMemoryType
 
 
 class _ExecutorMemoryMonitor:

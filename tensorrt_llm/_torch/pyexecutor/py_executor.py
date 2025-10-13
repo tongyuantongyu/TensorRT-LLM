@@ -1,5 +1,6 @@
 import dataclasses
 import datetime
+import enum
 import functools
 import gc
 import os
@@ -144,6 +145,20 @@ class BatchState:
 class BatchStatePP(BatchState):
     microbatch_id: int = -1
     scheduled_ctx_reqs: list[LlmRequest] = None
+
+
+class ExecutorMemoryType(enum.StrEnum):
+    SAMPLER = "sampler"
+    DRAFTER = "drafter"
+    GUIDED_DECODER = "guided_decoder"
+    SPEC_RESOURCES = "spec_resource_manager"
+    INIT_KV_CACHE = "_no_capture_init_kv_cache"
+    INIT_EXTRA_RESOURCES = "_no_capture_init_extra_resources"
+    MODEL_EXTRA = "_no_capture_model_extra"  # TODO: remove _no_capture after torch fix crash on torch.cuda.empty_cache()
+    EXTRA_RESOURCES = "executor_extra"
+    KV_CACHE = "kv_cache"
+    MODEL_ENGINE_MAIN = "model"
+    MODEL_ENGINE_DRAFT = "draft_model"
 
 
 class PyExecutor:
@@ -1274,13 +1289,26 @@ class PyExecutor:
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
-    def _handle_sleep(self, sleep_request):
-        if (sleep_request.sleep_level == 1):
-            tags = ("model",)
-        elif (sleep_request.sleep_level == 2):
-            tags = ("model", "kv_cache")
+    @staticmethod
+    def _get_sleep_wakeup_tags(sleep_level):
+        if sleep_level == 1:
+            return [ExecutorMemoryType.MODEL_ENGINE_MAIN]
+        elif sleep_level == 2:
+            return [ExecutorMemoryType.MODEL_ENGINE_MAIN,
+                    ExecutorMemoryType.KV_CACHE]
         else:
-            tags = ("model", "draft_model", "kv_cache", "spec", "drafter", "extra")
+            return [ExecutorMemoryType.SAMPLER,
+                    ExecutorMemoryType.DRAFTER,
+                    ExecutorMemoryType.GUIDED_DECODER,
+                    ExecutorMemoryType.SPEC_RESOURCES,
+                    ExecutorMemoryType.MODEL_EXTRA,
+                    ExecutorMemoryType.EXTRA_RESOURCES,
+                    ExecutorMemoryType.KV_CACHE,
+                    ExecutorMemoryType.MODEL_ENGINE_MAIN,
+                    ExecutorMemoryType.MODEL_ENGINE_DRAFT]
+
+    def _handle_sleep(self, sleep_request):
+        tags = self._get_sleep_wakeup_tags(sleep_request.sleep_level)
         logger.info(f"PyExecutor sleep: {tags}")
         torch.cuda.synchronize()
         release_with_tag(*tags)
@@ -1288,12 +1316,7 @@ class PyExecutor:
         self._enqueue_responses([(sleep_request.id, LlmResponse(request_id=sleep_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True), client_id=sleep_request.id))])
 
     def _handle_wakeup(self, wakeup_request):
-        if (wakeup_request.wakeup_level == 1):
-            tags = ("model",)
-        elif (wakeup_request.wakeup_level == 2):
-            tags = ("model", "kv_cache")
-        else:
-            tags = ("model", "draft_model", "kv_cache", "spec", "drafter", "extra")
+        tags = self._get_sleep_wakeup_tags(wakeup_request.sleep_level)
         logger.info(f"PyExecutor wakeup: {tags}")
         torch.cuda.synchronize()
         materialize_with_tag(*tags)
@@ -2335,16 +2358,16 @@ class PyExecutor:
     def update_weight_from_ipc_handles(self, handles):
         """
         Update model weights from IPC handles.
-        
+
         Args:
             ipc_handles (dict): Dictionary mapping device UUIDs to parameter IPC handles.
                 {device_uuid: all_handles}
         """
         device_uuid = get_device_uuid(self.device_id)
-        
+
         if device_uuid not in handles:
             raise ValueError(f"Device UUID {device_uuid} not found in ipc_handles")
-            
+
         try:
             weights = {}
             all_handles = handles[device_uuid]
@@ -2357,7 +2380,7 @@ class PyExecutor:
                 weights[param_name] = tensor
 
             self.update_weights(weights)
-                
+
         except Exception as e:
             logger.error(f"failed to update weights from ipc handles: {e}")
             raise

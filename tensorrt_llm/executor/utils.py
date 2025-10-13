@@ -152,7 +152,7 @@ def is_llm_response(instance):
     #  tensorrt_llm._torch.pyexecutor.llm_request.LlmResponse
     # Avoid testing for "result", because an error bindings.executor.Response
     # throws when accessing its result property.
-    return hasattr(instance, "has_error") and hasattr(instance, "request_id") and instance.request_id > 0
+    return hasattr(instance, "has_error") and hasattr(instance, "request_id") and instance.request_id >= 0
 
 def is_update_weights_response(instance):
     return hasattr(instance, "result") and hasattr(instance, "request_id") and instance.request_id == -2
