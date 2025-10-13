@@ -36,6 +36,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
+from tensorrt_llm._torch.utils import get_device_uuid
 
 from ..distributed import Distributed
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -1289,11 +1290,9 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     def update_weights(self, weights):
-        # Load weights into the model
         self.model_engine.model.load_weights(weights)
         torch.cuda.synchronize()
-
-        # TODO: reset prefix cache
+        self.reset_prefix_cache()
 
     def update_weight_from_ipc_handles(self, handles):
         """
@@ -1402,18 +1401,6 @@ class PyExecutor:
 
                 if scheduled_batch is None:
                     break
-                if self.is_control_request:
-                    self.is_control_request = False
-                    assert len(new_requests) == 1, f"control request should be the only request in the list, but got {len(new_requests)}"
-                    if (new_requests[0].is_update_weight_request()):
-                        self._update_weight(new_requests[0])
-                    elif (new_requests[0].is_sleep_request()):
-                        self._sleep(new_requests[0])
-                    elif (new_requests[0].is_wakeup_request()):
-                        self._wakeup(new_requests[0])
-                    else:
-                        assert False, "Invalid control request"
-                    continue
                 # In gen-only benchmarking mode, wait until the number of scheduled generation
                 # requests reaches the required threshold before starting forward pass,
                 # to ensure consistent batch sizes for accurate performance measurement.
@@ -2393,6 +2380,41 @@ class PyExecutor:
 
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()
+
+    def update_weights(self, weights):
+        self.model_engine.model.load_weights(weights)
+        torch.cuda.synchronize()
+        self.reset_prefix_cache()
+
+    def update_weight_from_ipc_handles(self, handles):
+        """
+        Update model weights from IPC handles.
+        
+        Args:
+            ipc_handles (dict): Dictionary mapping device UUIDs to parameter IPC handles.
+                {device_uuid: all_handles}
+        """
+        device_uuid = get_device_uuid(self.device_id)
+        
+        if device_uuid not in handles:
+            raise ValueError(f"Device UUID {device_uuid} not found in ipc_handles")
+            
+        try:
+            weights = {}
+            all_handles = handles[device_uuid]
+
+            for param_name, tensor_handle in all_handles:
+                func, args = tensor_handle
+                list_args = list(args)
+                list_args[6] = self.device_id  # Set target device
+                tensor = func(*list_args)
+                weights[param_name] = tensor
+
+            self.update_weights(weights)
+                
+        except Exception as e:
+            logger.error(f"failed to update weights from ipc handles: {e}")
+            raise
 
 
 class DisaggPPTerminationHandler:

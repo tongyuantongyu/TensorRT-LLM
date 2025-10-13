@@ -200,3 +200,17 @@ class RayGPUWorker(BaseWorker):
 
     def __del__(self):
         self.shutdown()
+
+    def update_weights(self, weights: dict):
+        try:           
+            self.engine.update_weights(weights)              
+        except Exception as e:
+            logger.error(f"Worker rank {self.rank} failed to update weights: {e}")
+            raise
+
+    def update_weights_from_ipc_handles(self, ipc_handles: dict):
+        try:
+            self.engine.update_weight_from_ipc_handles(ipc_handles)
+        except Exception as e:
+            logger.error(f"Worker rank {self.rank} failed to update weights from ipc handles: {e}")
+            raise

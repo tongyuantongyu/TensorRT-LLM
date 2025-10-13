@@ -1,459 +1,189 @@
-import argparse
+from typing import List
+
 import torch
-import torch.distributed as dist
-import atexit
-import os
-from typing import Any, Optional
-from tensorrt_llm import SamplingParams
-from tensorrt_llm import LLM
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    StateDictType,
-    MixedPrecision,
-    ShardedStateDictConfig,
-    FullStateDictConfig
-)
-#from torch.distributed.fsdp.api import ShardedStateDictConfig, StateDictType
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from torch.distributed.tensor import DTensor
+from torch.multiprocessing.reductions import reduce_tensor
 
-def init_distributed():
-    """Initialize distributed training"""
-    if "LOCAL_RANK" not in os.environ:
-        return 1, 0, torch.device("cuda:0")
-
-    # Set default environment variables if not already set
-    if "MASTER_ADDR" not in os.environ:
-        os.environ["MASTER_ADDR"] = "localhost"
-    if "MASTER_PORT" not in os.environ:
-        os.environ["MASTER_PORT"] = "29500"
-
-    dist.init_process_group(backend="cpu:gloo,cuda:nccl")
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-    torch.cuda.set_device(rank)
-    return world_size, rank, torch.device(f"cuda:{rank}")
-
-def exit_distributed():
-    """Exit distributed training"""
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-def report_device_id() -> str:
-    """Report the UUID of the current CUDA device using NVML.
-    Returns:
-        str: UUID of the device in the format "GPU-xxxxx"
-    """
-    from tensorrt_llm._torch.utils import get_device_uuid
-    # Get current device index from torch
-    device_idx = torch.cuda.current_device()
-    # Get device UUID using NVML
-    return get_device_uuid(device_idx)
-
-class fsdp_interface:
-    def __init__(self, model_dir):
-        self.model_dir = model_dir
-        self.world_size = dist.get_world_size()
-        self.rank = dist.get_rank()
-        self.device = torch.device(f"cuda:{self.rank}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-        self.model = self.load_fsdp_model(model_dir)
-
-    def load_fsdp_model(self, model_dir):
-        """Load and initialize FSDP model"""
-        # Initialize distributed setup
-        print(f"World size: {self.world_size}, Rank: {self.rank}, Device: {self.device}")
-
-        # Setup mixed precision policy for FSDP
-        mixed_precision_policy = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            buffer_dtype=torch.float32
-        )
-
-        if self.rank == 0:
-            print(f"Loading FSDP model from {model_dir}")
-
-        # Initialize FSDP model
-        fsdp_model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            device_map=self.device
-        )
-
-        # Print model info
-        if self.rank == 0:
-            total_params = sum(p.numel() for p in fsdp_model.parameters())
-            trainable_params = sum(p.numel() for p in fsdp_model.parameters() if p.requires_grad)
-            print(f"Total parameters: {total_params:,}")
-            print(f"Trainable parameters: {trainable_params:,}")
-            print(f"Model device: {next(fsdp_model.parameters()).device}")
-
-        # Wrap model with FSDP
-        fsdp_model = FSDP(
-            fsdp_model,
-            mixed_precision=mixed_precision_policy,
-            device_id=torch.cuda.current_device(),
-            use_orig_params=True
-        )
-
-        if self.rank == 0:
-            print("FSDP model initialized successfully")
-
-        self._held_streamed_param_reference = None
-        self._held_sharded_state_dict_reference = None
-
-        return fsdp_model
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
+from tensorrt_llm._utils import mpi_disabled
 
 
+class HFModel:
 
-    def per_tensor_generator(self):
-        # If the model is not FSDP, then we need to manually move it to the GPU
-        # For an FSDP model, model.state_dict() will move the params to the GPU
-        if not isinstance(self.model, FSDP):
-            self.model = self.manual_load_to_gpu(self.model)
-            self._held_sharded_state_dict_reference = self.model.state_dict()
-        else:
-            # Get sharded state dict instead of full state dict for FSDP1
-            with FSDP.state_dict_type(
-                self.model,
-                state_dict_type=StateDictType.FULL_STATE_DICT,
-                state_dict_config=FullStateDictConfig()
-            ):
-                self._held_sharded_state_dict_reference = self.model.state_dict()
-        for name, param in self._held_sharded_state_dict_reference.items():
-            yield name, param
+    def __init__(self, model_name: str):
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=torch.bfloat16).to("cuda")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.cuda_device = torch.cuda.current_device()
+        # Set seed for reproducible random initialization (same as TrainingInstance)
+        torch.manual_seed(32)
+        self.all_weights = {}
+        self.device_uuid = [
+            HFModel.get_device_uuid(i) for i in range(torch.cuda.device_count())
+        ]
 
-    @torch.no_grad()
-    def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
-        # If the model is not FSDP, then we need to manually move it to the GPU
-        # For an FSDP model, model.state_dict() will move the params to the GPU
-        if not isinstance(self.model, FSDP):
-            self.model = self.manual_load_to_gpu(self.model)
-            self._held_sharded_state_dict_reference = self.model.state_dict()
-        else:
-            # Get sharded state dict instead of full state dict for FSDP1
-            with FSDP.state_dict_type(
-                self.model,
-                state_dict_type=StateDictType.FULL_STATE_DICT,
-                state_dict_config=FullStateDictConfig()
-            ):
-                self._held_sharded_state_dict_reference = self.model.state_dict()
+    @staticmethod
+    def get_device_uuid(cuda_device: int):
+        from tensorrt_llm._torch.utils import get_device_uuid
+        return get_device_uuid(cuda_device)
 
-        # Collect info for streaming multiple tensors
-        ### state_dict_info = []
-        ### for name, tensor in self._held_sharded_state_dict_reference.items():
-        ###     # dtensor's numel will return complete tensor instead of only local tensor
-        ###     size_in_bytes = tensor.element_size() * tensor.numel()
-        ###     state_dict_info.append((name, size_in_bytes))
-        self.refit_param_info = []
-        for name, tensor in self._held_sharded_state_dict_reference.items():
-            # dtensor's numel will return complete tensor instead of only local tensor
-            size_in_bytes = tensor.element_size() * tensor.numel()
-            self.refit_param_info.append((name, size_in_bytes))
+    def flip_weights(self):
+        # Initialize all the parameters with random values (same as TrainingInstance)
+        for _, p in self.model.named_parameters():
+            p.data = -p.data
 
-        from tensorrt_llm._torch.utils import get_free_memory_bytes
-        #print(f"State dict info: {state_dict_info}")
-        # Collect current available memory for refit
-        ## Get current device index from torch
-        device_idx = torch.cuda.current_device()
-        ## Get device free memory using NVML
-        total_available_bytes = get_free_memory_bytes(device_idx)
-        ## Use 80% of the free memory for safety
-        memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.8")
-        total_available_bytes *= float(memory_ratio)
+        self._replicate_weights()
 
-        return self.refit_param_info, total_available_bytes
+    def _replicate_weights(self):
+        model_weights = []
+        for n, p in self.model.named_parameters():
+            model_weights.append((n, p.detach().clone()))
 
-    @torch.no_grad()
-    def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
-        from torch.distributed.tensor import DTensor
-        from torch.multiprocessing.reductions import reduce_tensor
+        self.all_weights[self.cuda_device] = model_weights
+        for i in range(torch.cuda.device_count()):
+            if i != self.cuda_device:
+                cur_weights = []
+                for n, p in self.all_weights[self.cuda_device]:
+                    cur_weights.append((n, p.to("cuda:" + str(i))))
+                self.all_weights[i] = cur_weights
 
-        assert self._held_sharded_state_dict_reference is not None, (
-            "prepare_weights_for_ipc must be called before get_weights_ipc_handles"
-        )
+    def get_weight_ipc_handles(self, cuda_device: int = None):
+        ret = {}
+        device_list = list(range(
+            torch.cuda.device_count())) if cuda_device is None else [
+                cuda_device
+            ]
+        for device in device_list:
+            all_handles = []
+            for item in self.all_weights[device]:
+                name, p = item
+                handle = reduce_tensor(p)
+                all_handles.append((name, handle))
+            ret[self.device_uuid[device]] = all_handles
+        return ret
 
-        # Clean up the held tensors to reduce peak memory
-        if self._held_streamed_param_reference is not None:
-            del self._held_streamed_param_reference
-            self._held_streamed_param_reference = None
+    def get_weights(self):
+        return dict(self.all_weights[self.cuda_device])
 
-        converted_params = {}
-        for key in keys:
-            # Get full_tensor for dtensor (GPU > 1)
-            if not key.startswith("model."):
-                continue
-            tensor = self._held_sharded_state_dict_reference[key]
-            if isinstance(tensor, DTensor):
-                full_tensor = tensor.full_tensor()
-            else:
-                full_tensor = tensor
-            # Convert parameters to the configured dtype
-            #print(f"FSDP rank {self.rank} name: {key}, shape: {full_tensor.shape}, {full_tensor[0]}")
-            converted_params[key] = full_tensor
+    def generate(self, inputs: List[torch.Tensor], max_new_tokens: int = 50):
+        generated_texts = []
+        generated_token_ids = []
+        for input_ids in inputs:
+            if input_ids.dim() == 1:
+                input_ids = input_ids.unsqueeze(0)
 
-        # Temporary record the full tensor for cleanup
-        # It is needed for cleanup the last full_tensor in the refit process
-        self._held_streamed_param_reference = converted_params
+            input_ids = input_ids.to(self.model.device)
 
-        # Get device UUID for IPC
-        device_uuid = report_device_id()
-        # Create handles for the tensors
-        all_handles = []
-        for key, p in converted_params.items():
-            handle = reduce_tensor(p.detach())
-            all_handles.append((key, handle))
+            ret = self.model.generate(input_ids=input_ids,
+                                      max_new_tokens=max_new_tokens,
+                                      use_cache=True)
 
-        #print(f"device_uuid: {device_uuid}, All handles keys: {[key for key, _ in all_handles]}")
-        print(f"device_uuid: {device_uuid}")
-        return {device_uuid: all_handles}
+            new_tokens = ret[0][input_ids.shape[1]:]
+            generated_token_ids.append(new_tokens)
+            generated_texts.append(
+                self.tokenizer.decode(new_tokens, skip_special_tokens=True))
+        return generated_texts, generated_token_ids
 
-    @torch.no_grad()
-    def prepare_weights_for_ipc_refit(
-        self, _refit_buffer_size_gb: Optional[int] = None
-    ) -> list[list[str]]:
-        """Prepare the weights for IPC.
-
-        Returns:
-            list: A list containing the keys of the parameters, which is grouped by size.
+    def generate_batch_incremental(self, original_prompts: List[str],
+                                   generated_token_ids_list: List[List[int]]):
         """
-        # Get the state_dict_info and available memory from all workers
-        state_dict_info = self.refit_param_info
+        Generate tokens incrementally for each prompt in the batch: [prompt, prompt+token0, prompt+token0+token1, ...]
+        """
+        logits_list = []
 
-        if _refit_buffer_size_gb is not None:
-            total_available_bytes = _refit_buffer_size_gb * (1024**3)
-        else:
-            # Get the minimum available memory from all workers
-            total_available_bytes = min(result[1] for result in state_dict_info)
-
-        # Group tensors by size
-        cur_available_bytes = total_available_bytes
-        grouped_param_keys: list[list[str]] = []
-        keys: list[str] = []
-
-        for key, size_in_bytes in state_dict_info:
-            if size_in_bytes > cur_available_bytes:
-                if keys:
-                    grouped_param_keys.append(keys)
-                    keys = []
-                cur_available_bytes = total_available_bytes
-
-            keys.append(key)
-            cur_available_bytes -= size_in_bytes
-
-        if keys:
-            grouped_param_keys.append(keys)
-
-        return grouped_param_keys
-
-class NamedParam:
-    def __init__(self, name, size, param):
-        self.name = name
-        self.size = size
-        self.param = param
-
-class GateAndUp:
-    def __init__(self):
-        self.gate = None
-        self.up = None
-    def set_gate(self, gate):
-        self.gate = gate
-    def set_up(self, up):
-        self.up = up
-    def get_size(self):
-        return self.gate.size + self.up.size
-    def is_complete(self):
-        return self.gate is not None and self.up is not None
-
-class trtllm_interface:
-    def __init__(self, model_dir, tensor_parallel_size):
-        self.world_size = dist.get_world_size()
-        self.rank = dist.get_rank()
-        self.device = torch.device(f"cuda:{self.rank}")
-        self.model_dir = model_dir
-        self.tensor_parallel_size = tensor_parallel_size
-        self.llm = self.load_trtllm_model(model_dir, tensor_parallel_size)
-
-    def load_trtllm_model(self, model_dir, tensor_parallel_size):
-        if self.rank == 0:
-            print("Loading TensorRT-LLM model")
-            return LLM(
-                model=model_dir,
-                tensor_parallel_size=tensor_parallel_size,
-                #disable_overlap_scheduler=True,
-                #load_format='auto'
-                load_format='dummy',
-                kv_cache_config=KvCacheConfig(
-                    free_gpu_memory_fraction=0.85,
-                    enable_block_reuse=False
-                )
-            )
-        else:
-            return None
-
-    def update_weights_from_ipc_handles(self, rank, device_handles):
-        if rank == 0:
-            gathered_handles = [None for _ in range(dist.get_world_size())]
-        else:
-            gathered_handles = None
-        dist.gather_object(
-            obj=device_handles,
-            object_gather_list=gathered_handles,
-            dst=0
-        )
-        if rank == 0:
-            all_handles = {k: v for d in gathered_handles for k, v in d.items()}
-            result = self.llm.update_weights_from_ipc_handles(all_handles)
-            return result
-        else:
-            return None
-
-    def update_weights_from_tensor_generator(self, tensor_generator):
-        device_uuid = report_device_id()
-        rank = dist.get_rank()
-        from torch.multiprocessing.reductions import reduce_tensor
-        total_available_bytes = 0.7 * (1024**3)
-        cur_available_bytes = total_available_bytes
-        converted_params = {}
-        cur_handles = []
-        gate_up = {}
-        stream_step = 0
-        for name, param in tensor_generator:
-            size_in_bytes = param.element_size() * param.numel()
-            if isinstance(param, DTensor):
-                param = param.full_tensor()
-            gate_up_name = None
-            gate_up_pair = None
-            if "gate_proj" in name:
-                gate_up_name = name.replace("gate_proj", "")
-                if (gate_up_name not in gate_up):
-                    gate_up[gate_up_name] = GateAndUp()
-                assert gate_up[gate_up_name].gate is None
-                gate_up[gate_up_name].set_gate(NamedParam(name, size_in_bytes, param))
-            elif "up_proj" in name:
-                gate_up_name = name.replace("up_proj", "")
-                if (gate_up_name not in gate_up):
-                    gate_up[gate_up_name] = GateAndUp()
-                assert gate_up[gate_up_name].up is None
-                gate_up[gate_up_name].set_up(NamedParam(name, size_in_bytes, param))
-            if (gate_up_name is not None):
-                if gate_up[gate_up_name].is_complete():
-                    gate_up_pair = gate_up.pop(gate_up_name)
-                    size_in_bytes = gate_up_pair.get_size()
+        for i in range(len(original_prompts)):
+            base_token_ids = self.tokenizer.encode(
+                original_prompts[i], return_tensors="pt")[0].to("cuda")
+            cur_logits = []
+            for j in range(len(generated_token_ids_list[i])):
+                if j > 0:
+                    cur_gen_tokens = torch.tensor(
+                        generated_token_ids_list[i][:j]).to("cuda")
+                    cur_token_ids = torch.cat([base_token_ids, cur_gen_tokens],
+                                              dim=-1)
                 else:
-                    continue
+                    cur_token_ids = base_token_ids
 
-            if size_in_bytes > cur_available_bytes:
-                stream_step += 1
-                device_handles = {device_uuid: cur_handles}
-                print(f"stream_step: {stream_step}")
-                result = self.update_weights_from_ipc_handles(rank, device_handles)
-                print(f"update_weights_from_ipc_handles result: {result}")
-                cur_available_bytes = total_available_bytes
-                del converted_params
-                converted_params = {}
-                cur_handles = []
+                ret = self.model.generate(
+                    input_ids=cur_token_ids.unsqueeze(0).cuda(),
+                    max_new_tokens=1,
+                    return_dict_in_generate=True,
+                    output_scores=True)
 
-            assert cur_available_bytes >= size_in_bytes
-            cur_available_bytes -= size_in_bytes
-            if (gate_up_pair is not None):
-                converted_params[gate_up_pair.gate.name] = gate_up_pair.gate.param
-                converted_params[gate_up_pair.up.name] = gate_up_pair.up.param
-                handle = reduce_tensor(gate_up_pair.gate.param.detach())
-                cur_handles.append((gate_up_pair.gate.name, handle))
-                handle = reduce_tensor(gate_up_pair.up.param.detach())
-                cur_handles.append((gate_up_pair.up.name, handle))
-                gate_up_pair = None
-            else:
-                converted_params[name] = param
-                handle = reduce_tensor(param.detach())
-                cur_handles.append((name, handle))
+                cur_logits.append(ret["scores"][0])
+            cur_logits = torch.stack(cur_logits, dim=0)
+            logits_list.append(cur_logits.squeeze(1))
 
-        assert len(gate_up) == 0
+        return logits_list
 
-        if cur_handles:
-            device_handles = {device_uuid: cur_handles}
-            stream_step += 1
-            print(f"stream_step: {stream_step}")
-            result = self.update_weights_from_ipc_handles(rank, device_handles)
-            print(f"update_weights_from_ipc_handles result: {result}")
-            cur_available_bytes = total_available_bytes
-            del converted_params
-            converted_params = {}
-            cur_handles = []
 
-def get_current_process_memory_info() -> int:
-    """
-    Returns GPU memory usage for current process in bytes.
-    """
-    # Get current process ID
-    import pynvml
-    current_pid = os.getpid()
-    # Get device handle for GPU 0
-    device_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+def extract_tokens_from_outputs(outputs):
+    """Extract individual tokens from LLM outputs using token IDs directly"""
+    tokens_list = []
+    for output in outputs:
+        # Get token IDs directly from the output
+        token_ids = output.outputs[0].token_ids
+        tokens_list.append(token_ids)
+    return tokens_list
 
-    # Get running processes
-    processes = pynvml.nvmlDeviceGetComputeRunningProcesses(device_handle)
 
-    # Find current process
-    for process in processes:
-        if process.pid == current_pid:
-            return process.usedGpuMemory
+def compare_logits(logits_list: List[torch.Tensor],
+                   ref_logits_list: List[torch.Tensor],
+                   topk: int = 20,
+                   threshold: float = 0.9):
+    assert len(logits_list) == len(ref_logits_list)
 
-    return 0
+    for i in range(len(logits_list)):
+        assert logits_list[i].shape == ref_logits_list[i].shape
+        lhs_idx = torch.topk(logits_list[i], topk, dim=-1).indices
+        rhs_idx = torch.topk(ref_logits_list[i], topk, dim=-1).indices
+        # Token wise comparison
+        ratios = []
+        for j in range(lhs_idx.shape[0]):
+            lhs_idx_j = lhs_idx[j].tolist()
+            rhs_idx_j = rhs_idx[j].tolist()
+            overlap = set(lhs_idx_j) & set(rhs_idx_j)
+            ratios.append(len(overlap) / len(lhs_idx_j))
 
-def get_current_mem_info(message: str = ""):
-    import nvsmi
-    mem_allocated = torch.cuda.memory_allocated()
-    mem_reserved = torch.cuda.memory_reserved()
-    mem_free, mem_total = torch.cuda.mem_get_info()
-    process_mem_info = get_current_process_memory_info()
-    print(f"{message} mem_free: {mem_free:,}, mem_total: {mem_total:,}, mem_allocated: {mem_allocated:,}, mem_reserved: {mem_reserved:,}, process_mem_info: {process_mem_info:,}")
-    for gpu in nvsmi.get_gpus():
-        print(gpu)
-    return mem_free, mem_total, mem_allocated, mem_reserved, process_mem_info
+        mean_ratio = sum(ratios) / len(ratios)
+        print(f"Prompt {i}: overlap ratio: {mean_ratio:.2%}")
+        assert mean_ratio > threshold, f"Prompt {i}: overlap ratio: {mean_ratio:.2%} is less than {threshold:.2%}"
 
-def get_total_available_bytes(pg: dist.ProcessGroup, message: str = "") -> int:
-    mem_allocated = torch.cuda.memory_allocated()
-    mem_reserved = torch.cuda.memory_reserved()
-    mem_free, mem_total = torch.cuda.mem_get_info()
-    print(f"{message} mem_free: {mem_free:,}, mem_total: {mem_total:,}, mem_allocated: {mem_allocated:,}, mem_reserved: {mem_reserved:,}")
-    mem_free = torch.tensor(mem_free)
-    dist.all_reduce(mem_free, op=dist.ReduceOp.MIN, group=pg)
-    mem_free = mem_free.item()
-    print(f"{message} gathered_mem_free: {mem_free:,}")
-    return mem_free * 0.2
 
-def cleanup():
-    """Cleanup function to destroy process group"""
-    if dist.is_initialized():
-        print(f"Cleaning up process group on rank {dist.get_rank()}")
-        dist.destroy_process_group()
+def run_generate(llm, hf_model, prompts, sampling_params):
+    outputs = llm.generate(prompts, sampling_params)
+    llm_logits = []
+    llm_texts = []
+    print("*" * 50)
+    for output in outputs:
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        llm_logits.append(output.outputs[0].generation_logits)
+        llm_texts.append(generated_text)
+        print(f"Prompt: {prompt!r}\nGenerated text: {generated_text!r}")
+        print("*" * 50)
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="LLM models with the PyTorch workflow.")
+    generated_token_ids_list = extract_tokens_from_outputs(outputs)
+    ref_logits = hf_model.generate_batch_incremental(prompts,
+                                                     generated_token_ids_list)
+    return llm_texts, llm_logits, ref_logits
 
-    parser.add_argument('--model_dir',
-                        type=str,
-                        required=True,
-                        default='/model/Qwen2.5-0.5B-Instruct',
-                        help="Model checkpoint directory.")
 
-    parser.add_argument('--tensor_parallel_size',
-                        type=int,
-                        default=2,
-                        help="Tensor parallel size (number of GPUs to use)")
+def test_llm_update_weights():
+    model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
-    parser.add_argument('--use_fsdp',
-                        action='store_true',
-                        help="Use FSDP model loading instead of direct TensorRT-LLM loading")
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                    free_gpu_memory_fraction=0.1)
 
-    args = parser.parse_args()
+    hf_model = HFModel(model_name)
 
+    llm = LLM(model=model_name,
+              tensor_parallel_size=1,
+              pipeline_parallel_size=1,
+              kv_cache_config=kv_cache_config)
+
+    # Generate texts from the prompts.
     prompts = [
         "Hello, my name is",
         "The president of the United States is",
@@ -461,72 +191,49 @@ def main():
         "The future of AI is",
     ]
 
-    world_size, rank, device = init_distributed()
+    sampling_params = SamplingParams(temperature=0,
+                                     return_generation_logits=True)
 
-    sampling_params = SamplingParams(max_tokens=32)
+    results = []
 
-    # Load FSDP model
-    fsdp = fsdp_interface(args.model_dir)
-    trtllm = trtllm_interface(args.model_dir, args.tensor_parallel_size)
+    print("-" * 20 + "Stage 1: Generate with original model" + "-" * 20)
+    results.append(run_generate(llm, hf_model, prompts, sampling_params))
+    llm_texts, llm_logits, ref_logits = results[0]
+    compare_logits(llm_logits, ref_logits)
 
-    if rank == 0:
-        print(f"Collected handles from all {world_size} ranks:")
+    print("-" * 20 + "Stage 2: Test update with flipped weights" + "-" * 20)
+    hf_model.flip_weights()
+    ipc_handles = hf_model.get_weight_ipc_handles()
 
-    # For FSDP mode, we would need additional logic to integrate withTensorRT-LLM
-    # This is a placeholder for now
-    if rank == 0:
-        outputs = trtllm.llm.generate(prompts, sampling_params)
-        for i, output in enumerate(outputs):
-            prompt = output.prompt
-            generated_text = output.outputs[0].text
-            print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+    if mpi_disabled():
+        llm.collective_rpc("update_weights_from_ipc_handles", (ipc_handles, ))
+    else:
+        llm.update_weights_from_ipc_handles(ipc_handles)
 
-        ## load the model from fsdp
-        ## then generate the output again
-        get_current_mem_info("Before sleep")
-        result = trtllm.llm.sleep(2)
-        print(f"sleep result: {result}")
-        get_current_mem_info("After sleep")
+    results.append(run_generate(llm, hf_model, prompts, sampling_params))
+    llm_texts, llm_logits, ref_logits = results[1]
 
-        result = trtllm.llm.wakeup(2)
-        print(f"wakeup result: {result}")
-        get_current_mem_info("After wakeup")
+    # Compare the logits for this phase since output should be random
+    compare_logits(llm_logits, ref_logits)
 
-    trtllm.update_weights_from_tensor_generator(fsdp.per_tensor_generator())
+    print("-" * 20 +
+          "Stage 3: Update with flipped weights with full tensor API" +
+          "-" * 20)
+    hf_model.flip_weights()
 
-    # generate the output again
-    if rank == 0:
-        outputs = trtllm.llm.generate(prompts, sampling_params)
-        for i, output in enumerate(outputs):
-            prompt = output.prompt
-            generated_text = output.outputs[0].text
-            print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+    if mpi_disabled():
+        llm.collective_rpc("update_weights", (hf_model.get_weights(), ))
+    else:
+        llm.update_weights(hf_model.get_weights())
 
-        ## load the model from fsdp
-        ## then generate the output again
-        get_current_mem_info("Before sleep")
-        result = trtllm.llm.sleep(2)
-        print(f"sleep result: {result}")
-        get_current_mem_info("After sleep")
+    results.append(run_generate(llm, hf_model, prompts, sampling_params))
+    llm_texts, llm_logits, ref_logits = results[2]
 
-        result = trtllm.llm.wakeup(2)
-        print(f"wakeup result: {result}")
-        get_current_mem_info("After wakeup")
+    # This stage, the weights should be the same as the original model, compare the logits and texts.
+    compare_logits(llm_logits, ref_logits)
+    for i in range(len(llm_texts)):
+        assert llm_texts[i] == results[0][0][
+            i], f"Stage 3 texts should be the same as stage 1, while {llm_texts[i]} != {results[0][i]}"
 
-
-    trtllm.update_weights_from_tensor_generator(fsdp.per_tensor_generator())
-
-    # generate the output again
-    if rank == 0:
-        outputs = trtllm.llm.generate(prompts, sampling_params)
-        for i, output in enumerate(outputs):
-            prompt = output.prompt
-            generated_text = output.outputs[0].text
-            print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
-
-    exit_distributed()
-if __name__ == '__main__':
-    main()
-
-# torchrun --nproc_per_node=2 tests/unittest/llmapi/test_llm_update_weights.py --model_dir /model/Qwen2.5-0.5B-Instruct --tensor_parallel_size 2
-# torchrun --nproc_per_node=2 tests/unittest/llmapi/test_llm_update_weights.py --model_dir /model/Qwen2.5-3B-Instruct/ --tensor_parallel_size 2
+if __name__ == "__main__":
+    test_llm_update_weights()
