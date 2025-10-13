@@ -31,7 +31,7 @@ from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
 from .request import CancellingRequest, GenerationRequest
 from .result import IterationResult
 from .utils import (ErrorResponse, RequestError, WorkerCommIpcAddrs,
-                    has_event_loop, is_update_weights_response, is_sleep_response, is_wakeup_response)
+                    has_event_loop)
 
 __all__ = [
     "GenerationExecutorWorker",
@@ -416,8 +416,6 @@ def worker_main(
                         "Failed to deliver ready signal to proxy, continuing anyway"
                     )
                 while (req := request_queue.get()) is not None:
-                    ## I like this design for `isINstance(req, ControlRequest)`,
-                    ## but all requests should have Response, so I still reuse the GenerationRequest data path to return Responses.
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
                     elif isinstance(req, GenerationRequest):

@@ -356,31 +356,6 @@ def device_id_to_physical_device_id(device_id: int) -> int:
     else:
         return device_id
 
-def get_device_uuid(device_idx: int) -> str:
-    """Get the UUID of a CUDA device using NVML."""
-    # Convert logical device index to physical device index
-
-    global_device_idx = device_id_to_physical_device_id(device_idx)
-
-    # Get the device handle and UUID
-    with nvml_context():
-        try:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(global_device_idx)
-            uuid = pynvml.nvmlDeviceGetUUID(handle)
-            # Ensure the UUID is returned as a string, not bytes
-            if isinstance(uuid, bytes):
-                return uuid.decode("utf-8")
-            elif isinstance(uuid, str):
-                return uuid
-            else:
-                raise RuntimeError(
-                    f"Unexpected UUID type: {type(uuid)} for device {device_idx} (global index: {global_device_idx})"
-                )
-        except pynvml.NVMLError as e:
-            raise RuntimeError(
-                f"Failed to get device UUID for device {device_idx} (global index: {global_device_idx}): {e}"
-            )
-
 def get_free_memory_bytes(device_idx: int) -> float:
     """Get the free memory of a CUDA device in bytes using NVML."""
     global_device_idx = device_id_to_physical_device_id(device_idx)

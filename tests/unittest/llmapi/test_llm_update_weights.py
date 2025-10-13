@@ -216,15 +216,16 @@ def test_llm_update_weights():
     # Compare the logits for this phase since output should be random
     compare_logits(llm_logits, ref_logits)
 
+    if not mpi_disabled():
+        # Skip update weights from full tensor test for MPI
+        return
+
     print("-" * 20 +
           "Stage 3: Update with flipped weights with full tensor API" +
           "-" * 20)
     hf_model.flip_weights()
 
-    if mpi_disabled():
-        llm.collective_rpc("update_weights", (hf_model.get_weights(), ))
-    else:
-        llm.update_weights(hf_model.get_weights())
+    llm.collective_rpc("update_weights", (hf_model.get_weights(), ))
 
     results.append(run_generate(llm, hf_model, prompts, sampling_params))
     llm_texts, llm_logits, ref_logits = results[2]

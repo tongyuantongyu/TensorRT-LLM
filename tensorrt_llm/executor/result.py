@@ -262,6 +262,7 @@ class GenerationResultBase:
         self.avg_decoded_tokens_per_iter: Optional[float] = None
         self._done = False
         self.metrics_dict = {}
+        self._success = False
 
         if ray_queue is not None:
             if has_event_loop():
@@ -272,8 +273,7 @@ class GenerationResultBase:
                 self.aqueue = None
 
             ray.get(self.queue.register.remote(id))
-        else:        self._success = False
-
+        else:
             if has_event_loop():
                 self.aqueue = AsyncQueue()
                 self.queue = self.aqueue.sync_q

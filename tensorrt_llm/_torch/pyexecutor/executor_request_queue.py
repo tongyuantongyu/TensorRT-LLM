@@ -275,7 +275,6 @@ class ExecutorRequestQueue:
 
     def enqueue_sleep_request(self, req_id: int, sleep_level: int):
         with self.enqueue_lock:
-            print(f"enqueue_sleep_request: {req_id} {sleep_level}")
             self.request_queue.put(
                 RequestQueueItem(req_id, sleep_level=sleep_level))
 

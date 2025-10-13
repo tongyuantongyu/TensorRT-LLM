@@ -22,7 +22,6 @@ except ImportError:
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
-from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
                                  mpi_disabled, nvtx_range, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
@@ -544,20 +543,6 @@ class PyExecutor:
         if result_wait_queue is not None:
             with self.response_cv:
                 self.result_wait_queues[req_id] = result_wait_queue
-        ##     if weight_ipc_handles is not None:
-        ##         self.request_queue.put(RequestQueueItem(UPDATE_WEIGHT_REQUEST_ID, None, False, None, weight_ipc_handles))
-        ##     elif sleep_level is not None:
-        ##         self.request_queue.put(RequestQueueItem(SLEEP_REQUEST_ID, None, False, None, None, sleep_level))
-        ##     elif wakeup_level is not None:
-        ##         self.request_queue.put(RequestQueueItem(WAKEUP_REQUEST_ID, None, False, None, None, None, wakeup_level))
-        ##     elif query is not None:
-        ##         self.request_queue.put(RequestQueueItem(req_id, request, query))
-        ##     else:
-        ##         self.request_queue.put(RequestQueueItem(req_id, request))
-        ##     #self.request_queue.put(RequestQueueItem(req_id, request, False, query, weight_ipc_handles, sleep_level, wakeup_level))
-        ##     self.next_req_id += 1
-        ## finally:
-        ##     self.enqueue_lock.release()
         return req_id
 
     def set_gather_responses(self, gather_all_responses):
@@ -863,11 +848,11 @@ class PyExecutor:
                     self.is_control_request = False
                     assert len(new_requests) == 1, f"control request should be the only request in the list, but got {len(new_requests)}"
                     if (new_requests[0].is_update_weight_request()):
-                        self._update_weight(new_requests[0])
+                        self._handle_update_weight(new_requests[0])
                     elif (new_requests[0].is_sleep_request()):
-                        self._sleep(new_requests[0])
+                        self._handle_sleep(new_requests[0])
                     elif (new_requests[0].is_wakeup_request()):
-                        self._wakeup(new_requests[0])
+                        self._handle_wakeup(new_requests[0])
                     else:
                         assert False, "Invalid control request"
                     continue
@@ -1289,80 +1274,42 @@ class PyExecutor:
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
-    def update_weights(self, weights):
-        self.model_engine.model.load_weights(weights)
-        torch.cuda.synchronize()
-        self.reset_prefix_cache()
-
-    def update_weight_from_ipc_handles(self, handles):
-        """
-        Update model weights from IPC handles.
-
-        Args:
-            ipc_handles (dict): Dictionary mapping device UUIDs to parameter IPC handles.
-                {device_uuid: all_handles}
-        """
-        from tensorrt_llm._torch.utils import get_device_uuid
-        device_uuid = get_device_uuid(self.device_id)
-
-        if device_uuid not in handles:
-            raise ValueError(f"Device UUID {device_uuid} not found in ipc_handles")
-
-        try:
-            weights = {}
-            all_handles = handles[device_uuid]
-
-            for param_name, tensor_handle in all_handles:
-                func, args = tensor_handle
-                list_args = list(args)
-                list_args[6] = self.device_id  # Set target device
-                tensor = func(*list_args)
-                weights[param_name] = tensor
-
-            self.update_weights(weights)
-
-        except Exception as e:
-            logger.error(f"failed to update weights from ipc handles: {e}")
-            raise e
-
-    def _sleep(self, sleep_request):
-        self.is_sleep_request = False
-        torch.cuda.synchronize()
+    def _handle_sleep(self, sleep_request):
         if (sleep_request.sleep_level == 1):
             tags = ("model",)
         elif (sleep_request.sleep_level == 2):
             tags = ("model", "kv_cache")
         else:
             tags = ("model", "draft_model", "kv_cache", "spec", "drafter", "extra")
-        print(f"PyExecutor sleep: {tags}")
+        logger.info(f"PyExecutor sleep: {tags}")
+        torch.cuda.synchronize()
         release_with_tag(*tags)
         torch.cuda.synchronize()
         self._enqueue_responses([(sleep_request.id, LlmResponse(request_id=sleep_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True), client_id=sleep_request.id))])
 
-    def _wakeup(self, wakeup_request):
-        self.is_wakeup_request = False
-        torch.cuda.synchronize()
+    def _handle_wakeup(self, wakeup_request):
         if (wakeup_request.wakeup_level == 1):
             tags = ("model",)
         elif (wakeup_request.wakeup_level == 2):
             tags = ("model", "kv_cache")
         else:
             tags = ("model", "draft_model", "kv_cache", "spec", "drafter", "extra")
-        print(f"PyExecutor wakeup: {tags}")
+        logger.info(f"PyExecutor wakeup: {tags}")
+        torch.cuda.synchronize()
         materialize_with_tag(*tags)
         torch.cuda.synchronize()
         self._enqueue_responses([(wakeup_request.id, LlmResponse(request_id=wakeup_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True), client_id=wakeup_request.id))])
 
-    def _update_weight(self, update_weight_request):
+    def _handle_update_weight(self, update_weight_request):
         self.is_update_weight_request = False
 
         try:
-            print(f"update_weight_from_ipc_handles: update_weight_request.id: {update_weight_request.id}")
+            logger.info(f"PyExecutor update_weight_from_ipc_handles: update_weight_request.id: {update_weight_request.id}")
             self.update_weight_from_ipc_handles(update_weight_request.weight_ipc_handles)
             update_weight_response = LlmResponse(request_id=update_weight_request.id, result=LlmResult(result=None, py_result=PyResult(0, 0, success=True), is_final=True),     client_id=update_weight_request.id)
             self._enqueue_responses([(update_weight_request.id, update_weight_response)])
         except Exception as e:
-            print(
+            logger.error(
                 f"Error in update_weights_from_ipc_handles: {e}"
             )
             raise e
@@ -1371,15 +1318,14 @@ class PyExecutor:
 
     def _handle_control_request(self):
         if len(self.executor_request_queue.control_requests) > 0:
-            #print(f"control requests: {self.executor_request_queue.control_requests}")
             assert len(self.executor_request_queue.control_requests) == 1, f"control request should be the only request in the list, but got {len(self.executor_request_queue.control_requests)}"
             control_request = self.executor_request_queue.control_requests.pop(0)
             if (control_request.is_update_weight_request):
-                self._update_weight(control_request)
+                self._handle_update_weight(control_request)
             elif (control_request.is_sleep_request):
-                self._sleep(control_request)
+                self._handle_sleep(control_request)
             elif (control_request.is_wakeup_request):
-                self._wakeup(control_request)
+                self._handle_wakeup(control_request)
             else:
                 assert False, "Invalid control request"
 
