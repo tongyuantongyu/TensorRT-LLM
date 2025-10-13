@@ -35,7 +35,7 @@ from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    is_llm_response)
+                    is_llm_response, is_update_weights_response, is_sleep_response, is_wakeup_response)
 
 __all__ = [
     "BaseWorker",
@@ -446,7 +446,15 @@ class BaseWorker(GenerationExecutor):
                 )
                 return default_max_tokens
             return max_tokens
-
+        if request.is_weight_update_request():
+            req_id = self.engine.enqueue_update_weight_request(request.id, weight_ipc_handles=request.weight_ipc_handles)
+            return req_id
+        elif request.is_sleep_request():
+            req_id = self.engine.enqueue_sleep_request(request.id, sleep_level=request.sleep_level)
+            return req_id
+        elif request.is_wakeup_request():
+            req_id = self.engine.enqueue_wakeup_request(request.id, wakeup_level=request.wakeup_level)
+            return req_id
         try:
             executor_request = tllm.Request(
                 client_id=request.id,
@@ -869,6 +877,12 @@ def _send_rsp(
     if is_llm_response(response):
         if response.has_error() or response.result.is_final:
             worker._pop_result(response.client_id)
+    elif is_update_weights_response(response):
+        worker._pop_result(response.client_id)
+    elif is_sleep_response(response):
+        worker._pop_result(response.client_id)
+    elif is_wakeup_response(response):
+        worker._pop_result(response.client_id)
     elif isinstance(response, ErrorResponse):
         worker._pop_result(response.client_id)
     else:
