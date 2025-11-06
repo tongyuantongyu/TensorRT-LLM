@@ -19,6 +19,7 @@ from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.tokenizer import TokenizerBase
 from ..sampling_params import BatchedLogitsProcessor
+from ..tools import gpu_affinity
 from .base_worker import BaseWorker
 from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
@@ -69,6 +70,17 @@ class RayWorkerWrapper:
         )
 
         torch.cuda.set_device(local_gpu)
+        try:
+            affinities = gpu_affinity.configure_thread_affinity(
+                local_gpu, torch.cuda.device_count())
+            fragments = [(f"thread {tid}" if tid != 0 else "other threads") +
+                         f" on cores {','.join(str(i) for i in sorted(cores))}"
+                         for tid, cores in affinities.items()]
+            print(f"Pinned {'; '.join(fragments)}")
+        except gpu_affinity.GPUAffinityError as e:
+            logger.warning(
+                f"Failed to pin worker thread to dedicated CPU core. Performance may degrade: {e}"
+            )
 
         worker_cls = RayWorkerWrapper._inject_worker_extension(
             worker_cls, worker_kwargs.pop("ray_worker_extension_cls", None))
