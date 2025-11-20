@@ -876,6 +876,11 @@ def _null_context_manager():
     yield
 
 
+def debug_nvtx_enabled():
+    return os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
+        os.getenv("TLLM_NVTX_DEBUG", "0") == "1"
+
+
 def nvtx_range(msg: str,
                color: str = "grey",
                domain: str = "TensorRT-LLM",
@@ -918,8 +923,7 @@ def nvtx_range_debug(msg: str,
         contextmanager: A context manager that either marks the NVTX range if enabled,
                         or a null context manager that does nothing if disabled.
     """
-    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
-            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+    if debug_nvtx_enabled():
         return nvtx_range(msg, color=color, domain=domain, category=category)
     else:
         return _null_context_manager()
@@ -932,8 +936,7 @@ def nvtx_mark_debug(msg: str,
     """
     Creates an NVTX marker for debugging purposes.
     """
-    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
-            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+    if debug_nvtx_enabled():
         nvtx_mark(msg, color=color, domain=domain, category=category)
 
 

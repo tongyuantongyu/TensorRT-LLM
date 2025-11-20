@@ -1,7 +1,7 @@
+import functools
 import math
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
-from functools import wraps
 from typing import Optional
 
 import numpy as np
@@ -15,10 +15,11 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
-from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
-                                 mpi_disabled, mpi_isend, mpi_isend_object,
-                                 mpi_recv, mpi_recv_object, mpi_send,
-                                 mpi_send_object, torch_pybind11_abi)
+from tensorrt_llm._utils import (debug_nvtx_enabled, mpi_allgather, mpi_barrier,
+                                 mpi_comm, mpi_disabled, mpi_isend,
+                                 mpi_isend_object, mpi_recv, mpi_recv_object,
+                                 mpi_send, mpi_send_object, nvtx_mark,
+                                 nvtx_range, torch_pybind11_abi)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
 from tensorrt_llm.logger import logger
@@ -30,10 +31,46 @@ except ModuleNotFoundError:
     from tensorrt_llm import ray_stub as ray
 
 
+def _nvtx_marker(method_or_domain, async_op):
+    if not debug_nvtx_enabled():
+        return (lambda x: x) if isinstance(method_or_domain,
+                                           str) else method_or_domain
+
+    domain = None
+    if isinstance(method_or_domain, str):
+        domain = method_or_domain
+
+    def decorator(method):
+
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            real_domain = domain or self._domain
+            if async_op:
+                nvtx_mark(msg=method.__name__, domain=real_domain)
+                return method(self, *args, **kwargs)
+
+            with nvtx_range(msg=method.__name__, domain=real_domain):
+                return method(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorator(method_or_domain) if domain is None else decorator
+
+
+op = functools.partial(_nvtx_marker, async_op=False)
+async_op = functools.partial(_nvtx_marker, async_op=True)
+
+
 class Distributed(ABC):
 
     def __init__(self, mapping: Mapping):
         self.mapping = mapping
+
+    @property
+    def _domain(self):
+        if hasattr(self, "domain"):
+            return self.domain
+        return type(self).__name__
 
     @property
     def rank(self):
@@ -345,34 +382,43 @@ class MPIDist(Distributed):
         self.create_pp_comm()
         self.create_cp_comm()
 
+    @op
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = mpi_comm()
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
+    @op
     def allgather(self, obj):
         return mpi_allgather(obj)
 
+    @op
     def barrier(self):
         mpi_barrier()
 
+    @async_op
     def isend(self, buf: np.ndarray, dest, tag=0):
         # non-blocking send numpy buffer
         return mpi_isend(buf, dest, tag)
 
+    @op
     def send(self, buf: np.ndarray, dest, tag=0):
         # blocking send numpy buffer
         mpi_send(buf, dest, tag)
 
+    @op
     def recv(self, buf: np.ndarray, src, tag=0):
         # in-place recv numpy buffer
         return mpi_recv(buf, src, tag)
 
+    @op
     def send_object(self, obj, dest, tag=0):
         mpi_send_object(obj, dest, tag)
 
+    @async_op
     def isend_object(self, obj, dest, tag=0):
         return mpi_isend_object(obj, dest, tag)
 
+    @op
     def recv_object(self, src, tag=0):
         return mpi_recv_object(src, tag)
 
@@ -388,26 +434,33 @@ class MPIDist(Distributed):
         new_group = mpi_comm().group.Incl(self.mapping.cp_group)
         self.cp_comm = mpi_comm().Create_group(new_group)
 
+    @op
     def cp_allgather(self, obj):
         return self.cp_comm.allgather(obj)
 
+    @op
     def tp_allgather(self, obj):
         return self.tp_comm.allgather(obj)
 
+    @op
     def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = self.tp_comm
         return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
 
+    @op
     def tp_broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = self.tp_comm
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
+    @op
     def pp_allgather(self, obj):
         return self.pp_comm.allgather(obj)
 
+    @op
     def pp_gather(self, obj, root=0):
         return self.pp_comm.gather(obj, root=root)
 
+    @op
     def pp_broadcast(self, obj, root=0):
         return self.pp_comm.bcast(obj, root)
 
@@ -508,24 +561,7 @@ class TorchDist(Distributed):
         logger.debug(f"Cluster info: {self.cluster_info}")
         return self.cluster_info
 
-    @staticmethod
-    def log_op(func, enable_log=False):
-
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            if enable_log:
-                logger.debug(
-                    f"{func.__name__} enter: {args[1:]}, {kwargs}, rank: {torch.distributed.get_rank()}"
-                )
-            ret = func(*args, **kwargs)
-
-            if enable_log:
-                logger.debug(f"{func.__name__} exit: {ret}")
-            return ret
-
-        return wrapper
-
-    @log_op
+    @op
     def broadcast(self, obj, root=0):
         assert not (self.mapping.has_cp_ulysses() and self.mapping.has_tp()
                     ), 'Unsupported mix of Ulysses CP and TP.'
@@ -544,7 +580,7 @@ class TorchDist(Distributed):
         elif self.mapping.has_tp():
             self.broadcast_tp(obj, root)
 
-    @log_op
+    @op
     def allgather(self, obj):
         if isinstance(obj, torch.Tensor):
             output_list = [
@@ -557,38 +593,38 @@ class TorchDist(Distributed):
             dist.all_gather_object(obj_list, obj)
             return obj_list
 
-    @log_op
+    @op
     def barrier(self):
         dist.barrier()
 
-    @log_op
+    @async_op
     def isend(self, buf: np.ndarray, dest, tag=0):
         # non-blocking send numpy buffer
         tensor = torch.from_numpy(buf)
         return dist.isend(tensor, dst=dest, tag=tag)
 
-    @log_op
+    @op
     def send(self, buf: np.ndarray, dest, tag=0):
         raise NotImplementedError(
             "blocking send is not implemented for TorchDist")
 
-    @log_op
+    @op
     def recv(self, buf: np.ndarray, src, tag=0):
         # in-place recv numpy buffer
         tensor = torch.empty_like(torch.from_numpy(buf))
         dist.recv(tensor, src=src, tag=tag)
         return tensor.numpy()
 
-    @log_op
+    @async_op
     def isend_tensor(self, tensor: torch.Tensor, dest, tag=0):
         return dist.isend(tensor, dst=dest, tag=tag)
 
-    @log_op
+    @op
     def recv_tensor(self, tensor: torch.Tensor, src, tag=0):
         dist.recv(tensor, src=src, tag=tag)
         return tensor
 
-    @log_op
+    @op
     def recv_object(self, src, tag=0):
         size_tensor = torch.tensor([0], dtype=torch.int32)
         torch.distributed.recv(size_tensor,
@@ -604,12 +640,12 @@ class TorchDist(Distributed):
         return _tensor_to_object(recv_tensor, bytes_size,
                                  torch.distributed.group.WORLD)
 
-    @log_op
+    @op
     def send_object(self, obj, dest, tag=0):
         raise NotImplementedError(
             "send_object is not implemented for TorchDist")
 
-    @log_op
+    @async_op
     def isend_object(self, obj, dest, tag=0):
         input_tensor, local_size = _object_to_tensor(
             obj, torch.device("cpu"), torch.distributed.group.WORLD)
@@ -624,7 +660,7 @@ class TorchDist(Distributed):
         works.append(torch.distributed.isend(input_tensor, dst=dest, tag=tag))
         return MultiHandleWrapper(works)
 
-    @log_op
+    @op
     def recv_object_from_isend(self, src, tag):
         size_tensor = torch.tensor([0], dtype=torch.int32)
         torch.distributed.recv(size_tensor, src=src, tag=tag)
@@ -634,7 +670,7 @@ class TorchDist(Distributed):
         return _tensor_to_object(recv_tensor, bytes_size,
                                  torch.distributed.group.WORLD)
 
-    @log_op
+    @op
     def allreduce(self,
                   obj: int | float | torch.Tensor,
                   op=torch.distributed.ReduceOp.SUM):
@@ -649,7 +685,7 @@ class TorchDist(Distributed):
 
         return obj
 
-    @log_op
+    @op
     def tp_allgather(self, obj):
         if isinstance(obj, torch.Tensor):
             output_list = [
@@ -665,7 +701,7 @@ class TorchDist(Distributed):
                                    group=self.mapping.tp_group_pg)
             return output_list
 
-    @log_op
+    @op
     def tp_gather(self, obj, dst=0):
         global_rank = torch.distributed.get_rank()
         if isinstance(obj, torch.Tensor):
@@ -693,7 +729,7 @@ class TorchDist(Distributed):
                                group=self.mapping.tp_group_pg)
             return output_list
 
-    @log_op
+    @op
     def tp_broadcast(self, obj, root=0):
         if isinstance(obj, torch.Tensor):
             dist.broadcast(obj, src=root, group=self.mapping.tp_group_pg)
@@ -707,7 +743,7 @@ class TorchDist(Distributed):
                 device=torch.device("cpu"))
             return ret[0]
 
-    @log_op
+    @op
     def pp_allgather(self, obj):
         if isinstance(obj, torch.Tensor):
             output_list = [
@@ -723,7 +759,7 @@ class TorchDist(Distributed):
                                    group=self.mapping.pp_group_pg)
             return output_list
 
-    @log_op
+    @op
     def pp_gather(self, obj, dst=0):
         global_rank = torch.distributed.get_rank()
         if isinstance(obj, torch.Tensor):
@@ -751,7 +787,7 @@ class TorchDist(Distributed):
                                group=self.mapping.pp_group_pg)
             return output_list
 
-    @log_op
+    @op
     def pp_broadcast(self, obj, root=0):
         if isinstance(obj, torch.Tensor):
             dist.broadcast(obj, src=root, group=self.mapping.pp_group_pg)
@@ -823,13 +859,13 @@ def init_pp_comm(mapping):
         _pp_comm = PPComm(mapping)
 
 
-@TorchDist.log_op
+@op("PPComm")
 def pp_recv(tensor):
     """Receive tensors from previous pp rank."""
     _pp_comm.recv(tensor)
 
 
-@TorchDist.log_op
+@op("PPComm")
 def pp_send(tensor):
     """Send tensors to next pp rank."""
     _pp_comm.send(tensor)
