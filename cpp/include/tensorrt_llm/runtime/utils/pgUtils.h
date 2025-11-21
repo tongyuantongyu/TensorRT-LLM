@@ -281,4 +281,29 @@ struct PgHelper
     }
 };
 
+/**
+ * FutexBarrier synchronizes multiple processes via futex.
+ */
+class LocalNodeBarrier
+{
+    struct BarrierData;
+
+    BarrierData* mData{nullptr};
+    std::string mMemPath;
+
+public:
+    explicit LocalNodeBarrier(std::string memPath);
+    void init();
+    ~LocalNodeBarrier();
+
+    // No copy
+    LocalNodeBarrier(LocalNodeBarrier const&) = delete;
+    LocalNodeBarrier& operator=(LocalNodeBarrier const&) = delete;
+    LocalNodeBarrier(LocalNodeBarrier&&) = default;
+    LocalNodeBarrier& operator=(LocalNodeBarrier&&) = default;
+
+    void spin_sync(uint32_t participants) const;
+    void futex_sync(uint32_t participants, bool spin) const;
+};
+
 } // namespace tensorrt_llm::pg_utils

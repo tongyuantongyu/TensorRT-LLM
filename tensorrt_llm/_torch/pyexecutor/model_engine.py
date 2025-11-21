@@ -5,6 +5,7 @@ import gc
 import inspect
 import math
 import os
+import uuid
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -14,8 +15,10 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
+from tensorrt_llm._utils import (is_trace_enabled, mpi_disabled, nvtx_range,
+                                 nvtx_range_debug, release_gc,
                                  torch_dtype_to_str, trace_func)
+from tensorrt_llm.bindings.internal.process_group import LocalNodeBarrier
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
 from tensorrt_llm.inputs.registry import (create_input_processor,
@@ -435,6 +438,18 @@ class PyTorchModelEngine(ModelEngine):
             self.cache_indirection_attention = None
 
         self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
+
+        self._disable_mpi = mpi_disabled()
+
+        if self._disable_mpi and self.dist.tp_size > 1:
+            random_name = uuid.uuid4()
+            barrier_shm_file = self.dist.broadcast(
+                f"/tensorrt_llm@request_queue_barrier@{random_name}" if self.
+                dist.rank == 0 else None)
+            print(f"LocalNodeBarrier created at {barrier_shm_file}")
+            self.local_node_barrier = LocalNodeBarrier(barrier_shm_file)
+        else:
+            self.local_node_barrier = None
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
@@ -2612,6 +2627,10 @@ class PyTorchModelEngine(ModelEngine):
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer,
                 num_accepted_tokens_device, req_id_to_old_request)
+
+            if self._disable_mpi and self.dist.tp_size > 1:
+                with nvtx_range_debug("LocalNodeBarrier.sync"):
+                    self.local_node_barrier.spin_sync(self.dist.tp_size)
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:

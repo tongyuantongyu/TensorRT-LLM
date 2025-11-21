@@ -38,6 +38,16 @@ void initBindings(nb::module_& m)
             pg_utils::init_pg(common::get_intrusive_ptr<Pg, E>(world_pg_obj.ptr(), pybind11_abi),
                 common::get_intrusive_ptr<Pg, E>(local_pg_obj.ptr(), pybind11_abi));
         });
+
+    nb::class_<pg_utils::LocalNodeBarrier>(m, "LocalNodeBarrier")
+        .def("__init__",
+            [](pg_utils::LocalNodeBarrier* self, std::string mem_path)
+            {
+                new (self) pg_utils::LocalNodeBarrier(std::move(mem_path));
+                self->init();
+            })
+        .def("spin_sync", &pg_utils::LocalNodeBarrier::spin_sync, nb::call_guard<nb::gil_scoped_release>())
+        .def("futex_sync", &pg_utils::LocalNodeBarrier::futex_sync, nb::call_guard<nb::gil_scoped_release>());
 }
 
 } // namespace tensorrt_llm::nanobind::process_group
