@@ -110,6 +110,11 @@ public:
         NB_OVERRIDE_PURE(addToken, requestId);
     }
 
+    void batchAddToken(std::vector<std::pair<RequestIdType, SizeType32>> requestIdsSizes) override
+    {
+        NB_OVERRIDE(batchAddToken, requestIdsSizes);
+    }
+
     void addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt) override
     {
@@ -362,6 +367,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion,
             nb::call_guard<nb::gil_scoped_release>())
         .def("add_token", &BaseKVCacheManager::addToken, nb::call_guard<nb::gil_scoped_release>())
+        .def("batch_add_token", &BaseKVCacheManager::batchAddToken, nb::call_guard<nb::gil_scoped_release>())
         .def("add_sequence", &BaseKVCacheManager::addSequence, nb::call_guard<nb::gil_scoped_release>())
         .def("remove_sequence", &BaseKVCacheManager::removeSequence, nb::call_guard<nb::gil_scoped_release>())
         .def("pin_blocks", &BaseKVCacheManager::pinBlocks, nb::call_guard<nb::gil_scoped_release>())

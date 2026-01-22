@@ -1530,6 +1530,18 @@ public:
     /// @brief Increase size for request at seqSlotIdx. Allocate new KV cache block(s) if needed.
     virtual void addToken(LlmRequest::RequestIdType requestId) = 0;
 
+    /// @brief Increase size for requests at seqSlotIdx. Allocate new KV cache block(s) if needed.
+    virtual void batchAddToken(std::vector<std::pair<LlmRequest::RequestIdType, SizeType32>> requestIdsSizes)
+    {
+        for (auto [requestId, numTokens] : requestIdsSizes)
+        {
+            for (SizeType32 i = 0; i < numTokens; ++i)
+            {
+                addToken(requestId);
+            }
+        }
+    }
+
     /// @brief Add new request to the KV cache manager.
     /// @param inputLength Input length for which KV cache need to be allocated.
     /// @param beamWidth Beam width for which KV cache need to be allocated.
@@ -1859,6 +1871,9 @@ public:
 
     /// @brief Increase size for request with requestId. Allocate new KV cache block(s) if needed.
     void addToken(LlmRequest::RequestIdType requestId) override;
+
+    /// @brief Increase size for requests with requestIds. Allocate new KV cache block(s) if needed.
+    void batchAddToken(std::vector<std::pair<LlmRequest::RequestIdType, SizeType32>> requestIdsSizes) override;
 
     /// @brief Add new request to the KV cache manager.
     /// @param inputLength Input length for which KV cache need to be allocated.

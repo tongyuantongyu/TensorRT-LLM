@@ -445,6 +445,8 @@ class KVCacheManager(BaseResourceManager):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
+            add_token_requests = []
+
             # allocate KV Cache
             for req in context_batch:
                 req_beam_width = req.sampling_config.beam_width
@@ -464,10 +466,9 @@ class KVCacheManager(BaseResourceManager):
                         self.impl.add_sequence(req.py_request_id,
                                                req.prompt_len, req_beam_width,
                                                req)
-                        for _ in range(self.num_extra_kv_tokens):
-                            self.impl.add_token(req.py_request_id)
-                        for _ in range(get_draft_token_length(req)):
-                            self.impl.add_token(req.py_request_id)
+                        add_token_requests.append(
+                            (req.py_request_id, self.num_extra_kv_tokens +
+                             get_draft_token_length(req)))
 
                         if self.kv_connector_manager is not None:
                             block_ids = self.get_cache_indices(req)
@@ -486,9 +487,10 @@ class KVCacheManager(BaseResourceManager):
                         req.py_helix_is_inactive_rank = True
                         # Skip allocating KV cache at decode for inactive helix ranks.
                         continue
-                self.impl.add_token(req.py_request_id)
-                for _ in range(get_draft_token_length(req)):
-                    self.impl.add_token(req.py_request_id)
+                add_token_requests.append(
+                    (req.py_request_id, 1 + get_draft_token_length(req)))
+
+            self.impl.batch_add_token(add_token_requests)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
             self.impl.refresh_blocks()

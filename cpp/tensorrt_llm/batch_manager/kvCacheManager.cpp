@@ -2366,6 +2366,16 @@ void KVCacheManager::addToken(RequestIdType requestId)
     mBlockManager.adjustBlocksIfNeeded(sequence);
 }
 
+void KVCacheManager::batchAddToken(std::vector<std::pair<LlmRequest::RequestIdType, SizeType32>> requestIdsSizes)
+{
+    for (auto [requestId, numTokens] : requestIdsSizes)
+    {
+        auto& sequence = getSequence(requestId);
+        sequence.addNewTokens(numTokens);
+        mBlockManager.adjustBlocksIfNeeded(sequence);
+    }
+}
+
 void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
 {
     // streamLLM is not supported at the moment. The out of window block will
