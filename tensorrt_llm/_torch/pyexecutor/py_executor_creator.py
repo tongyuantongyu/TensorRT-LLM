@@ -148,6 +148,22 @@ class _ExecutorMemoryMonitor:
         ])
         return msg
 
+    def _verbose_memory_report(self, current_stage: ExecutorMemoryType,
+                               free_gpu_memory_bytes_pre: int) -> None:
+        """Print memory usage report if TLLM_VERBOSE_MEMORY_USAGE is set."""
+        # if not os.getenv("TLLM_VERBOSE_MEMORY_USAGE"):
+        #     return
+
+        free_gpu_memory_bytes_post = torch.cuda.mem_get_info()[0]
+        memory_used = free_gpu_memory_bytes_pre - free_gpu_memory_bytes_post
+
+        component_name = self.memory_type_friendly_names.get(current_stage, current_stage.value)
+        print(
+            f"[Memory Report] {component_name}: "
+            f"used {self._bytes_to_gib(memory_used):.2f} GiB, "
+            f"free {self._bytes_to_gib(free_gpu_memory_bytes_pre):.2f} -> {self._bytes_to_gib(free_gpu_memory_bytes_post):.2f} GiB"
+        )
+
     @contextmanager
     def observe_creation_stage(self, current_stage: ExecutorMemoryType):
         """Catches OOM and prints instructive message."""
@@ -172,6 +188,7 @@ class _ExecutorMemoryMonitor:
                     free_gpu_memory_bytes_pre=free_gpu_memory_bytes_pre,
                     free_gpu_memory_bytes_post=free_gpu_memory_bytes_post,
                 ))
+            self._verbose_memory_report(current_stage, free_gpu_memory_bytes_pre)
 
 
 def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
