@@ -512,6 +512,7 @@ class PyExecutor:
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
         self.batch_wait_iters_count = 0
+        self.batch_wait_request_count = 0
 
         def on_detected():
             self._handle_errors(
@@ -3483,11 +3484,17 @@ class PyExecutor:
         num_scheduled_tokens = self._compute_scheduled_tokens(
             context_requests, generation_requests)
 
-        should_waiting = self.batch_wait_iters_count < self.batch_wait_timeout_iters and num_scheduled_tokens < self.batch_wait_max_tokens_ratio * self.max_num_tokens
-        if should_waiting:
+        if len(context_requests) != self.batch_wait_request_count:
+            self.batch_wait_request_count = len(context_requests)
+            self.batch_wait_iters_count = 0
+
+        should_waiting_iters = self.batch_wait_iters_count < self.batch_wait_timeout_iters
+        should_waiting_tokens = num_scheduled_tokens < self.batch_wait_max_tokens_ratio * self.max_num_tokens
+        if should_waiting_iters and should_waiting_tokens:
             self.batch_wait_iters_count += 1
             return []
 
+        self.batch_wait_request_count = 0
         self.batch_wait_iters_count = 0
         return context_requests
 
