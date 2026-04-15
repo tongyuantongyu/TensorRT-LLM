@@ -41,6 +41,7 @@ from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
+from ..step_profiler import StepProfiler
 from ..memory_buffer_utils import with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -220,6 +221,7 @@ class PyTorchModelEngine(ModelEngine):
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
+            StepProfiler.create(self.dist)
         self.llm_args = llm_args
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.original_max_total_draft_tokens = (
@@ -3977,6 +3979,8 @@ class PyTorchModelEngine(ModelEngine):
                         inputs,
                         gather_ids=gather_ids,
                         gather_context_logits=gather_context_logits)
+
+        len_gen = len(scheduled_requests.generation_requests)
         with self.cuda_graph_runner.pad_batch(
                 scheduled_requests, resource_manager,
                 self.runtime_draft_len) as padded_requests:
@@ -3993,6 +3997,12 @@ class PyTorchModelEngine(ModelEngine):
             )
 
             can_run_graph = key is not None
+            StepProfiler.record(
+                "forward",
+                ctx_batch_size=len(scheduled_requests.context_requests),
+                gen_batch_size=len_gen,
+                graph_key=list(key) if key else None,
+                can_run_graph=can_run_graph)
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata

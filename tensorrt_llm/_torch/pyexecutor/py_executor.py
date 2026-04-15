@@ -43,6 +43,7 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
 
 from ..distributed import Distributed
 from ..expert_statistic import ExpertStatistic
+from ..step_profiler import StepProfiler
 from ..models.modeling_llama import Llama4ForConditionalGeneration
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
@@ -488,6 +489,7 @@ class PyExecutor:
         # Run warmup on the execution_stream for proper synchronization with
         # KVCacheTransferManager's onboard/offload operations.
         self.is_warmup = True
+        StepProfiler.record("warm_up", phase="start")
 
         self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
@@ -499,6 +501,7 @@ class PyExecutor:
         # before subsequent operations.
         torch.cuda.current_stream().wait_stream(self.execution_stream)
         self.is_warmup = False
+        StepProfiler.record("warm_up", phase="end")
 
         # Snapshot some cumulative KV cache counters so that stats reported to
         # users exclude blocks reused and missed during warmup dummy requests.
@@ -3494,6 +3497,26 @@ class PyExecutor:
             self.batch_wait_iters_count += 1
             return []
 
+        if not should_waiting_tokens:
+            StepProfiler.record(
+                "schedule_batch_wait_ctx",
+                trigger="token_ratio",
+                scheduled_tokens=num_scheduled_tokens,
+                threshold=int(self.batch_wait_max_tokens_ratio *
+                              self.max_num_tokens),
+                wait_iters=self.batch_wait_iters_count,
+                timeout_iters=self.batch_wait_timeout_iters)
+
+        if not should_waiting_iters:
+            StepProfiler.record(
+                "schedule_batch_wait_ctx",
+                trigger="wait_timeout",
+                wait_iters=self.batch_wait_iters_count,
+                timeout=self.batch_wait_timeout_iters,
+                scheduled_tokens=num_scheduled_tokens,
+                token_threshold=int(self.batch_wait_max_tokens_ratio *
+                                    self.max_num_tokens))
+
         self.batch_wait_request_count = 0
         self.batch_wait_iters_count = 0
         return context_requests
@@ -3946,6 +3969,7 @@ class PyExecutor:
             new_tensors_device: Optional[SampleStateTensors] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
         ExpertStatistic.set_iter(self.iter_counter)
+        StepProfiler.set_step(self.iter_counter)
 
         @nvtx_range(
             f"[Executor] _forward_step {self.iter_counter}: {scheduled_requests.num_context_requests} ctx reqs, {scheduled_requests.num_generation_requests} gen reqs"
