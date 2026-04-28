@@ -109,7 +109,7 @@ Generic over phase enum and storage
 This module is the generic runtime — it dispatches requests, manages
 the active state, and pumps coroutines, but it does not know what
 phases or what storage fields exist. The production data model
-(``LoopPhase`` enum and ``BatchStorage`` dataclass) lives in
+(``BatchPhase`` enum and ``BatchStorage`` dataclass) lives in
 :mod:`batch_storage`, which also provides the typed ``@overload`` chain
 on ``step``. Tests build their own tiny storage classes locally.
 """
@@ -194,7 +194,7 @@ def phased_field(phase: IntEnum, default: Any = None) -> Any:
     truth to maintain.
 
     Generic over the phase enum: any ``IntEnum`` whose values induce a
-    consistent ordering works. Production uses ``batch_storage.LoopPhase``;
+    consistent ordering works. Production uses ``batch_storage.BatchPhase``;
     tests use a local ``_TestPhase``.
     """
     return dataclasses.field(

@@ -2,7 +2,7 @@
 
 The runtime in :mod:`tensorrt_llm._torch.pyexecutor.coroutines` is
 generic over phase enum and storage class. This module pins down the
-*specific* ``LoopPhase`` and ``BatchStorage`` used by TensorRT-LLM's
+*specific* ``BatchPhase`` and ``BatchStorage`` used by TensorRT-LLM's
 forward loop, plus the typed ``@overload`` chain that narrows
 ``step`` for users of ``BatchStorage``.
 
@@ -12,7 +12,7 @@ Layering
 - :mod:`coroutines` exposes the generic primitives (``enter_phase``,
   ``batch_phase`` CM, ``resume``, ``step``, ``Batch``, ``Driver``,
   ``spawn``, ``phased_field`` and the runtime proxies). It never
-  references ``LoopPhase`` or ``BatchStorage``.
+  references ``BatchPhase`` or ``BatchStorage``.
 - This module imports those primitives and provides the production
   data model on top: phase enum, storage dataclass, and the typed
   views generated from the storage's ``phase`` metadata.
@@ -24,7 +24,7 @@ runtime tests that exercise the generic mechanics import directly from
 Adding a new field
 ==================
 
-1. Add ``Optional[T] = phased_field(LoopPhase.X)`` to ``BatchStorage``.
+1. Add ``Optional[T] = phased_field(BatchPhase.X)`` to ``BatchStorage``.
 2. Run ``python scripts/generate_coroutine_views.py`` to refresh the
    ``# ===== BEGIN GENERATED =====`` … ``# ===== END GENERATED =====``
    region below. Never edit that region by hand.
@@ -60,7 +60,7 @@ __all__ = [
     "Driver",
     "BatchStorage",
     "Batch",
-    "LoopPhase",
+    "BatchPhase",
     "again",
     "enter_phase",
     "batch_phase",
@@ -78,7 +78,7 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 
 
-class LoopPhase(IntEnum):
+class BatchPhase(IntEnum):
     """Placeholder phases used to exercise the runtime.
 
     Real phase values (the batch's actual lifecycle) are a followup.
@@ -103,7 +103,7 @@ class BatchStorage:
 
     Held by an ``Batch`` handle. ``step()`` hands out typed views
     derived from the field metadata. Fields are ``Optional`` and
-    default to ``None``. Each field carries a ``{"phase": LoopPhase.P_k}``
+    default to ``None``. Each field carries a ``{"phase": BatchPhase.P_k}``
     metadata entry (via :func:`phased_field`) declaring which phase
     produces it.
 
@@ -117,9 +117,9 @@ class BatchStorage:
       view construction, no codegen needed.
     """
 
-    p0_out: Optional[int] = phased_field(LoopPhase.P0)
-    p1_out: Optional[str] = phased_field(LoopPhase.P1)
-    p2_out: Optional[bytes] = phased_field(LoopPhase.P2)
+    p0_out: Optional[int] = phased_field(BatchPhase.P0)
+    p1_out: Optional[str] = phased_field(BatchPhase.P1)
+    p2_out: Optional[bytes] = phased_field(BatchPhase.P2)
 
 
 # --------------------------------------------------------------------------- #
@@ -202,25 +202,25 @@ class _WriteAtP3:
 async def step(
     handle: Batch,
     *,
-    through: Literal[LoopPhase.P0],
+    through: Literal[BatchPhase.P0],
 ) -> Tuple[_ReadAtP1, _WriteAtP0]: ...
 @overload
 async def step(
     handle: Batch,
     *,
-    through: Literal[LoopPhase.P1],
+    through: Literal[BatchPhase.P1],
 ) -> Tuple[_ReadAtP2, _WriteAtP1]: ...
 @overload
 async def step(
     handle: Batch,
     *,
-    through: Literal[LoopPhase.P2],
+    through: Literal[BatchPhase.P2],
 ) -> Tuple[_ReadAtP3, _WriteAtP2]: ...
 @overload
 async def step(
     handle: Batch,
     *,
-    through: Literal[LoopPhase.P3],
+    through: Literal[BatchPhase.P3],
 ) -> Tuple[_ReadAtAll, None]: ...
 
 
@@ -228,47 +228,47 @@ async def step(
 async def try_step(
     handle: Batch,
     *,
-    through: Literal[LoopPhase.P0],
+    through: Literal[BatchPhase.P0],
 ) -> Optional[Tuple[_ReadAtP1, _WriteAtP0]]: ...
 @overload
 async def try_step(
     handle: Batch,
     *,
-    through: Literal[LoopPhase.P1],
+    through: Literal[BatchPhase.P1],
 ) -> Optional[Tuple[_ReadAtP2, _WriteAtP1]]: ...
 @overload
 async def try_step(
     handle: Batch,
     *,
-    through: Literal[LoopPhase.P2],
+    through: Literal[BatchPhase.P2],
 ) -> Optional[Tuple[_ReadAtP3, _WriteAtP2]]: ...
 @overload
 async def try_step(
     handle: Batch,
     *,
-    through: Literal[LoopPhase.P3],
+    through: Literal[BatchPhase.P3],
 ) -> Optional[Tuple[_ReadAtAll, None]]: ...
 
 
 @overload
 @asynccontextmanager
 def batch_phase(
-    p: Literal[LoopPhase.P0],
+    p: Literal[BatchPhase.P0],
 ) -> AsyncIterator[Tuple[None, _WriteAtP0]]: ...
 @overload
 @asynccontextmanager
 def batch_phase(
-    p: Literal[LoopPhase.P1],
+    p: Literal[BatchPhase.P1],
 ) -> AsyncIterator[Tuple[_ReadAtP1, _WriteAtP1]]: ...
 @overload
 @asynccontextmanager
 def batch_phase(
-    p: Literal[LoopPhase.P2],
+    p: Literal[BatchPhase.P2],
 ) -> AsyncIterator[Tuple[_ReadAtP2, _WriteAtP2]]: ...
 @overload
 @asynccontextmanager
 def batch_phase(
-    p: Literal[LoopPhase.P3],
+    p: Literal[BatchPhase.P3],
 ) -> AsyncIterator[Tuple[_ReadAtP3, _WriteAtP3]]: ...
 
 
@@ -298,7 +298,7 @@ def batch_phase(p):  # type: ignore[misc]
     Sync function returning an ``AbstractAsyncContextManager`` (the
     runtime decorates the underlying generator with
     ``@asynccontextmanager``). The narrowed return type makes
-    ``async with batch_phase(LoopPhase.Py) as (r, w):`` give ``r`` and
+    ``async with batch_phase(BatchPhase.Py) as (r, w):`` give ``r`` and
     ``w`` the proper ``_ReadAtPy`` / ``_WriteAtPy`` types at every
     call site.
     """

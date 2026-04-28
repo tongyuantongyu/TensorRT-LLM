@@ -8,7 +8,7 @@ of truth — the ``phase`` metadata on ``BatchStorage`` fields — to define:
 - ``_ReadAtAll`` Protocol     : the cumulative view at the terminal
   ``step`` (i.e., everything produced through the last phase).
 - ``_WriteAtP*`` dataclasses  : phase-local write views.
-- ``@overload`` signatures for ``step`` : pair ``Literal[LoopPhase.Py]``
+- ``@overload`` signatures for ``step`` : pair ``Literal[BatchPhase.Py]``
   with ``(_ReadAtP{y+1}, _WriteAtPy)`` for non-terminal phases and
   with ``(_ReadAtAll, None)`` for the terminal phase.
 - ``@overload`` signatures for ``try_step`` : same pairing wrapped in
@@ -31,7 +31,7 @@ CI / pre-commit check (exit 1 on drift, no writes)::
 When to run
 -----------
 After adding, removing, or re-phasing any field on ``BatchStorage``, or
-after adding a new ``LoopPhase`` member. The tests under
+after adding a new ``BatchPhase`` member. The tests under
 ``tests/unittest/_torch/executor/test_coroutines.py`` include a
 ``--check``-equivalent test that fails if the block has drifted.
 """
@@ -51,7 +51,7 @@ from typing import Iterable, List, Tuple
 # host (e.g. without a GPU driver for NVML), running this script is
 # pointless on that host anyway — the generator isn't a test, it's a
 # dev tool.
-from tensorrt_llm._torch.pyexecutor.batch_storage import BatchStorage, LoopPhase
+from tensorrt_llm._torch.pyexecutor.batch_storage import BatchStorage, BatchPhase
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TARGET = REPO_ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "batch_storage.py"
@@ -67,9 +67,9 @@ END_MARKER = "# ===== END GENERATED ====="
 
 def _fields_by_phase(
     storage_cls: type,
-) -> dict[LoopPhase, List[dataclasses.Field]]:
+) -> dict[BatchPhase, List[dataclasses.Field]]:
     """Group a storage's fields by the phase that produces them."""
-    result: dict[LoopPhase, List[dataclasses.Field]] = {p: [] for p in LoopPhase}
+    result: dict[BatchPhase, List[dataclasses.Field]] = {p: [] for p in BatchPhase}
     for f in dataclasses.fields(storage_cls):
         phase = f.metadata.get("phase")
         if phase is not None:
@@ -92,12 +92,12 @@ def _unwrap_optional(annotation: str) -> str:
     return stripped
 
 
-def _sorted_phases() -> List[LoopPhase]:
-    return sorted(LoopPhase, key=lambda p: p.value)
+def _sorted_phases() -> List[BatchPhase]:
+    return sorted(BatchPhase, key=lambda p: p.value)
 
 
 def _render_read_protocol(
-    phase: LoopPhase,
+    phase: BatchPhase,
     new_fields: List[dataclasses.Field],
     is_first: bool,
 ) -> List[str]:
@@ -126,7 +126,7 @@ def _render_read_protocol(
 
 
 def _render_write_dataclass(
-    phase: LoopPhase,
+    phase: BatchPhase,
     fields: List[dataclasses.Field],
 ) -> List[str]:
     """Emit a phase-local write-view dataclass for `phase`."""
@@ -145,7 +145,7 @@ def _render_write_dataclass(
 
 
 def _render_read_at_all(
-    last_phase: LoopPhase,
+    last_phase: BatchPhase,
     last_phase_fields: List[dataclasses.Field],
 ) -> List[str]:
     """Emit the cumulative read-view Protocol used by terminal ``step``.
@@ -168,7 +168,7 @@ def _render_read_at_all(
     return lines
 
 
-def _render_step_overload(phase: LoopPhase, is_terminal: bool) -> List[str]:
+def _render_step_overload(phase: BatchPhase, is_terminal: bool) -> List[str]:
     """Emit one ``@overload`` signature for ``step``.
 
     Non-terminal: ``(_ReadAtP{y+1}, _WriteAtPy)`` — the read view
@@ -187,7 +187,7 @@ def _render_step_overload(phase: LoopPhase, is_terminal: bool) -> List[str]:
     params = [
         "    handle: Batch,",
         "    *,",
-        f"    through: Literal[LoopPhase.P{phase.value}],",
+        f"    through: Literal[BatchPhase.P{phase.value}],",
     ]
     return [
         "@overload",
@@ -197,7 +197,7 @@ def _render_step_overload(phase: LoopPhase, is_terminal: bool) -> List[str]:
     ]
 
 
-def _render_try_step_overload(phase: LoopPhase, is_terminal: bool) -> List[str]:
+def _render_try_step_overload(phase: BatchPhase, is_terminal: bool) -> List[str]:
     """Emit one ``@overload`` signature for ``try_step``.
 
     Mirrors :func:`_render_step_overload` but wraps the return type in
@@ -214,7 +214,7 @@ def _render_try_step_overload(phase: LoopPhase, is_terminal: bool) -> List[str]:
     params = [
         "    handle: Batch,",
         "    *,",
-        f"    through: Literal[LoopPhase.P{phase.value}],",
+        f"    through: Literal[BatchPhase.P{phase.value}],",
     ]
     return [
         "@overload",
@@ -224,7 +224,7 @@ def _render_try_step_overload(phase: LoopPhase, is_terminal: bool) -> List[str]:
     ]
 
 
-def _render_batch_phase_overload(phase: LoopPhase) -> List[str]:
+def _render_batch_phase_overload(phase: BatchPhase) -> List[str]:
     """Emit one ``@overload`` signature for ``batch_phase``.
 
     The overload uses the pattern::
@@ -232,13 +232,13 @@ def _render_batch_phase_overload(phase: LoopPhase) -> List[str]:
         @overload
         @asynccontextmanager
         def batch_phase(
-            p: Literal[LoopPhase.Py],
+            p: Literal[BatchPhase.Py],
         ) -> AsyncIterator[Tuple[_ReadAtPy, _WriteAtPy]]: ...
 
     Stacking ``@overload`` outside ``@asynccontextmanager`` and using
     ``AsyncIterator`` as the return is what most IDEs / type
     checkers (PyCharm, mypy, pyright) need to correctly narrow
-    ``async with batch_phase(LoopPhase.Py) as (r, w):`` to the right
+    ``async with batch_phase(BatchPhase.Py) as (r, w):`` to the right
     view types. Returning ``AbstractAsyncContextManager`` directly
     works for some checkers but is missed by others, so we mirror
     the pattern stdlib's own ``asynccontextmanager``-typed overloads
@@ -250,7 +250,7 @@ def _render_batch_phase_overload(phase: LoopPhase) -> List[str]:
         "@overload",
         "@asynccontextmanager",
         "def batch_phase(",
-        f"    p: Literal[LoopPhase.P{phase.value}],",
+        f"    p: Literal[BatchPhase.P{phase.value}],",
         f") -> AsyncIterator[Tuple[{read}, {write}]]: ...",
     ]
 

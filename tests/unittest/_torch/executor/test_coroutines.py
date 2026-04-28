@@ -6,14 +6,14 @@ Most tests exercise generic runtime behavior (primitive wire format,
 tracked-view proxies, and end-to-end 3-layer interleaving). They use a
 test-local ``_TestPhase`` enum and ``_TestStorage`` dataclass defined
 just below the imports, so they stay stable when the production
-``LoopPhase`` / ``BatchStorage`` evolve.
+``BatchPhase`` / ``BatchStorage`` evolve.
 
 A separate "production-binding" group of tests at the bottom of the
 file (``test_static_{read,write}_views_match_field_metadata``,
 ``test_generator_output_agrees_with_file``) intentionally imports the
 production types from :mod:`batch_storage` to verify the generated
 block matches ``BatchStorage``'s field metadata. Those are the only
-tests that should reference ``BatchStorage`` / ``LoopPhase`` /
+tests that should reference ``BatchStorage`` / ``BatchPhase`` /
 ``_ReadAtP*`` / ``_WriteAtP*`` / ``_ReadAtAll``.
 """
 
@@ -49,16 +49,16 @@ from tensorrt_llm._torch.pyexecutor.coroutines import (
 
 # --------------------------------------------------------------------------- #
 # Test-local phase enum and storage. Decoupled from production so runtime
-# tests survive any change to ``LoopPhase`` / ``BatchStorage`` shape.
+# tests survive any change to ``BatchPhase`` / ``BatchStorage`` shape.
 #
 # Naming: ``_TestPhase`` / ``_TestStorage`` (with the ``_Test`` prefix)
-# is deliberately verbose so a grep for ``LoopPhase`` or ``BatchStorage``
+# is deliberately verbose so a grep for ``BatchPhase`` or ``BatchStorage``
 # in this file lands only on the production-binding tests at the bottom.
 # --------------------------------------------------------------------------- #
 
 
 class _TestPhase(IntEnum):
-    """Test-local phase enum independent of production ``LoopPhase``.
+    """Test-local phase enum independent of production ``BatchPhase``.
 
     Four ordered values are enough to exercise every primitive.
     """
@@ -1359,7 +1359,7 @@ def test_again_retry_sentinel_is_singleton():
 from tensorrt_llm._torch.pyexecutor.coroutines import _field_phases  # noqa: E402
 from tensorrt_llm._torch.pyexecutor.batch_storage import (  # noqa: E402
     BatchStorage,
-    LoopPhase,
+    BatchPhase,
     _ReadAtAll,
     _ReadAtP0,
     _ReadAtP1,
@@ -1396,10 +1396,10 @@ def test_static_read_views_match_field_metadata():
     """
     phase_of_field = _field_phases(BatchStorage)
     read_protos = {
-        LoopPhase.P0: _ReadAtP0,
-        LoopPhase.P1: _ReadAtP1,
-        LoopPhase.P2: _ReadAtP2,
-        LoopPhase.P3: _ReadAtP3,
+        BatchPhase.P0: _ReadAtP0,
+        BatchPhase.P1: _ReadAtP1,
+        BatchPhase.P2: _ReadAtP2,
+        BatchPhase.P3: _ReadAtP3,
     }
     for phase_value, proto in read_protos.items():
         expected = {name for name, p in phase_of_field.items() if p < phase_value}
@@ -1423,10 +1423,10 @@ def test_static_write_views_match_field_metadata():
     """Each ``_WriteAtP*`` exposes exactly the fields produced at phase P."""
     phase_of_field = _field_phases(BatchStorage)
     write_dcs = {
-        LoopPhase.P0: _WriteAtP0,
-        LoopPhase.P1: _WriteAtP1,
-        LoopPhase.P2: _WriteAtP2,
-        LoopPhase.P3: _WriteAtP3,
+        BatchPhase.P0: _WriteAtP0,
+        BatchPhase.P1: _WriteAtP1,
+        BatchPhase.P2: _WriteAtP2,
+        BatchPhase.P3: _WriteAtP3,
     }
     for phase_value, dc in write_dcs.items():
         expected = {name for name, p in phase_of_field.items() if p == phase_value}
