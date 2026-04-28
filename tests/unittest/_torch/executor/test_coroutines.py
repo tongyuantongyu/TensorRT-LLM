@@ -2,7 +2,7 @@
 
 Most tests exercise generic runtime behavior (primitive wire format,
 ``phase`` CM, ``resume`` / ``step`` semantics, exception propagation,
-``close()``-shutdown, frame hiding, ``spawn``, Driver policy, runtime
+``close()``-shutdown, frame hiding, ``Concern`` handle / ``__del__``, Driver policy, runtime
 tracked-view proxies, and end-to-end 3-layer interleaving). They use a
 test-local ``_TestPhase`` enum and ``_TestStorage`` dataclass defined
 just below the imports, so they stay stable when the production
@@ -32,6 +32,7 @@ import tensorrt_llm._torch.pyexecutor.coroutines as _cor_mod
 from tensorrt_llm._torch.pyexecutor.coroutines import (
     Driver,
     Batch,
+    Concern,
     _AdvanceRequest,
     _RETRY,
     _RetryRequest,
@@ -41,7 +42,6 @@ from tensorrt_llm._torch.pyexecutor.coroutines import (
     batch_phase,
     phased_field,
     resume,
-    spawn,
     step,
     try_resume,
     try_step,
@@ -145,19 +145,19 @@ def test_enter_phase_outside_active_raises_runtime_error():
 
 
 def test_resume_yields_advance_request_inside_phase_cm(active_storage):
-    """``resume`` yields ``_AdvanceRequest`` with ``at`` from the phase CM."""
+    """``resume`` yields ``_AdvanceRequest`` carrying the Concern handle."""
 
     async def child():
         # Will not actually run; we drop on close().
         await enter_phase(_TestPhase.P1)
 
-    child_coro = child()
+    child_handle = Concern(child())
     captured = {}
 
     async def body():
         async with batch_phase(_TestPhase.P1):
             captured["before_resume"] = _cor_mod._active_phase.get()
-            await resume(child_coro)
+            await resume(child_handle)
 
     parent = body()
     try:
@@ -166,15 +166,15 @@ def test_resume_yields_advance_request_inside_phase_cm(active_storage):
         assert isinstance(request, _WaitRequest)
         assert request.phase is _TestPhase.P1
         # Pump 2: parent's body resumes after wait, calls resume(child),
-        # yields _AdvanceRequest(child, at=P1).
+        # yields _AdvanceRequest(handle, at=P1) carrying the handle.
         request = parent.send(None)
         assert isinstance(request, _AdvanceRequest)
-        assert request.child is child_coro
+        assert request.child is child_handle
         assert request.at is _TestPhase.P1
         assert captured["before_resume"] is _TestPhase.P1
     finally:
         parent.close()
-        child_coro.close()
+        # child_handle.__del__ closes the underlying coro for us.
 
 
 def test_resume_outside_phase_cm_raises():
@@ -183,20 +183,17 @@ def test_resume_outside_phase_cm_raises():
     async def child():
         await enter_phase(_TestPhase.P1)
 
-    child_coro = child()
+    child_handle = Concern(child())
+
+    async def body():
+        await resume(child_handle)
+
+    parent = body()
     try:
-
-        async def body():
-            await resume(child_coro)
-
-        parent = body()
-        try:
-            with pytest.raises(RuntimeError, match="outside a batch_phase CM"):
-                parent.send(None)
-        finally:
-            parent.close()
+        with pytest.raises(RuntimeError, match="outside a batch_phase CM"):
+            parent.send(None)
     finally:
-        child_coro.close()
+        parent.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -557,11 +554,11 @@ def test_three_layer_scheduler_batch_concern_data_flow():
         # ALL phase values (CM, resume) are P1.
         async with batch_phase(_TestPhase.P1) as (r, w):
             w.batch_label = f"L:{r.p0_out}"
-            await resume(concern_a())
+            await resume(Concern(concern_a()))
 
         # P2 block: drives concern_b. batch publishes nothing here.
         async with batch_phase(_TestPhase.P2):
-            await resume(concern_b())
+            await resume(Concern(concern_b()))
 
         # Terminal — nothing produced.
         async with batch_phase(_TestPhase.P3):
@@ -671,7 +668,7 @@ def test_batch_exception_propagates_to_scheduler():
 
     async def batch():
         async with batch_phase(_TestPhase.P1):
-            await resume(concern())
+            await resume(Concern(concern()))
 
     handle = Batch(batch(), _TestStorage())
 
@@ -745,8 +742,8 @@ def test_close_unwinds_try_finally_in_scheduler():
 
     drv = Driver(scheduler())
     # Pump the scheduler manually until it suspends, then close.
-    drv._stack = [(drv._main, None, None)]  # noqa: SLF001
-    request = drv._main.send(None)  # noqa: SLF001
+    drv._stack = [(drv._main_handle, None, None)]  # noqa: SLF001
+    request = drv._main_handle.coro.send(None)  # noqa: SLF001
     assert isinstance(request, _WaitRequest)
     drv._close_all()  # noqa: SLF001
     assert cleanup == ["scheduler"]
@@ -814,61 +811,76 @@ def test_frame_hiding_env_reveals_driver_frames():
 
 
 # --------------------------------------------------------------------------- #
-# spawn helper
+# Handle lifecycle: __del__ silences "never awaited" warning.
+# Replaces the old `spawn` primitive — wrapping a coroutine in a
+# Concern / Batch handle is now what owns its cleanup.
 # --------------------------------------------------------------------------- #
 
 
-def test_spawn_primes_via_send_none():
-    """spawn() runs the coroutine up to its first yield."""
-
-    started: list[str] = []
-
-    async def concern():
-        started.append("started")
-        # Pretend to yield — but spawn needs an active state. Use a
-        # mock active state to pre-prime without going through the
-        # Driver.
-        await enter_phase(_TestPhase.P1)
-
-    storage = _TestStorage()
-    token = _cor_mod._active_storage.set(storage)
-    try:
-        coro = concern()
-        result = spawn(coro)
-        assert result is coro
-        assert started == ["started"]
-    finally:
-        _cor_mod._active_storage.reset(token)
-        coro.close()
-
-
-def test_spawn_silences_never_awaited_warning():
-    """A spawned coroutine that's never advanced doesn't emit RuntimeWarning."""
+def test_concern_handle_del_silences_never_awaited_warning():
+    """A Concern handle whose coro is never advanced doesn't emit RuntimeWarning."""
+    import gc
     import warnings
 
-    storage = _TestStorage()
-    token = _cor_mod._active_storage.set(storage)
-    try:
+    async def concern():
+        await enter_phase(_TestPhase.P1)
 
-        async def concern():
-            await enter_phase(_TestPhase.P1)
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        handle = Concern(concern())
+        del handle
+        gc.collect()
+    never_awaited = [
+        w
+        for w in captured
+        if issubclass(w.category, RuntimeWarning) and "was never awaited" in str(w.message)
+    ]
+    assert never_awaited == []
 
-        with warnings.catch_warnings(record=True) as captured:
-            warnings.simplefilter("always")
-            coro = concern()
-            spawn(coro)
-            del coro  # let GC see it
-            import gc
 
-            gc.collect()
-        never_awaited = [
-            w
-            for w in captured
-            if issubclass(w.category, RuntimeWarning) and "was never awaited" in str(w.message)
-        ]
-        assert never_awaited == []
-    finally:
-        _cor_mod._active_storage.reset(token)
+def test_batch_handle_del_silences_never_awaited_warning():
+    """Same as above for a Batch handle."""
+    import gc
+    import warnings
+
+    async def batch():
+        async with batch_phase(_TestPhase.P0):
+            pass
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        handle = Batch(batch(), _TestStorage())
+        del handle
+        gc.collect()
+    never_awaited = [
+        w
+        for w in captured
+        if issubclass(w.category, RuntimeWarning) and "was never awaited" in str(w.message)
+    ]
+    assert never_awaited == []
+
+
+def test_close_if_undriven_skips_when_done():
+    """``_close_if_undriven`` skips ``coro.close()`` when the handle is done."""
+
+    closes = []
+
+    class _StubCoro:
+        def close(self):
+            closes.append(1)
+
+    class _StubHandle:
+        def __init__(self, done):
+            self.coro = _StubCoro()
+            self.done = done
+
+    # Done = True: helper skips close.
+    _cor_mod._close_if_undriven(_StubHandle(done=True))
+    assert closes == []
+
+    # Done = False: helper closes once.
+    _cor_mod._close_if_undriven(_StubHandle(done=False))
+    assert closes == [1]
 
 
 # --------------------------------------------------------------------------- #
@@ -1031,7 +1043,7 @@ def test_concern_using_phase_cm_raises_via_nesting_assert():
 
     async def batch():
         async with batch_phase(_TestPhase.P1):
-            await resume(concern())
+            await resume(Concern(concern()))
 
     handle = Batch(batch(), _TestStorage())
 
@@ -1177,7 +1189,7 @@ def test_resume_raises_on_unexpected_retry_from_concern():
 
     async def batch():
         async with batch_phase(_TestPhase.P1):
-            await resume(concern())
+            await resume(Concern(concern()))
 
     handle = Batch(batch(), _TestStorage())
 
@@ -1202,8 +1214,8 @@ def test_try_resume_reports_concern_retry():
 
     async def batch():
         async with batch_phase(_TestPhase.P1):
-            seen.append(("cooperative", await try_resume(cooperative_concern())))
-            seen.append(("retrying", await try_resume(retrying_concern())))
+            seen.append(("cooperative", await try_resume(Concern(cooperative_concern()))))
+            seen.append(("retrying", await try_resume(Concern(retrying_concern()))))
 
     handle = Batch(batch(), _TestStorage())
 
@@ -1343,6 +1355,201 @@ def test_again_retry_sentinel_is_singleton():
     assert _RETRY is _RETRY
     # Repr is self-describing.
     assert repr(_RETRY) == "_RETRY"
+
+
+# --------------------------------------------------------------------------- #
+# Handle completion: resume / try_resume / step / try_step are no-ops on
+# already-finished handles. The Driver flips ``handle.done`` whenever a
+# coroutine terminates (StopIteration, exception, or explicit close).
+# --------------------------------------------------------------------------- #
+
+
+def test_concern_handle_done_after_first_resume():
+    """After a concern's coro returns, its Concern handle has ``done = True``."""
+
+    captured = {}
+
+    async def concern():
+        await enter_phase(_TestPhase.P1)
+
+    c = Concern(concern())
+
+    async def batch():
+        async with batch_phase(_TestPhase.P1):
+            await resume(c)
+            captured["done_after_first"] = c.done
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        await step(handle, through=_TestPhase.P3)
+
+    Driver(scheduler()).run()
+    assert captured["done_after_first"] is True
+
+
+def test_resume_on_completed_concern_is_noop():
+    """`resume()` on a Concern whose coro completed returns immediately."""
+
+    seen = []
+
+    async def concern():
+        seen.append("ran")
+        await enter_phase(_TestPhase.P1)
+
+    c = Concern(concern())
+
+    async def batch():
+        async with batch_phase(_TestPhase.P1):
+            await resume(c)
+            seen.append("after_first")
+            await resume(c)  # was a crash before; now a no-op
+            seen.append("after_second")
+            await resume(c)  # still no-op
+            seen.append("after_third")
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        await step(handle, through=_TestPhase.P3)
+
+    Driver(scheduler()).run()
+    # The concern body ran exactly once.
+    assert seen == ["ran", "after_first", "after_second", "after_third"]
+
+
+def test_try_resume_on_completed_concern_returns_true():
+    """`try_resume()` on a completed Concern returns True (made it past everything)."""
+
+    results = []
+
+    async def concern():
+        await enter_phase(_TestPhase.P1)
+
+    c = Concern(concern())
+
+    async def batch():
+        async with batch_phase(_TestPhase.P1):
+            results.append(await try_resume(c))  # progresses, then completes
+            results.append(await try_resume(c))  # no-op, True
+            results.append(await try_resume(c))  # no-op, True
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        await step(handle, through=_TestPhase.P3)
+
+    Driver(scheduler()).run()
+    assert results == [True, True, True]
+
+
+def test_step_on_completed_batch_is_idempotent():
+    """`step()` on a finished Batch returns the terminal view repeatedly."""
+
+    async def batch():
+        async with batch_phase(_TestPhase.P0) as (_, w):
+            w.p0_out = 99
+        async with batch_phase(_TestPhase.P3):
+            pass
+
+    handle = Batch(batch(), _TestStorage())
+    captured = {}
+
+    async def scheduler():
+        # First step drives to terminal.
+        first = await step(handle, through=_TestPhase.P3)
+        captured["first_write_is_none"] = first[1] is None
+        captured["done_after_first"] = handle.done
+        # Second step on same handle: no-op fast path, returns terminal again.
+        second = await step(handle, through=_TestPhase.P3)
+        captured["second_write_is_none"] = second[1] is None
+        # Read view still exposes the data the batch wrote.
+        captured["second_read_p0_out"] = second[0].p0_out
+
+    Driver(scheduler()).run()
+    assert captured == {
+        "first_write_is_none": True,
+        "done_after_first": True,
+        "second_write_is_none": True,
+        "second_read_p0_out": 99,
+    }
+
+
+def test_try_step_on_completed_batch_returns_terminal_not_retry():
+    """Idempotent terminal — distinct from retry's bare ``None``."""
+
+    async def batch():
+        async with batch_phase(_TestPhase.P0):
+            pass
+        async with batch_phase(_TestPhase.P3):
+            pass
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        await try_step(handle, through=_TestPhase.P3)
+        # Now batch is done. try_step should return (read, None), NOT bare None.
+        result = await try_step(handle, through=_TestPhase.P3)
+        assert result is not None
+        read, write = result
+        assert write is None
+
+    Driver(scheduler()).run()
+
+
+def test_handle_done_set_after_exception():
+    """A coroutine that raises also marks its handle done (terminated)."""
+
+    async def concern():
+        raise ValueError("planned")
+
+    c = Concern(concern())
+
+    async def batch():
+        async with batch_phase(_TestPhase.P1):
+            try:
+                await resume(c)
+            except ValueError:
+                pass
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        await step(handle, through=_TestPhase.P3)
+
+    Driver(scheduler()).run()
+    # The concern handle is done — the coroutine raised, terminated the same.
+    assert c.done is True
+
+
+def test_concern_can_be_reused_across_batch_phases():
+    """A Concern can be ``resume``-d across multiple batch_phase blocks."""
+
+    log = []
+
+    async def concern():
+        await enter_phase(_TestPhase.P1)
+        log.append("p1_done")
+        await enter_phase(_TestPhase.P2)
+        log.append("p2_done")
+
+    c = Concern(concern())
+
+    async def batch():
+        async with batch_phase(_TestPhase.P1):
+            await resume(c)  # drives concern through P1
+        log.append("between_blocks")
+        async with batch_phase(_TestPhase.P2):
+            await resume(c)  # drives concern through P2; concern returns
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        await step(handle, through=_TestPhase.P3)
+
+    Driver(scheduler()).run()
+    assert log == ["p1_done", "between_blocks", "p2_done"]
+    assert c.done is True
 
 
 # --------------------------------------------------------------------------- #

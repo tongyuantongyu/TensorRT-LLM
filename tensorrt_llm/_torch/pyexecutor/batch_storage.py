@@ -49,11 +49,11 @@ import torch
 from tensorrt_llm._torch.pyexecutor.coroutines import (
     Driver,
     Batch,
+    Concern,
     again,
     enter_phase,
     phased_field,
     resume,
-    spawn,
     try_resume,
 )
 from tensorrt_llm._torch.pyexecutor.coroutines import batch_phase as _generic_batch_phase
@@ -68,12 +68,12 @@ __all__ = [
     "BatchStorage",
     "Batch",
     "BatchPhase",
+    "Concern",
     "again",
     "enter_phase",
     "batch_phase",
     "phased_field",
     "resume",
-    "spawn",
     "step",
     "try_resume",
     "try_step",

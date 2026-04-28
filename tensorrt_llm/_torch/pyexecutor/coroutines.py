@@ -7,9 +7,17 @@ The runtime is shaped around a strict three-layer hierarchy:
 
 | Layer | Who | Primitive |
 |---|---|---|
-| Concern body | non-batch coroutines spawned by a batch | ``r, w = await enter_phase(Py)`` (no storage arg) |
-| Batch body | batch coroutine only | ``async with batch_phase(Py): ...`` + ``await resume(child)`` |
+| Concern body | non-batch coroutines wrapped in a ``Concern`` handle | ``r, w = await enter_phase(Py)`` (no storage arg) |
+| Batch body | batch coroutine only | ``async with batch_phase(Py): ...`` + ``await resume(c)`` where ``c: Concern`` |
 | Scheduler | top-level driver of batches | ``Batch(coro, storage)`` + ``await step(handle, through=Py)`` |
+
+Coroutines in the lower two layers are always wrapped in a *handle*
+(:class:`Batch` for batches, :class:`Concern` for concerns). The handle
+owns its coroutine, tracks completion via ``handle.done``, and closes
+the coroutine in ``__del__`` if it was never advanced — replacing the
+old ``spawn`` primitive. After ``handle.done`` becomes ``True``, all
+further ``resume`` / ``try_resume`` (or ``step`` / ``try_step``) calls
+on that handle are no-ops.
 
 The single happens-before rule
 ==============================
@@ -123,17 +131,17 @@ import types
 import weakref
 from contextlib import asynccontextmanager
 from enum import IntEnum
-from typing import Any, AsyncIterator, Coroutine, Generator, List, Optional, Tuple
+from typing import Any, AsyncIterator, Coroutine, Generator, List, Optional, Protocol, Tuple
 
 __all__ = [
     "Driver",
     "Batch",
+    "Concern",
     "again",
     "enter_phase",
     "batch_phase",
     "phased_field",
     "resume",
-    "spawn",
     "step",
     "try_resume",
     "try_step",
@@ -459,8 +467,29 @@ stash so the batch's CM-state survives across step boundaries.
 
 
 # --------------------------------------------------------------------------- #
-# Request sentinels (internal to the Driver protocol)
+# Handle protocol + request sentinels (internal to the Driver protocol)
 # --------------------------------------------------------------------------- #
+
+
+class _Handle(Protocol):
+    """Structural type matched by :class:`Batch`, :class:`Concern`, and the
+    private :class:`_RootHandle`.
+
+    All three carry the same minimal shape: a ``coro`` they wrap and a
+    ``done`` flag the Driver flips when that coro terminates. This
+    Protocol lets the Driver's internals annotate stack entries and
+    advance-request payloads precisely without forward-referencing
+    every concrete handle class — and stops the type checker from
+    warning about ``handle.coro`` / ``handle.done`` accesses on
+    otherwise-``object``-typed values.
+
+    Public ``step`` / ``resume`` keep the concrete (``Batch`` /
+    ``Concern``) parameter types so call-site documentation and the
+    typed ``@overload`` chains in :mod:`batch_storage` stay specific.
+    """
+
+    coro: _CoroutineLike
+    done: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -480,11 +509,19 @@ class _WaitRequest:
 class _AdvanceRequest:
     """A coroutine has yielded ``await resume(child)`` (or ``step``).
 
-    ``at`` is the target phase: drive ``child`` until it has yielded
-    a ``_WaitRequest`` at ``phase > at``, completed, or raised.
+    ``child`` is the handle (:class:`Batch` for ``step``,
+    :class:`Concern` for ``resume``) wrapping the coroutine to drive.
+    ``at`` is the target phase: drive ``child.coro`` until it has
+    yielded a ``_WaitRequest`` at ``phase > at``, completed, or raised.
+
+    Carrying the handle (not the raw coroutine) lets the Driver flip
+    ``child.done`` directly when the wrapped coroutine completes, so
+    the user-side fast path in ``resume`` / ``step`` can short-circuit
+    by reading ``child.done`` without consulting any Driver-internal
+    state.
     """
 
-    child: _CoroutineLike
+    child: _Handle
     at: IntEnum
 
 
@@ -540,7 +577,7 @@ def _yield_wait(
 
 @types.coroutine
 def _yield_advance(
-    child: _CoroutineLike,
+    child: _Handle,
     at: IntEnum,
 ) -> Generator[_AdvanceRequest, Any, Any]:
     """Yield an ``_AdvanceRequest`` and return the value the Driver sends back.
@@ -682,16 +719,21 @@ async def again() -> None:
     await _yield_retry()
 
 
-async def resume(child: _CoroutineLike) -> None:
+async def resume(child: "Concern") -> None:
     """Batch-only primitive: drive ``child`` through the current phase's work.
 
+    ``child`` is a :class:`Concern` handle wrapping the concern coroutine.
     Reads the target phase from ``_active_phase`` (set by the
-    enclosing :func:`batch_phase` CM). Drives ``child`` until ``child``
+    enclosing :func:`batch_phase` CM). Drives ``child.coro`` until it
     yields at a phase strictly greater than the current phase,
     completes, or raises. Returns nothing — the batch's view of any
     data the child published goes through the batch's own
     ``batch_phase`` CM views at the next phase, not through this
     primitive's return.
+
+    Fast path: if ``child.done`` (the concern coroutine already
+    completed on a previous ``resume`` / ``try_resume``), this is a
+    no-op and returns immediately without entering the Driver.
 
     Strict on retry: if ``child`` yields ``await again()``, ``resume``
     raises ``RuntimeError`` — the call site declared retry to be a
@@ -701,6 +743,8 @@ async def resume(child: _CoroutineLike) -> None:
     Raises if called outside a ``batch_phase`` CM (``_active_phase``
     is ``None``).
     """
+    if child.done:
+        return
     p = _active_phase.get()
     if p is None:
         raise RuntimeError(
@@ -716,7 +760,7 @@ async def resume(child: _CoroutineLike) -> None:
         )
 
 
-async def try_resume(child: _CoroutineLike) -> bool:
+async def try_resume(child: "Concern") -> bool:
     """Like :func:`resume`, but report retry instead of raising.
 
     Returns ``True`` if ``child`` progressed past the current phase
@@ -725,8 +769,15 @@ async def try_resume(child: _CoroutineLike) -> bool:
     cascade (``await again()`` itself) or skip the child for this
     pass.
 
+    Fast path: if ``child.done`` (the concern coroutine already
+    completed on a previous call), returns ``True`` immediately
+    without entering the Driver — semantically "the concern made it
+    past every phase by way of finishing".
+
     Like :func:`resume`, must be called inside a ``batch_phase`` CM.
     """
+    if child.done:
+        return True
     p = _active_phase.get()
     if p is None:
         raise RuntimeError(
@@ -737,21 +788,113 @@ async def try_resume(child: _CoroutineLike) -> bool:
     return sent is not _RETRY
 
 
+def _close_if_undriven(handle: object) -> None:
+    """``__del__`` body shared by :class:`Batch` and :class:`Concern`.
+
+    If the handle's coroutine never reached completion, close it now so
+    Python doesn't emit ``RuntimeWarning: coroutine '...' was never
+    awaited`` when the coroutine itself is GC-ed afterwards. This
+    replaces the old ``spawn`` primitive: instead of priming the
+    coroutine eagerly to silence the warning, we let the handle's
+    lifetime own the cleanup — undriven handles GC themselves cleanly.
+
+    Defensive lookups (``getattr``) make this safe during interpreter
+    shutdown when module attrs may already be gone.
+    """
+    if getattr(handle, "done", True):
+        return
+    coro = getattr(handle, "coro", None)
+    if coro is None:
+        return
+    try:
+        coro.close()
+    except BaseException:
+        # ``__del__`` swallows everything; otherwise Python prints
+        # to stderr and keeps the GC moving. We do the same explicitly.
+        pass
+
+
 @dataclasses.dataclass
 class Batch:
-    """Bundle of a batch coroutine, its storage, and saved CM-state.
+    """Handle wrapping a batch coroutine. Used by schedulers via :func:`step`.
 
-    Construct with the already-created coroutine and a fresh storage
-    instance. The scheduler hands instances to ``step()`` to drive
-    the batch; storage and CM-state are intentionally
-    encapsulated — there are no read/write helpers on this class.
-    Data exchange with the batch happens only through the views
-    returned by ``step()``.
+    Bundles the coroutine, its :class:`BatchStorage`-shaped storage,
+    saved CM state across step boundaries, and a ``done`` flag the
+    Driver flips when the coroutine completes. The scheduler hands
+    ``Batch`` instances to ``step`` / ``try_step`` to drive forward;
+    storage and CM state are intentionally encapsulated — there are
+    no read/write helpers on this class. Data exchange with the batch
+    happens only through the views returned by ``step``.
+
+    After ``done`` is set, ``step`` / ``try_step`` short-circuit to
+    the terminal view ``(_all_read_view, None)`` without re-entering
+    the Driver — calling them on a finished batch is a no-op.
+
+    The handle's ``__del__`` closes the wrapped coroutine if it was
+    never advanced, which silences Python's ``RuntimeWarning:
+    coroutine '...' was never awaited``. This means a scheduler can
+    construct ``Batch`` lazily and discard handles whose work isn't
+    needed (e.g., conditional batches) without manual priming.
     """
 
     coro: _CoroutineLike
     storage: object
     saved_phase: Optional[IntEnum] = None
+    done: bool = False
+
+    def __del__(self) -> None:
+        _close_if_undriven(self)
+
+
+@dataclasses.dataclass
+class Concern:
+    """Handle wrapping a concern coroutine. Used by batches via :func:`resume`.
+
+    Mirror of :class:`Batch` for the layer below: a batch creates a
+    ``Concern`` around a freshly-instantiated concern coroutine and
+    drives it with ``await resume(concern_handle)`` (or
+    ``await try_resume(concern_handle)`` when the concern may issue
+    ``again()``).
+
+    The Driver flips ``done`` when the wrapped coroutine completes,
+    after which ``resume`` / ``try_resume`` on the same handle are
+    cheap no-ops (``resume`` returns immediately, ``try_resume``
+    returns ``True`` — "the concern made it past every phase, by
+    way of finishing"). This lets a batch's body reuse the same
+    handle across multiple ``batch_phase`` blocks without worrying
+    about whether the concern still has work to do.
+
+    The handle's ``__del__`` closes the wrapped coroutine if it was
+    never advanced — replacing the old ``spawn`` primitive. A
+    conditionally-needed concern can be wrapped early and discarded
+    without manual priming if the condition turns out false.
+    """
+
+    coro: _CoroutineLike
+    done: bool = False
+
+    def __del__(self) -> None:
+        _close_if_undriven(self)
+
+
+class _RootHandle:
+    """Private handle wrapping the Driver's root coroutine.
+
+    Exists purely so the Driver's stack can hold one shape — handles —
+    rather than mixing handles with raw coroutines. Carries the same
+    ``coro`` / ``done`` shape as :class:`Batch` / :class:`Concern`,
+    plus the ``__del__`` closer (in case a Driver is constructed and
+    GC-ed without ever calling ``run``).
+    """
+
+    __slots__ = ("coro", "done")
+
+    def __init__(self, coro: _CoroutineLike) -> None:
+        self.coro: _CoroutineLike = coro
+        self.done: bool = False
+
+    def __del__(self) -> None:
+        _close_if_undriven(self)
 
 
 async def step(handle: Batch, *, through: IntEnum) -> Tuple[object, Optional[object]]:
@@ -768,6 +911,11 @@ async def step(handle: Batch, *, through: IntEnum) -> Tuple[object, Optional[obj
       injecting Py-fields the batch left as holes.
     - ``(full_read_view, None)`` if the batch completed during
       this step.
+
+    Fast path: if ``handle.done`` (the batch already completed on a
+    previous ``step`` / ``try_step``), this returns
+    ``(_all_read_view, None)`` immediately without entering the
+    Driver — re-stepping a finished batch is idempotent.
 
     Strict on retry: if the batch yields ``await again()``, ``step``
     raises ``RuntimeError`` — the call site declared retry to be a
@@ -805,6 +953,10 @@ async def try_step(
     Distinguishing retry from terminal: retry returns a bare ``None``;
     terminal returns ``(read_view, None)``.
 
+    Fast path: if ``handle.done``, returns ``(_all_read_view, None)``
+    immediately — same idempotent behavior as :func:`step` on a
+    finished batch.
+
     Same non-nesting semantics as :func:`step`.
     """
     return await _do_step(handle, through, allow_retry=True)
@@ -821,6 +973,12 @@ async def _do_step(
     Differs only in the retry policy: ``allow_retry=False`` raises on
     ``_RETRY``, ``allow_retry=True`` returns ``None``.
     """
+    if handle.done:
+        # Batch coroutine has already completed. Skip the Driver
+        # round-trip and return the terminal view directly. Both
+        # ``step`` and ``try_step`` agree on this: completion is
+        # not retry, and is observable through the storage.
+        return _all_read_view(handle.storage), None
     if _active_storage.get() is not None:
         raise RuntimeError(
             "step()/try_step() does not nest; another batch is currently active"
@@ -828,7 +986,7 @@ async def _do_step(
     _active_storage.set(handle.storage)
     _active_phase.set(handle.saved_phase)
     try:
-        sent = await _yield_advance(handle.coro, through)
+        sent = await _yield_advance(handle, through)
         if sent is _RETRY:
             if allow_retry:
                 return None
@@ -858,30 +1016,6 @@ async def _do_step(
         _active_storage.set(None)
 
 
-def spawn(coro: _CoroutineLike) -> _CoroutineLike:
-    """Prime ``coro`` past its first yield via ``coro.send(None)``.
-
-    Returns ``coro`` for convenient chaining. The first yielded
-    request is dropped on the floor; the caller must drive ``coro``
-    further via the parent's ``resume`` / ``step``.
-
-    Use case: silence the ``RuntimeWarning: coroutine '...' was never
-    awaited`` warning Python emits when a coroutine object is GC-ed
-    without ever being sent to. Priming makes it safe to discard the
-    coroutine afterward.
-
-    Caveat: if ``coro``'s first yield is an ``_AdvanceRequest`` (i.e.,
-    a ``resume`` call to a sub-child), the request is silently lost.
-    Concerns and batches never start that way in our 3-layer
-    design, so this is a documented but unrealizable edge case.
-    """
-    try:
-        coro.send(None)
-    except StopIteration:
-        pass
-    return coro
-
-
 # --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
@@ -895,6 +1029,15 @@ class Driver:
     schedule. The Driver interprets three request sentinels —
     :class:`_WaitRequest`, :class:`_AdvanceRequest`, and
     :class:`_RetryRequest` — and manages a stack for nested advance.
+
+    Stack uniformity: every entry on the stack is a *handle*
+    (:class:`Batch`, :class:`Concern`, or the private
+    :class:`_RootHandle` wrapping the scheduler coroutine). The
+    Driver flips ``handle.done`` when a coroutine completes (normally
+    or by exception) and when the Driver closes the coroutine during
+    shutdown. User-side fast paths in ``step`` / ``resume`` /
+    ``try_step`` / ``try_resume`` consult ``handle.done`` to skip
+    re-entering the Driver for an already-finished handle.
 
     Pop predicate is strict ``>``: a child is popped when its current
     wait phase is strictly greater than the parent's advance target
@@ -923,15 +1066,15 @@ class Driver:
     """
 
     def __init__(self, main: _CoroutineLike) -> None:
-        self._main: _CoroutineLike = main
-        # Stack of currently-active coroutines:
-        #   (coro, target_phase_or_None, last_storage_or_None)
+        self._main_handle: _RootHandle = _RootHandle(main)
+        # Stack of currently-active handles:
+        #   (handle, target_phase_or_None, last_storage_or_None)
         # ``target_phase`` is the phase the parent asked the child to
-        # reach via ``advance``/``step``; ``None`` marks the root main.
-        self._stack: List[Tuple[_CoroutineLike, Optional[IntEnum], Optional[object]]] = []
-        # Coroutines that have yielded a ``_WaitRequest`` and are
-        # suspended at a known phase. Keyed by ``id(coro)``. Used
-        # both for the "child already past target" short-circuit and
+        # reach via ``step`` / ``resume``; ``None`` marks the root.
+        self._stack: List[Tuple[_Handle, Optional[IntEnum], Optional[object]]] = []
+        # Handles whose coroutine has yielded a ``_WaitRequest`` and
+        # are suspended at a known phase. Keyed by ``id(handle.coro)``.
+        # Used for the "child already past target" short-circuit and
         # for the strict-progression check.
         self._suspensions: dict[int, Tuple[IntEnum, object]] = {}
 
@@ -963,12 +1106,13 @@ class Driver:
 
     def _drive(self) -> None:
         """Main loop: pump the top of stack, dispatch on yielded requests."""
-        self._stack = [(self._main, None, None)]
+        self._stack = [(self._main_handle, None, None)]
         send_value: object = None
         send_exc: Optional[BaseException] = None
 
         while self._stack:
-            coro, target, last_storage = self._stack[-1]
+            handle, target, last_storage = self._stack[-1]
+            coro = handle.coro
 
             try:
                 if send_exc is not None:
@@ -979,7 +1123,10 @@ class Driver:
                     request = coro.send(send_value)
                     send_value = None
             except StopIteration:
-                # Coroutine returned. Pop; resume parent (if any).
+                # Coroutine returned. Mark the handle done so user-side
+                # fast paths short-circuit on the next call; pop the
+                # stack and resume the parent (if any).
+                handle.done = True
                 self._stack.pop()
                 self._suspensions.pop(id(coro), None)
                 # Parent's resume value is None — under the new design,
@@ -988,8 +1135,10 @@ class Driver:
                 send_value = None
                 continue
             except BaseException as e:
-                # Coroutine raised. Propagate to parent (if any), or
-                # out of run() if we're at the root.
+                # Coroutine raised. Mark handle done (terminated by
+                # exception is still terminated) and propagate to
+                # parent (if any), or out of run() at the root.
+                handle.done = True
                 self._stack.pop()
                 self._suspensions.pop(id(coro), None)
                 if self._stack:
@@ -1000,16 +1149,26 @@ class Driver:
 
             # Dispatch on the yielded request.
             if isinstance(request, _AdvanceRequest):
-                child = request.child
+                child_handle = request.child
                 new_target = request.at
-                suspension = self._suspensions.get(id(child))
+                if child_handle.done:
+                    # Child already completed (e.g., a previous
+                    # ``resume`` consumed it). The user-side ``resume``
+                    # / ``step`` fast path should normally catch this,
+                    # but a defensive short-circuit here handles any
+                    # path that builds an ``_AdvanceRequest`` without
+                    # going through the typed helpers.
+                    send_value = None
+                    continue
+                child_coro = child_handle.coro
+                suspension = self._suspensions.get(id(child_coro))
                 if suspension is not None and suspension[0] > new_target:
                     # Child is already past the target — no pumping
                     # needed. Resume the parent immediately.
                     send_value = None
                 else:
-                    # Push child for pumping.
-                    self._stack.append((child, new_target, None))
+                    # Push child handle for pumping.
+                    self._stack.append((child_handle, new_target, None))
                     send_value = None
             elif isinstance(request, _WaitRequest):
                 phase_value = request.phase
@@ -1026,7 +1185,7 @@ class Driver:
                     continue
                 self._suspensions[id(coro)] = (phase_value, storage)
                 # Update the current stack entry's last_storage.
-                self._stack[-1] = (coro, target, storage)
+                self._stack[-1] = (handle, target, storage)
                 if target is None:
                     # Root main coroutine yielded a wait. Treat as a
                     # no-op and keep pumping main.
@@ -1048,6 +1207,8 @@ class Driver:
                 # left as-is so the next ``try_step`` / ``try_resume``
                 # restores them and the coroutine resumes from right
                 # after ``await again()`` with the same world view.
+                # ``handle.done`` is also unchanged: the coroutine is
+                # paused, not finished.
                 if target is None:
                     send_exc = RuntimeError(
                         "again() at the root coroutine has no parent "
@@ -1070,20 +1231,23 @@ class Driver:
 
         ``BaseException`` (``KeyboardInterrupt``, ``SystemExit``) is
         intentionally allowed to propagate so a Ctrl-C during shutdown
-        actually stops shutdown.
+        actually stops shutdown. Each closed handle is marked
+        ``done`` so its ``__del__`` skips the redundant ``close()``.
         """
         main_closed = False
         while self._stack:
-            coro, _, _ = self._stack.pop()
-            if coro is self._main:
+            handle, _, _ = self._stack.pop()
+            if handle is self._main_handle:
                 main_closed = True
             try:
-                coro.close()
+                handle.coro.close()
             except Exception:
                 pass
+            handle.done = True
         self._suspensions.clear()
         if not main_closed:
             try:
-                self._main.close()
+                self._main_handle.coro.close()
             except Exception:
                 pass
+            self._main_handle.done = True
