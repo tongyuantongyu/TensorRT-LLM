@@ -45,25 +45,31 @@ from typing import AsyncIterator, Literal, Optional, Protocol, Tuple, overload, 
 from tensorrt_llm._torch.pyexecutor.coroutines import (
     Driver,
     Batch,
+    again,
     enter_phase,
     phased_field,
     resume,
     spawn,
+    try_resume,
 )
 from tensorrt_llm._torch.pyexecutor.coroutines import batch_phase as _generic_batch_phase
 from tensorrt_llm._torch.pyexecutor.coroutines import step as _generic_step
+from tensorrt_llm._torch.pyexecutor.coroutines import try_step as _generic_try_step
 
 __all__ = [
     "Driver",
     "BatchStorage",
     "Batch",
     "LoopPhase",
+    "again",
     "enter_phase",
     "batch_phase",
     "phased_field",
     "resume",
     "spawn",
     "step",
+    "try_resume",
+    "try_step",
 ]
 
 
@@ -219,6 +225,32 @@ async def step(
 
 
 @overload
+async def try_step(
+    handle: Batch,
+    *,
+    through: Literal[LoopPhase.P0],
+) -> Optional[Tuple[_ReadAtP1, _WriteAtP0]]: ...
+@overload
+async def try_step(
+    handle: Batch,
+    *,
+    through: Literal[LoopPhase.P1],
+) -> Optional[Tuple[_ReadAtP2, _WriteAtP1]]: ...
+@overload
+async def try_step(
+    handle: Batch,
+    *,
+    through: Literal[LoopPhase.P2],
+) -> Optional[Tuple[_ReadAtP3, _WriteAtP2]]: ...
+@overload
+async def try_step(
+    handle: Batch,
+    *,
+    through: Literal[LoopPhase.P3],
+) -> Optional[Tuple[_ReadAtAll, None]]: ...
+
+
+@overload
 @asynccontextmanager
 def batch_phase(
     p: Literal[LoopPhase.P0],
@@ -253,6 +285,11 @@ def batch_phase(
 async def step(handle, *, through):  # type: ignore[misc]
     """``step`` narrowed for :class:`BatchStorage` — see overloads above."""
     return await _generic_step(handle, through=through)
+
+
+async def try_step(handle, *, through):  # type: ignore[misc]
+    """``try_step`` narrowed for :class:`BatchStorage` — see overloads above."""
+    return await _generic_try_step(handle, through=through)
 
 
 def batch_phase(p):  # type: ignore[misc]

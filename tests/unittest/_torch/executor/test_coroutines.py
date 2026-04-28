@@ -33,13 +33,18 @@ from tensorrt_llm._torch.pyexecutor.coroutines import (
     Driver,
     Batch,
     _AdvanceRequest,
+    _RETRY,
+    _RetryRequest,
     _WaitRequest,
+    again,
     enter_phase,
     batch_phase,
     phased_field,
     resume,
     spawn,
     step,
+    try_resume,
+    try_step,
 )
 
 # --------------------------------------------------------------------------- #
@@ -1035,6 +1040,309 @@ def test_concern_using_phase_cm_raises_via_nesting_assert():
 
     with pytest.raises(RuntimeError, match="must not nest"):
         Driver(scheduler()).run()
+
+
+# --------------------------------------------------------------------------- #
+# Retry / EAGAIN: `again()`, `try_step`, `try_resume`
+#
+# Semantics: `again()` says "I'm at this phase, ask me again from this exact
+# point". The Driver pops the coroutine without touching its suspension
+# record or active state, and signals the parent via the `_RETRY` sentinel.
+# Strict drivers (`step` / `resume`) raise on retry; tolerant drivers
+# (`try_step` / `try_resume`) report it via `None` / `False`.
+# --------------------------------------------------------------------------- #
+
+
+def test_again_outside_phase_raises():
+    """`again()` requires `_active_phase` to be set; no phase = bug."""
+
+    async def body():
+        await again()
+
+    coro = body()
+    try:
+        with pytest.raises(RuntimeError, match="outside a phase"):
+            coro.send(None)
+    finally:
+        coro.close()
+
+
+def test_again_yields_retry_request_inside_phase_cm(active_storage):
+    """Inside a batch_phase CM, `again()` yields a `_RetryRequest`."""
+
+    # Look up classes via _cor_mod so we don't get tripped up by tests that
+    # reload the coroutines module (frame-hiding env tests above).
+    async def body():
+        async with _cor_mod.batch_phase(_TestPhase.P1):
+            await _cor_mod.again()
+
+    coro = body()
+    try:
+        request = coro.send(None)
+        assert isinstance(request, _cor_mod._WaitRequest)
+        request = coro.send(None)
+        assert isinstance(request, _cor_mod._RetryRequest)
+    finally:
+        coro.close()
+
+
+def test_step_raises_on_unexpected_retry_from_batch():
+    """`step()` (strict) raises if the batch yields `again()`."""
+
+    async def batch():
+        async with batch_phase(_TestPhase.P1):
+            await again()
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        await step(handle, through=_TestPhase.P1)
+
+    with pytest.raises(RuntimeError, match="batch issued.*again.*try_step"):
+        Driver(scheduler()).run()
+
+
+def test_try_step_returns_none_on_retry():
+    """`try_step()` (tolerant) returns `None` if batch retries."""
+
+    captured = {}
+
+    async def batch():
+        async with batch_phase(_TestPhase.P1):
+            await again()
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        result = await try_step(handle, through=_TestPhase.P1)
+        captured["result"] = result
+
+    Driver(scheduler()).run()
+    assert captured["result"] is None
+
+
+def test_try_step_returns_views_on_progress():
+    """`try_step()` returns the same `(read, write)` shape as `step()` on success."""
+
+    captured = {}
+
+    async def batch():
+        async with batch_phase(_TestPhase.P0) as (_, w):
+            w.p0_out = 7
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        result = await try_step(handle, through=_TestPhase.P0)
+        captured["result"] = result
+
+    Driver(scheduler()).run()
+    assert captured["result"] is not None
+    read, write = captured["result"]
+    assert handle.storage.p0_out == 7
+
+
+def test_try_step_terminal_returns_views_not_none():
+    """Terminal completion returns `(read_view, None)` — distinct from retry's bare `None`."""
+
+    async def batch():
+        async with batch_phase(_TestPhase.P0):
+            pass
+        async with batch_phase(_TestPhase.P1):
+            pass
+        async with batch_phase(_TestPhase.P2):
+            pass
+        async with batch_phase(_TestPhase.P3):
+            pass
+
+    handle = Batch(batch(), _TestStorage())
+    captured = {}
+
+    async def scheduler():
+        result = await try_step(handle, through=_TestPhase.P3)
+        captured["result"] = result
+
+    Driver(scheduler()).run()
+    assert captured["result"] is not None  # not retry
+    read, write = captured["result"]
+    assert write is None  # terminal
+
+
+def test_resume_raises_on_unexpected_retry_from_concern():
+    """`resume()` (strict) raises if the concern yields `again()`."""
+
+    async def concern():
+        await enter_phase(_TestPhase.P1)
+        await again()
+
+    async def batch():
+        async with batch_phase(_TestPhase.P1):
+            await resume(concern())
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        await step(handle, through=_TestPhase.P1)
+
+    with pytest.raises(RuntimeError, match="child issued.*again.*try_resume"):
+        Driver(scheduler()).run()
+
+
+def test_try_resume_reports_concern_retry():
+    """`try_resume()` returns `False` if concern retried, `True` otherwise."""
+
+    seen = []
+
+    async def cooperative_concern():
+        await enter_phase(_TestPhase.P1)
+
+    async def retrying_concern():
+        await enter_phase(_TestPhase.P1)
+        await again()
+
+    async def batch():
+        async with batch_phase(_TestPhase.P1):
+            seen.append(("cooperative", await try_resume(cooperative_concern())))
+            seen.append(("retrying", await try_resume(retrying_concern())))
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        await try_step(handle, through=_TestPhase.P1)
+
+    Driver(scheduler()).run()
+    assert seen == [("cooperative", True), ("retrying", False)]
+
+
+def test_again_at_root_raises():
+    """`again()` from the root coroutine has no parent — programming error."""
+
+    async def main():
+        # Set _active_phase manually so again()'s own check passes;
+        # the Driver-level "no parent" check is what we want to hit.
+        _cor_mod._active_phase.set(_TestPhase.P0)
+        try:
+            await again()
+        finally:
+            _cor_mod._active_phase.set(None)
+
+    with pytest.raises(RuntimeError, match="root coroutine has no parent"):
+        Driver(main()).run()
+
+
+def test_again_preserves_active_phase_across_retry():
+    """After retry, the batch resumes at the same phase it was paused at."""
+
+    seen = []
+
+    async def batch():
+        async with batch_phase(_TestPhase.P0):
+            pass
+        async with batch_phase(_TestPhase.P1):
+            seen.append(("before_again", _cor_mod._active_phase.get()))
+            await again()
+            seen.append(("after_again", _cor_mod._active_phase.get()))
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        # First step drives through P0.
+        await step(handle, through=_TestPhase.P0)
+        # Second step: batch enters P1, hits again() — try_step needed.
+        first = await try_step(handle, through=_TestPhase.P3)
+        seen.append(("first_call", first))
+        # Third step (retry): batch resumes from after again() inside P1.
+        second = await try_step(handle, through=_TestPhase.P3)
+        seen.append(("second_call_terminal", second is not None))
+
+    Driver(scheduler()).run()
+    # Batch saw P1 both before and after again() (same phase preserved).
+    assert seen[0] == ("before_again", _TestPhase.P1)
+    assert seen[1] == ("first_call", None)  # try_step returned None on retry
+    assert seen[2] == ("after_again", _TestPhase.P1)
+    # Third entry is from after the second try_step ran the rest of the body.
+    assert seen[3] == ("second_call_terminal", True)
+
+
+def test_again_does_not_update_strict_progression_record():
+    """Strict-progression check uses prev wait phase; `again()` doesn't bump it."""
+
+    # Sequence: enter P1 (real wait), again() (no wait), enter P2 (real wait).
+    # Strict progression compares P2 against prev=P1, not against P1+again.
+    # Should NOT raise.
+
+    async def batch():
+        async with batch_phase(_TestPhase.P1):
+            await again()
+        async with batch_phase(_TestPhase.P2):
+            pass
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        # Drive far enough; tolerate the retry.
+        first = await try_step(handle, through=_TestPhase.P3)
+        # First call retried during P1.
+        assert first is None
+        # Resume — P2 yield is OK because prev (in suspension table) is P1.
+        await try_step(handle, through=_TestPhase.P3)
+
+    Driver(scheduler()).run()  # would raise if strict-progression rejected
+
+
+def test_pp_heartbeat_pattern_end_to_end():
+    """A PP-style heartbeat: do_first, then heartbeat-and-again until ready."""
+
+    iters_observed = []
+    heartbeats = 0
+
+    async def batch():
+        nonlocal heartbeats
+        async with batch_phase(_TestPhase.P0) as (_, w):
+            w.p0_out = 0  # "first iter" work done
+        # Still inside P1 phase block; loop heartbeats until external ready.
+        async with batch_phase(_TestPhase.P1) as (_, w):
+            while heartbeats < 3:
+                heartbeats += 1
+                # No phase yields: just keep retrying until ready.
+                await again()
+            # After loop: do the real P1 work.
+            w.p1_out = f"ready_after_{heartbeats}_heartbeats"
+        async with batch_phase(_TestPhase.P3):
+            pass
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        # Iter 0: P0 done.
+        await step(handle, through=_TestPhase.P0)
+        iters_observed.append("iter0_p0_done")
+        # Iters 1..N: try_step until success.
+        for i in range(10):
+            result = await try_step(handle, through=_TestPhase.P3)
+            if result is not None:
+                iters_observed.append(f"iter{i + 1}_success")
+                break
+            iters_observed.append(f"iter{i + 1}_retry")
+
+    Driver(scheduler()).run()
+    # 3 retries (heartbeats) + 1 successful iter that runs the P1 body.
+    assert iters_observed == [
+        "iter0_p0_done",
+        "iter1_retry",
+        "iter2_retry",
+        "iter3_retry",
+        "iter4_success",
+    ]
+    assert handle.storage.p1_out == "ready_after_3_heartbeats"
+
+
+def test_again_retry_sentinel_is_singleton():
+    """`_RETRY` is a singleton; identity comparison is the contract."""
+
+    assert _RETRY is _RETRY
+    # Repr is self-describing.
+    assert repr(_RETRY) == "_RETRY"
 
 
 # --------------------------------------------------------------------------- #

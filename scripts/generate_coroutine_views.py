@@ -11,6 +11,8 @@ of truth — the ``phase`` metadata on ``BatchStorage`` fields — to define:
 - ``@overload`` signatures for ``step`` : pair ``Literal[LoopPhase.Py]``
   with ``(_ReadAtP{y+1}, _WriteAtPy)`` for non-terminal phases and
   with ``(_ReadAtAll, None)`` for the terminal phase.
+- ``@overload`` signatures for ``try_step`` : same pairing wrapped in
+  ``Optional[...]`` to surface the retry-on-EAGAIN ``None`` return.
 
 This script reads the metadata and rewrites the generated block in
 batch_storage.py, between the ``# ===== BEGIN GENERATED`` and
@@ -195,6 +197,33 @@ def _render_step_overload(phase: LoopPhase, is_terminal: bool) -> List[str]:
     ]
 
 
+def _render_try_step_overload(phase: LoopPhase, is_terminal: bool) -> List[str]:
+    """Emit one ``@overload`` signature for ``try_step``.
+
+    Mirrors :func:`_render_step_overload` but wraps the return type in
+    ``Optional[...]``. ``None`` from ``try_step`` means "the batch
+    issued ``await again()``" (retry); otherwise the return shape is
+    identical to :func:`step`.
+    """
+    if is_terminal:
+        read = "_ReadAtAll"
+        write = "None"
+    else:
+        read = f"_ReadAtP{phase.value + 1}"
+        write = f"_WriteAtP{phase.value}"
+    params = [
+        "    handle: Batch,",
+        "    *,",
+        f"    through: Literal[LoopPhase.P{phase.value}],",
+    ]
+    return [
+        "@overload",
+        "async def try_step(",
+        *params,
+        f") -> Optional[Tuple[{read}, {write}]]: ...",
+    ]
+
+
 def _render_batch_phase_overload(phase: LoopPhase) -> List[str]:
     """Emit one ``@overload`` signature for ``batch_phase``.
 
@@ -267,6 +296,13 @@ def generate_block() -> str:
     for i, phase in enumerate(phases):
         is_terminal = i == len(phases) - 1
         out.extend(_render_step_overload(phase, is_terminal))
+    out.append("")
+    out.append("")
+
+    # try_step overloads (same shape, Optional-wrapped return).
+    for i, phase in enumerate(phases):
+        is_terminal = i == len(phases) - 1
+        out.extend(_render_try_step_overload(phase, is_terminal))
     out.append("")
     out.append("")
 

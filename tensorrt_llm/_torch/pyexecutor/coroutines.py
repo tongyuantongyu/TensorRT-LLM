@@ -60,6 +60,32 @@ and stay-at-same-phase (P1 then P1) raise. This catches misuse at the
 offending ``enter_phase`` call rather than waiting for an attribute
 access on a tracked-storage proxy to surface a confusing error.
 
+Retry: ``await again()`` and the ``try_*`` drivers
+==================================================
+
+Sometimes a coroutine is "at" a phase but cannot make further progress
+yet because of external state (e.g., a PP rank is still waiting on its
+upstream). Looking sideways at this: ``again()`` is the coroutine
+saying *EAGAIN* — "ask me again later, from this exact point". The
+Driver pops the coroutine without touching its ``_active_phase``,
+``_active_storage``, suspension record, or tracked-write log. When the
+parent next drives it, execution resumes from right after ``await
+again()`` with the same view of storage it had before; the data
+barrier (read at Py sees writes at < Py) is unchanged.
+
+Because retry isn't always expected, drivers come in pairs:
+
+- :func:`step` / :func:`resume`: strict. Raise ``RuntimeError`` if the
+  child issued ``again()``. Use when ``again()`` would be a logic bug.
+- :func:`try_step` / :func:`try_resume`: retry-aware. ``try_step``
+  returns ``None`` instead of ``(read, write)``; ``try_resume``
+  returns ``False`` instead of ``True``. Use only at call sites
+  that genuinely expect EAGAIN.
+
+The contract: ``again()`` *must* be paired with a ``try_*`` driver
+upstream. The strict variants exist so accidental retries surface
+as exceptions at the immediate boundary rather than silently looping.
+
 Shutdown and cleanup
 ====================
 
@@ -102,12 +128,15 @@ from typing import Any, AsyncIterator, Coroutine, Generator, List, Optional, Tup
 __all__ = [
     "Driver",
     "Batch",
+    "again",
     "enter_phase",
     "batch_phase",
     "phased_field",
     "resume",
     "spawn",
     "step",
+    "try_resume",
+    "try_step",
 ]
 
 
@@ -459,6 +488,42 @@ class _AdvanceRequest:
     at: IntEnum
 
 
+@dataclasses.dataclass(frozen=True)
+class _RetryRequest:
+    """A coroutine has yielded ``await again()``.
+
+    The Driver pops the coroutine to its parent without updating its
+    suspension record or active state. The parent's
+    :func:`_yield_advance` returns :data:`_RETRY`; ``step`` / ``resume``
+    raise on it, ``try_step`` / ``try_resume`` translate it to the
+    user-facing retry signal.
+    """
+
+
+class _RetryToken:
+    """Singleton type for the :data:`_RETRY` sentinel.
+
+    A bespoke type so ``isinstance``-style checks via ``is _RETRY`` are
+    unambiguous, and the repr is self-describing in tracebacks.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "_RETRY"
+
+
+_RETRY: object = _RetryToken()
+"""Sentinel sent into a parent coroutine after its child yielded
+``await again()``.
+
+The parent's :func:`_yield_advance` returns this value, and ``step`` /
+``try_step`` / ``resume`` / ``try_resume`` decide how to surface it.
+``is _RETRY`` is the only way to test for it; equality and identity
+are the same here because :class:`_RetryToken` is a singleton.
+"""
+
+
 # --------------------------------------------------------------------------- #
 # Internal yield helpers
 # --------------------------------------------------------------------------- #
@@ -477,15 +542,28 @@ def _yield_wait(
 def _yield_advance(
     child: _CoroutineLike,
     at: IntEnum,
-) -> Generator[_AdvanceRequest, None, None]:
-    """Yield an ``_AdvanceRequest`` and resume on send.
+) -> Generator[_AdvanceRequest, Any, Any]:
+    """Yield an ``_AdvanceRequest`` and return the value the Driver sends back.
 
-    The Driver's send value is irrelevant here — under the new design
-    the parent's view of "what the child produced" comes from active
-    state (in batch's case, the parent's own ``batch_phase`` CM views;
-    in scheduler's case, ``step()`` builds views post-hoc).
+    The Driver sends ``None`` on a normal pop (child reached / passed
+    its target phase or returned) and :data:`_RETRY` if the child
+    yielded ``await again()``. ``step`` / ``resume`` treat the latter
+    as a programming error; ``try_step`` / ``try_resume`` thread it
+    through to the user.
     """
-    yield _AdvanceRequest(child, at)
+    return (yield _AdvanceRequest(child, at))
+
+
+@types.coroutine
+def _yield_retry() -> Generator[_RetryRequest, None, None]:
+    """Yield a ``_RetryRequest``. Resume value is always ``None``.
+
+    The :data:`_RETRY` sentinel travels *outward* (from the Driver back
+    to the popped child's parent), not inward to the retrying child.
+    The retrying child just resumes after :func:`again` like any other
+    awaited primitive.
+    """
+    yield _RetryRequest()
 
 
 # --------------------------------------------------------------------------- #
@@ -566,6 +644,44 @@ async def batch_phase(p: IntEnum) -> AsyncIterator[Tuple[object, object]]:
         _active_phase.set(None)
 
 
+async def again() -> None:
+    """Yield to scheduler asking to resume from this exact point later.
+
+    Like POSIX ``EAGAIN``: the coroutine cannot make further progress
+    at its current phase yet (e.g., upstream PP rank not ready) and
+    asks the scheduler to try again. The Driver pops this coroutine
+    to its parent and sends :data:`_RETRY` to the parent's
+    :func:`_yield_advance`. The coroutine's ``_active_phase``,
+    ``_active_storage``, suspension record, and tracked-write log are
+    all unchanged: when resumed, it sees the same world it saw before
+    ``again()``. The data barrier (read at Py exposes writes at
+    ``< Py``) holds.
+
+    ``again()`` must be paired with a ``try_*`` driver upstream:
+
+    - From a batch coroutine: the scheduler must use :func:`try_step`,
+      not :func:`step`. The latter raises on retry.
+    - From a concern: the parent batch must use :func:`try_resume`,
+      not :func:`resume`. Cascading is fine — the batch can itself
+      ``await again()`` after a child concern retries.
+
+    ``again()`` requires an active phase (``_active_phase`` non-``None``):
+    inside a ``batch_phase`` CM (for batches) or after ``enter_phase``
+    has returned (for concerns). Calling it between phases is a
+    programming error and raises.
+    """
+    p = _active_phase.get()
+    if p is None:
+        raise RuntimeError(
+            "again() called outside a phase. The semantics is 'I'm at "
+            "phase Py and want to be at phase Py when resumed', so "
+            "_active_phase must be set: inside `async with "
+            "batch_phase(Py): ...` for batches, or after `await "
+            "enter_phase(Py)` returned in a concern."
+        )
+    await _yield_retry()
+
+
 async def resume(child: _CoroutineLike) -> None:
     """Batch-only primitive: drive ``child`` through the current phase's work.
 
@@ -577,6 +693,11 @@ async def resume(child: _CoroutineLike) -> None:
     ``batch_phase`` CM views at the next phase, not through this
     primitive's return.
 
+    Strict on retry: if ``child`` yields ``await again()``, ``resume``
+    raises ``RuntimeError`` — the call site declared retry to be a
+    programming error by choosing ``resume``. Use :func:`try_resume`
+    when the child legitimately retries.
+
     Raises if called outside a ``batch_phase`` CM (``_active_phase``
     is ``None``).
     """
@@ -586,7 +707,34 @@ async def resume(child: _CoroutineLike) -> None:
             "resume() called outside a batch_phase CM; resume must be "
             "used inside `async with batch_phase(Py): ...`"
         )
-    await _yield_advance(child, p)
+    sent = await _yield_advance(child, p)
+    if sent is _RETRY:
+        raise RuntimeError(
+            f"resume({child!r}): child issued `await again()` but the "
+            f"caller used resume(), which forbids retry. Use "
+            f"try_resume() if retry is part of the protocol."
+        )
+
+
+async def try_resume(child: _CoroutineLike) -> bool:
+    """Like :func:`resume`, but report retry instead of raising.
+
+    Returns ``True`` if ``child`` progressed past the current phase
+    (or completed); ``False`` if ``child`` yielded ``await again()``.
+    The caller decides what to do on ``False`` — typically either
+    cascade (``await again()`` itself) or skip the child for this
+    pass.
+
+    Like :func:`resume`, must be called inside a ``batch_phase`` CM.
+    """
+    p = _active_phase.get()
+    if p is None:
+        raise RuntimeError(
+            "try_resume() called outside a batch_phase CM; try_resume "
+            "must be used inside `async with batch_phase(Py): ...`"
+        )
+    sent = await _yield_advance(child, p)
+    return sent is not _RETRY
 
 
 @dataclasses.dataclass
@@ -621,21 +769,75 @@ async def step(handle: Batch, *, through: IntEnum) -> Tuple[object, Optional[obj
     - ``(full_read_view, None)`` if the batch completed during
       this step.
 
+    Strict on retry: if the batch yields ``await again()``, ``step``
+    raises ``RuntimeError`` — the call site declared retry to be a
+    programming error by choosing ``step``. Use :func:`try_step` if
+    the batch may legitimately retry.
+
     ``step`` does not nest. The scheduler drives batches
     sequentially via successive ``step`` calls, never two
     simultaneously. The non-nesting assert at entry catches any
     accidental misuse early.
 
     The batch's own ``_active_phase`` at the moment of pop is
-    captured into ``handle.saved_phase`` so the next ``step()`` can
-    restore it.
+    captured into ``handle.saved_phase`` so the next ``step()`` /
+    ``try_step()`` can restore it.
+    """
+    result = await _do_step(handle, through, allow_retry=False)
+    # _do_step never returns None when allow_retry=False (it raises
+    # instead). The cast makes the type narrow for callers using the
+    # untyped (generic) overload.
+    assert result is not None
+    return result
+
+
+async def try_step(
+    handle: Batch, *, through: IntEnum
+) -> Optional[Tuple[object, Optional[object]]]:
+    """Like :func:`step`, but report retry instead of raising.
+
+    Returns ``None`` if the batch yielded ``await again()`` instead of
+    progressing past ``through``. The caller decides what to do —
+    typically retry on a later iter, or skip this batch for now.
+
+    Otherwise returns the same ``(read, write)`` shape as :func:`step`,
+    including ``(full_read_view, None)`` on terminal completion.
+    Distinguishing retry from terminal: retry returns a bare ``None``;
+    terminal returns ``(read_view, None)``.
+
+    Same non-nesting semantics as :func:`step`.
+    """
+    return await _do_step(handle, through, allow_retry=True)
+
+
+async def _do_step(
+    handle: Batch,
+    through: IntEnum,
+    *,
+    allow_retry: bool,
+) -> Optional[Tuple[object, Optional[object]]]:
+    """Common implementation for :func:`step` and :func:`try_step`.
+
+    Differs only in the retry policy: ``allow_retry=False`` raises on
+    ``_RETRY``, ``allow_retry=True`` returns ``None``.
     """
     if _active_storage.get() is not None:
-        raise RuntimeError("step() does not nest; another batch is currently active")
+        raise RuntimeError(
+            "step()/try_step() does not nest; another batch is currently active"
+        )
     _active_storage.set(handle.storage)
     _active_phase.set(handle.saved_phase)
     try:
-        await _yield_advance(handle.coro, through)
+        sent = await _yield_advance(handle.coro, through)
+        if sent is _RETRY:
+            if allow_retry:
+                return None
+            raise RuntimeError(
+                f"step({handle.coro!r}, through={through!r}): batch "
+                f"issued `await again()` but the scheduler used step(), "
+                f"which forbids retry. Use try_step() if the batch may "
+                f"retry."
+            )
         # ``_active_phase`` now reflects where the batch is paused:
         # - inside a batch_phase CM at the wait that triggered the pop, or
         # - ``None`` if the batch completed (last CM cleared it).
@@ -646,10 +848,11 @@ async def step(handle: Batch, *, through: IntEnum) -> Tuple[object, Optional[obj
         write_view = _views_at(handle.storage, through)[1]
         return read_view, write_view
     finally:
-        # Capture the batch's CM state for the next ``step`` to restore,
-        # then clear the active state. ``set(None)`` rather than
-        # ``reset(token)`` for cross-Context cleanup robustness; see
-        # :func:`batch_phase` for rationale.
+        # Capture the batch's CM state for the next step()/try_step()
+        # to restore. ``set(None)`` rather than ``reset(token)`` for
+        # cross-Context cleanup robustness; see :func:`batch_phase`.
+        # On retry the captured value reflects the batch's *unchanged*
+        # phase, since `again()` doesn't touch ``_active_phase``.
         handle.saved_phase = _active_phase.get()
         _active_phase.set(None)
         _active_storage.set(None)
@@ -689,9 +892,9 @@ class Driver:
 
     The Driver decides nothing about scheduling order; the top-level
     coroutine's sequence of ``step`` / ``resume`` calls IS the
-    schedule. The Driver just interprets ``_WaitRequest`` and
-    ``_AdvanceRequest`` sentinels and manages a stack for nested
-    advance.
+    schedule. The Driver interprets three request sentinels —
+    :class:`_WaitRequest`, :class:`_AdvanceRequest`, and
+    :class:`_RetryRequest` — and manages a stack for nested advance.
 
     Pop predicate is strict ``>``: a child is popped when its current
     wait phase is strictly greater than the parent's advance target
@@ -700,6 +903,15 @@ class Driver:
     Strict-progression check on ``_WaitRequest``: a coroutine yielding
     a wait at phase ``P`` after a previous wait at ``Pprev`` raises
     if ``P <= Pprev`` (regression or stay-at-same-phase).
+
+    Retry on ``_RetryRequest``: the Driver pops the coroutine and
+    sends :data:`_RETRY` to the parent's ``_yield_advance``. The
+    coroutine's suspension record and the active state's
+    ``_active_phase`` / ``_active_storage`` are intentionally left
+    unchanged — when the parent next drives this coroutine, it picks
+    up exactly where it left off, with the same view of storage. A
+    retry from the root (no parent) is a programming error and is
+    raised back into the offending coroutine.
 
     The Driver is policy-free about main completion: it returns when
     main returns and raises what main raises. Higher layers decide
@@ -828,6 +1040,22 @@ class Driver:
                 else:
                     # Child still needs more pumping to reach target.
                     send_value = None
+            elif isinstance(request, _RetryRequest):
+                # `await again()`: the coroutine is at some phase and
+                # cannot move forward yet. Pop to its parent and signal
+                # via :data:`_RETRY`. The suspension record and active
+                # state (``_active_phase`` / ``_active_storage``) are
+                # left as-is so the next ``try_step`` / ``try_resume``
+                # restores them and the coroutine resumes from right
+                # after ``await again()`` with the same world view.
+                if target is None:
+                    send_exc = RuntimeError(
+                        "again() at the root coroutine has no parent "
+                        "to retry against; root must complete or raise"
+                    )
+                    continue
+                self._stack.pop()
+                send_value = _RETRY
             else:
                 raise RuntimeError(f"Unknown request yielded by coroutine: {request!r}")
 
