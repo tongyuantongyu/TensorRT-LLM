@@ -1337,6 +1337,97 @@ class PyExecutor:
             )
 
     def _executor_loop_pp(self):
+        # ===================================================================
+        # 3-LAYER COROUTINE REFACTOR ROADMAP -- PIPELINE-PARALLEL LOOP
+        # See `coroutines.py` + `batch_storage.py` for the target runtime.
+        # ===================================================================
+        # Most complex of the three loops. Each batch lives
+        # `n = pp_size = num_micro_batches` iters in iter-INDEX on every
+        # rank (~`2n` wall-time steps end-to-end across the cluster, with
+        # implicit 1F1B stagger from NCCL p2p inside `_forward_step`).
+        # `n - 1` batches alive on every rank simultaneously. Three
+        # off-main-thread lanes the scheduler keeps moving:
+        #   - GPU streams (`execution_stream` for forward + transfer,
+        #     `sample_stream` for the last rank's sampling).
+        #   - Slot ring `self.micro_batches[N mod n]` parking suspended
+        #     batches between forward and bcast handoff.
+        #   - Background `_broadcast_sample_state_loop` thread doing the
+        #     reverse ring `(n-1) -> 0 -> 1 -> ... -> (n-2)` of decoded
+        #     tokens. In the refactor, this becomes a long-running concern
+        #     coroutine that spans `(n-1)` scheduler iterations.
+        #
+        # Batch perspective -- lifecycle of ONE batch on each rank
+        # (in iter-INDEX local to that rank; span = `n` iters)
+        # -------------------------------------------------------------------
+        #   Iter N (creation):
+        #     P_SCHEDULE : `_pp_schedule_and_propagate` (rk0 decides;
+        #                  non-rk0 recv+isend along PP forward chain)
+        #     P_FORWARD  : `_forward_step` (this rank's layer slice;
+        #                  `pp_recv` <- prev, layers, `pp_send` -> next)
+        #     P_SAMPLE   : LAST RANK ONLY -- `_sample_async` queued on
+        #                  `sample_stream` if `pp_multi_stream_sample` else
+        #                  default stream. (batch_state stored in
+        #                  `self.micro_batches[N mod n]`.)
+        #
+        #   Iter N+1 (sample sync; last rank's bcast handoff):
+        #     P_SYNC_EVT : `previous_batch.sample_state.sampler_event`
+        #                  `.synchronize()`
+        #                    - last rank: real GPU->CPU copy of decoded
+        #                      tokens (host data feeds the ring isend)
+        #                    - other ranks: backpressure-only sync of a
+        #                      placeholder event
+        #     P_HANDOFF  : LAST RANK ONLY -- `executed_batch_queue.put`
+        #                  (offset `-1`); bcast thread `isend_object`s
+        #                  tokens -> rk0. (For other ranks, P_HANDOFF
+        #                  happens at iter `N+(n-1)` instead.)
+        #
+        #   Iter N+2 .. N+(n-2) (parked):
+        #     Batch sits in its slot (intermediate ranks) or in
+        #     `executed_batch_response_queue` (last rank). bcast thread on
+        #     rk0/.../(n-2) walks the reverse ring in the background.
+        #
+        #   Iter N+(n-1) (retirement on every rank):
+        #     P_HANDOFF  : NON-LAST RANKS -- `executed_batch_queue.put`
+        #                  (offset `-(n-1)`) + bcast thread does its single
+        #                  ring hop (recv <- prev, isend -> next, or
+        #                  terminus on rk(n-2))
+        #     P_VOTE     : rk0 alone fetches its response queue and sets
+        #                  `executed_batch_num`; the count propagates along
+        #                  the PP forward chain so all ranks retire the
+        #                  same number of batches.
+        #     P_RETIRE   : `_handle_executed_batch(mb_N)` --
+        #                  `_update_requests` (apply tokens),
+        #                  `_send_kv_async`, `_handle_responses`
+        #                  (rk0 -> user), `update_resources`,
+        #                  `_remove_inflight_ids`.
+        # User-visible first-token latency = `n` wall-time steps (rk0's
+        # P_RETIRE). End-to-end batch lifetime across the cluster =
+        # `2n` wall-time steps (rk(n-1)'s P_RETIRE).
+        #
+        # Scheduler perspective -- per-iter work (3 batches per iter)
+        # -------------------------------------------------------------------
+        # On every rank, identify each batch by `k = iters since forward`:
+        #   k = 0    : `mb_t`            -- current iter's batch
+        #   k = 1    : `mb_(t-1)`        -- prev iter's batch (sync, plus
+        #                                   last-rank handoff)
+        #   k = n-1  : `mb_(t-(n-1))`    -- oldest in flight (handoff +
+        #                                   vote + retire)
+        # Non-last ranks: cleanly grouped k=0 -> k=1 -> k=n-1.
+        # Last rank: one k=1 wait (`finish_sample_event.wait()`, fencing
+        # `sample_stream`) is interleaved into the k=0 forward block.
+        # Pseudo-refactored body:
+        #
+        #     async def scheduler_iter():
+        #         await step(handle_curr,   through=P_SAMPLE)    # k=0
+        #         await step(handle_prev,   through=P_HANDOFF)   # k=1
+        #         await step(handle_oldest, through=P_RETIRE)    # k=n-1
+        #         ring.append(handle_curr); handle_oldest = ring.popleft()
+        #
+        # The slot ring + bcast thread + sample_stream all encode lag the
+        # refactor must replace with phased `BatchStorage` fields and a
+        # ring-broadcast concern coroutine that spans `(n-1)` scheduler
+        # iters.
+        # ===================================================================
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -2037,6 +2128,40 @@ class PyExecutor:
         return can_forward, False
 
     def _executor_loop(self):
+        # ===================================================================
+        # 3-LAYER COROUTINE REFACTOR ROADMAP -- PLAIN LOOP
+        # See `coroutines.py` + `batch_storage.py` for the target runtime
+        # (Concern: `enter_phase` / Batch: `batch_phase` + `resume` /
+        #  Scheduler: `step`). After untanglement, every coroutine body
+        # is single-topic and linear.
+        # ===================================================================
+        #
+        # Batch perspective -- lifecycle of ONE batch (span = 1 iter)
+        # -------------------------------------------------------------------
+        #   P_SCHEDULE -> P_FORWARD -> P_SAMPLE -> P_APPLY -> P_RESPOND
+        #     P_SCHEDULE : `_prepare_and_schedule_batch`, resource prep,
+        #                  first-token response, `_kv_connector_start_batch`
+        #     P_FORWARD  : `_forward_step` (queues GPU forward; draft prep
+        #                  + guided decoder run within)
+        #     P_SAMPLE   : `_sample_async` (records `sampler_event`)
+        #     P_APPLY    : `_update_request_states` then `_update_requests`
+        #                  -- BLOCKS on sampler_event before applying
+        #                  decoded tokens to LlmRequests
+        #     P_RESPOND  : `_send_kv_async`, `_handle_canceled_requests`,
+        #                  `_handle_responses` (delivers to user),
+        #                  `resource_manager.update_resources`,
+        #                  `_kv_connector_terminate_requests`
+        # The batch is born at P_SCHEDULE and retired at P_RESPOND of the
+        # SAME iteration.
+        #
+        # Scheduler perspective -- per-iter work (1 batch in flight)
+        # -------------------------------------------------------------------
+        # No inter-batch interleaving. Pseudo-refactored body:
+        #
+        #     async def scheduler_iter():
+        #         handle = Batch(batch_coro(), BatchStorage())
+        #         await step(handle, through=P_RESPOND)
+        # ===================================================================
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
@@ -2279,6 +2404,50 @@ class PyExecutor:
             self.control_request_barrier.clear()
 
     def _executor_loop_overlap(self):
+        # ===================================================================
+        # 3-LAYER COROUTINE REFACTOR ROADMAP -- OVERLAP LOOP
+        # See `coroutines.py` + `batch_storage.py` for the target runtime.
+        # ===================================================================
+        # Same three layers as the plain loop. This loop deliberately splits
+        # each batch's lifecycle across TWO iters so the GPU forward of
+        # `mb_t` overlaps the CPU bookkeeping of `mb_(t-1)`. The cross-iter
+        # state is `self.previous_batch`; `_forward_step` reads `mb_(t-1)`'s
+        # GPU sample tensors directly via `previous_tensors_device`, so
+        # nothing on the critical path waits for the previous sampler event.
+        #
+        # Batch perspective -- lifecycle of ONE batch (span = 2 iters)
+        # -------------------------------------------------------------------
+        #   Iter t (creation):
+        #     P_SCHEDULE  : `_prepare_and_schedule_batch`, resource prep
+        #     P_FORWARD   : `_forward_step(scheduled_batch,
+        #                                  previous_tensors_device)`
+        #     P_SAMPLE    : `_sample_async`
+        #     P_STATE_UPD : `_update_request_states`
+        #
+        #   Iter t+1 (retirement -- the loop body sees this batch as
+        #             `self.previous_batch`):
+        #     P_APPLY     : `_update_requests(mb_t.sample_state)` -- BLOCKS
+        #                   on mb_t's sampler_event, then `_send_kv_async`
+        #     P_RESPOND   : `_process_previous_batch` (responses + perf,
+        #                   `_kv_connector_terminate_requests`)
+        # First iter queues GPU work and stashes the batch as
+        # `previous_batch`; second iter syncs and retires it.
+        #
+        # Scheduler perspective -- per-iter work (2 batches, interleaved 4x)
+        # -------------------------------------------------------------------
+        # `mb_t` (newly forwarded) and `mb_(t-1)` (about to retire) are
+        # interleaved because `_update_requests(prev)` must run AFTER
+        # `_forward_step(curr)` is queued (so its sampler_event sync
+        # overlaps the GPU forward of mb_t) but BEFORE `_sample_async(curr)`
+        # (which mutates the default stream). Pseudo-refactored body:
+        #
+        #     async def scheduler_iter():
+        #         await step(handle_t,    through=P_FORWARD)
+        #         await step(handle_prev, through=P_APPLY)
+        #         await step(handle_t,    through=P_STATE_UPD)
+        #         await step(handle_prev, through=P_RESPOND)   # terminal
+        #         handle_prev = handle_t                        # promote
+        # ===================================================================
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
