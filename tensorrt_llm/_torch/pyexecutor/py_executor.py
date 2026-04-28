@@ -1427,6 +1427,62 @@ class PyExecutor:
         # refactor must replace with phased `BatchStorage` fields and a
         # ring-broadcast concern coroutine that spans `(n-1)` scheduler
         # iters.
+        #
+        # Thread-elimination policy (shared with all `_executor_loop*` variants)
+        # -------------------------------------------------------------------
+        # The refactor removes application-owned auxiliary threads. Their
+        # work moves onto the main loop coroutine via a uniform
+        # "submit -> opportunistic probe -> wait at deadline" pattern:
+        #   submit : non-blocking primitive returning a handle (e.g.,
+        #            `MPI.Comm.Irecv` / `Isend`, `cudaEventRecord`,
+        #            KV transceiver `start_transfer`).
+        #   probe  : non-blocking query at iter top to drive library
+        #            progress (`MPI.Request.Test`, `cudaEventQuery`,
+        #            `ucp_worker_progress`). Cheap; lets a concern
+        #            coroutine handle results early when ready.
+        #   wait   : the coroutine block-waits at the deadline phase
+        #            (`MPI.Request.Wait`, `cudaEventSynchronize`,
+        #            `end_transfer`).
+        # Exception: operations that are fundamentally sync-blocking with
+        # no async API (rare) are wrapped in one shared
+        # `ThreadPoolExecutor` that re-shapes them into submit+wait. From
+        # the coroutine layer they look identical to native async ops; the
+        # thread pool is an implementation detail of those concerns.
+        # Library-internal threads (MPI / NIXL / UCX / NCCL progress) are
+        # untouched -- we only eliminate threads we own.
+        #
+        # Threads removed under this policy on this loop variant:
+        #   * `broadcast_sample_state_handler` (the sole PP-only
+        #     application thread): the entire reverse ring loop collapses
+        #     into a single ring-broadcast concern coroutine on the main
+        #     thread. New per-slot `recv_handles[N mod n]` complement the
+        #     existing `send_handles` ring. The pattern:
+        #       - submit `Irecv` at iter N (right after `_forward_step`
+        #         returns on every non-source rank) -- earliest legal
+        #         phase to know mb_N will need a receive.
+        #       - probe via `MPI.Request.Test` at iter top to drive MPI
+        #         progress without an idle thread.
+        #       - wait at iter N+1 on the last rank (just before the
+        #         host-side `isend_object` of the freshly-sampled tokens)
+        #         and at iter N+(n-1) on the other ranks (P_RETIRE) --
+        #         the same deadlines the bcast thread enforces today.
+        #     Consequences:
+        #       - `mpi_comm().Dup()` (and the deadlock workaround it
+        #         exists for) goes away; all MPI now runs single-threaded
+        #         on one comm.
+        #       - `executed_batch_queue` and
+        #         `executed_batch_response_queue` go away (the slot ring
+        #         plus its handle ring is enough state).
+        #       - The `TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE` env var
+        #         (which exists only to disable bcast-thread asynchrony
+        #         for deterministic tests) retires too -- the runtime is
+        #         deterministic by construction.
+        #   * Sampler `_async_worker`: same treatment as in the non-PP
+        #     loops -- `cudaEventRecord` (submit at P_SAMPLE) paired with
+        #     `cudaEventSynchronize` (wait at P_SYNC_EVT, the iter N+1
+        #     sync point) replaces the thread pool. On the last rank the
+        #     wait gates the host-side ring isend; on other ranks it is
+        #     the placeholder backpressure sync.
         # ===================================================================
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
@@ -2161,6 +2217,38 @@ class PyExecutor:
         #     async def scheduler_iter():
         #         handle = Batch(batch_coro(), BatchStorage())
         #         await step(handle, through=P_RESPOND)
+        #
+        # Thread-elimination policy (shared with all `_executor_loop*` variants)
+        # -------------------------------------------------------------------
+        # The refactor removes application-owned auxiliary threads. Their
+        # work moves onto the main loop coroutine via a uniform
+        # "submit -> opportunistic probe -> wait at deadline" pattern:
+        #   submit : non-blocking primitive returning a handle (e.g.,
+        #            `MPI.Comm.Irecv` / `Isend`, `cudaEventRecord`,
+        #            KV transceiver `start_transfer`).
+        #   probe  : non-blocking query at iter top to drive library
+        #            progress (`MPI.Request.Test`, `cudaEventQuery`,
+        #            `ucp_worker_progress`). Cheap; lets a concern
+        #            coroutine handle results early when ready.
+        #   wait   : the coroutine block-waits at the deadline phase
+        #            (`MPI.Request.Wait`, `cudaEventSynchronize`,
+        #            `end_transfer`).
+        # Exception: operations that are fundamentally sync-blocking with
+        # no async API (rare) are wrapped in one shared
+        # `ThreadPoolExecutor` that re-shapes them into submit+wait. From
+        # the coroutine layer they look identical to native async ops; the
+        # thread pool is an implementation detail of those concerns.
+        # Library-internal threads (MPI / NIXL / UCX / NCCL progress) are
+        # untouched -- we only eliminate threads we own.
+        #
+        # Threads removed under this policy on this loop variant:
+        #   * Sampler `_async_worker` (the `ThreadPoolExecutor` started by
+        #     `start_worker` for `AsyncWorkerMixin` samplers): the D2H
+        #     copies of sample-state tensors are already CUDA-async, so
+        #     pair `cudaEventRecord` (submit at P_SAMPLE) with
+        #     `cudaEventSynchronize` (wait at P_APPLY of the SAME iter).
+        #     Any genuinely sync CPU bookkeeping that remains lives in the
+        #     shared exception thread pool.
         # ===================================================================
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -2447,6 +2535,38 @@ class PyExecutor:
         #         await step(handle_t,    through=P_STATE_UPD)
         #         await step(handle_prev, through=P_RESPOND)   # terminal
         #         handle_prev = handle_t                        # promote
+        #
+        # Thread-elimination policy (shared with all `_executor_loop*` variants)
+        # -------------------------------------------------------------------
+        # The refactor removes application-owned auxiliary threads. Their
+        # work moves onto the main loop coroutine via a uniform
+        # "submit -> opportunistic probe -> wait at deadline" pattern:
+        #   submit : non-blocking primitive returning a handle (e.g.,
+        #            `MPI.Comm.Irecv` / `Isend`, `cudaEventRecord`,
+        #            KV transceiver `start_transfer`).
+        #   probe  : non-blocking query at iter top to drive library
+        #            progress (`MPI.Request.Test`, `cudaEventQuery`,
+        #            `ucp_worker_progress`). Cheap; lets a concern
+        #            coroutine handle results early when ready.
+        #   wait   : the coroutine block-waits at the deadline phase
+        #            (`MPI.Request.Wait`, `cudaEventSynchronize`,
+        #            `end_transfer`).
+        # Exception: operations that are fundamentally sync-blocking with
+        # no async API (rare) are wrapped in one shared
+        # `ThreadPoolExecutor` that re-shapes them into submit+wait. From
+        # the coroutine layer they look identical to native async ops; the
+        # thread pool is an implementation detail of those concerns.
+        # Library-internal threads (MPI / NIXL / UCX / NCCL progress) are
+        # untouched -- we only eliminate threads we own.
+        #
+        # Threads removed under this policy on this loop variant:
+        #   * Sampler `_async_worker`: the D2H copy of mb_t's sample-state
+        #     is already CUDA-async; pair `cudaEventRecord` (submit at
+        #     iter t's P_SAMPLE) with `cudaEventSynchronize` (wait at
+        #     iter t+1's P_APPLY, where the existing code already
+        #     implicitly syncs the sampler event inside `_update_requests`
+        #     -- so making the submit + wait explicit is a one-line move,
+        #     not a control-flow change).
         # ===================================================================
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
