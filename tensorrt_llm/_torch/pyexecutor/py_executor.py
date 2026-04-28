@@ -1484,6 +1484,181 @@ class PyExecutor:
         #     wait gates the host-side ring isend; on other ranks it is
         #     the placeholder backpressure sync.
         # ===================================================================
+        # ===================================================================
+        # CONCERN / PHASE / HALF-CONCERN ANNOTATIONS (round 1: comments only)
+        # -------------------------------------------------------------------
+        # Concerns: same set as the plain / overlap loops, minus
+        # `kv_connector` (PP loop currently has no kv_connector hooks)
+        # and `dwdp` / explicit `perf_metric` GPU-event blocks.
+        #
+        # Per-batch phase order (each batch lives `n = pp_size` iters in
+        # iter-INDEX local to this rank):
+        #   P_SCHEDULE -> P_FORWARD -> P_SAMPLE -> P_STATE_UPD
+        #     -> P_SYNC_EVT -> P_HANDOFF -> [parked iters]
+        #     -> P_VOTE -> P_RETIRE
+        # Phase placement varies by rank because of the implicit 1F1B
+        # NCCL stagger in `_forward_step` (when rk0 is at iter N, rk1 is
+        # at iter N-1, ... — a single physical batch traverses the
+        # cluster in (n-1) wall-time steps after rk0 created it):
+        #   Last rank   : P_SCHEDULE/FORWARD/SAMPLE/STATE_UPD at iter N,
+        #                 P_SYNC_EVT/HANDOFF at iter N+1,
+        #                 P_VOTE/RETIRE at iter N+(n-1).
+        #   Other ranks : P_SCHEDULE/FORWARD at iter N (P_SAMPLE collapses
+        #                 to a placeholder sampler_event in
+        #                 `_forward_step_inter_pp`), P_SYNC_EVT at iter N+1,
+        #                 P_HANDOFF at iter N+(n-1), P_VOTE/RETIRE same iter.
+        # Iter N+2 .. N+(n-2) the batch is *parked* in slot ring storage
+        # (intermediate ranks: `self.micro_batches[N mod n]`; last rank:
+        # already in `executed_batch_response_queue` after the bcast hop).
+        #
+        # Scheduler iter pattern (3 step calls + ring rotation):
+        #     async def scheduler_iter():
+        #         await step(handle_curr,   through=P_SAMPLE)    # k=0
+        #         await step(handle_prev,   through=P_HANDOFF)   # k=1
+        #         await step(handle_oldest, through=P_RETIRE)    # k=n-1
+        #         ring.append(handle_curr); handle_oldest = ring.popleft()
+        #
+        # User-visible first-token latency = `n` wall-time steps (rk0's
+        # P_RETIRE on the very first batch). End-to-end batch lifetime
+        # across the cluster = `2n` wall-time steps (rk(n-1)'s P_RETIRE).
+        #
+        # "Half concerns" — two flavors in the PP loop:
+        # =================================================================
+        # (a) SAME-RANK CROSS-ITER half concerns. The scheduler stashes
+        # one batch's per-batch data and consumes it in a later iter on
+        # the *same* rank. These are the slot ring + handle rings:
+        #
+        #   HC1 SLOT RING (per rank): mb_t.{scheduled_requests, sample_state,
+        #         iter_stats, iter_start_time, microbatch_id} (P_STATE_UPD)
+        #         -> mb_t at later iter's HANDOFF (P_HANDOFF).
+        #     produce: `self.micro_batches[microbatch_id] = batch_state`
+        #              at iter N (P_STATE_UPD end), or `... = None` when
+        #              the batch was skipped.
+        #     consume: `executed_batch = self.micro_batches[(microbatch_id
+        #              + offset) % n]` at iter N+|offset| where
+        #              offset=-1 (last rank, k=1) or 1-n (other ranks, k=n-1).
+        #     The slot ring is what implements "the batch is parked for
+        #     n-2 iters" — a coroutine refactor would replace the slot
+        #     by a held `Batch` handle in a deque on the scheduler.
+        #
+        #   HC2 PREV (last rank only, cross-iter same rank):
+        #     mb_t.sample_state.sampler_event (P_SAMPLE)
+        #         -> next iter's P_SYNC_EVT for mb_t.
+        #     produce: `self.previous_batch = batch_state` at iter N.
+        #     consume: `previous_batch = self.previous_batch;
+        #              previous_batch.sample_state.sampler_event.synchronize()`
+        #              at iter N+1.
+        #     The conditional "(is_last_pp_rank or can_queue) and previous_batch
+        #     is not None" is the same-iter side: non-last ranks delay
+        #     this sync if `not can_queue`, deferring it to a later iter.
+        #
+        #   HC3 SAMPLE_STREAM (last rank, last-rank multi-stream sampling):
+        #     mb_t.finish_sample_event (recorded after _sample_async on
+        #     sample_stream) -> next iter's mb_(t+1) sampling.
+        #     produce: `self.finish_sample_event.record()` (this iter,
+        #              after _sample_async on sample_stream).
+        #     consume: `self.finish_sample_event.wait()` (next iter,
+        #              before next _sample_async on sample_stream).
+        #     Backpressures the sample_stream so two iters of sampling
+        #     don't overlap on the same stream resources.
+        #
+        #   HC4 BCAST QUEUE (per rank, but pairs with the bcast thread's
+        #   cross-rank ring HC10 below): mb_t put into bcast queue at
+        #   iter N+offset -> retrieved from response queue at the iter
+        #   when its ring traversal completes.
+        #     produce: `self.executed_batch_queue.put(executed_batch)`.
+        #     consume: `self.executed_batch_response_queue.get()` (drained
+        #              by `fetch_executed_batches` on rk0 and by
+        #              `handle_executed_batches` elsewhere).
+        #     In the refactored runtime, this becomes a long-running
+        #     "ring broadcast" concern coroutine spanning (n-1) scheduler
+        #     iters.
+        #
+        #   HC5 SEND HANDLES RING (per rank): isend handle for slot N
+        #   produced now, waited at the next iter that reuses slot N.
+        #     produce: `self.send_handles[mid] = isend_object(...)` (in
+        #              bcast thread / rank-broadcast helpers).
+        #     consume: `self.wait_on_pp_send_handles(self.send_handles, mid)`
+        #              before the next isend into the same slot.
+        #     Same pattern applies to `send_schedule_handles` (HC5a) and
+        #     `send_expected_batch_num_handles` (HC5b).
+        #
+        # (b) CROSS-RANK transfers — NOT scheduler-level when intra-batch.
+        # A "batch" here means all logic dealing with the *same set of
+        # requests* on all ranks. A cross-rank transfer that carries one
+        # batch's per-batch data (a request set's activations, schedule
+        # decision, or sample tokens) is *intra-batch*: the producer
+        # rank and the consumer rank are both inside the SAME logical
+        # batch concern, just running its body on different physical
+        # ranks. Such transfers belong inside a *distributed concern
+        # coroutine* that runs on every rank — the cross-rank send/recv
+        # is the concern's own internal coordination, not a scheduler
+        # bridge between separate batches.
+        #
+        # The intra-batch distributed concerns identified:
+        #   HC7 PP FORWARD CHAIN — internal to the `forward` distributed
+        #     concern (hidden inside `_forward_step`'s NCCL p2p). Each
+        #     rank's `forward` body pp_recv <- prev, runs its layer
+        #     slice, pp_send -> next. This is what *creates* the 1F1B
+        #     stagger that makes the per-rank iter clocks differ.
+        #   HC8 PP SCHEDULE CHAIN — internal to the `schedule` distributed
+        #     concern (`_pp_schedule_and_propagate`). rk0's body runs
+        #     the scheduler and serializes; other ranks' bodies recv
+        #     from prev and isend to next, then deserialize the same
+        #     decision. The same request set ends up scheduled on every
+        #     rank.
+        #   HC10 SAMPLE-STATE REVERSE RING — internal to a long-running
+        #     `ring_broadcast_sample` distributed concern (currently
+        #     `_ring_broadcast_sample_state` running on the bcast
+        #     thread `_broadcast_sample_state_loop`). Ring traverses
+        #     (n-1) -> 0 -> 1 -> ... -> (n-2) carrying the *same batch's*
+        #     decoded tokens to all ranks. In the coroutine refactor
+        #     this becomes a per-batch coroutine that spans (n-1)
+        #     scheduler iters; the docstring above explicitly calls
+        #     this out as the replacement for the bcast thread.
+        #
+        # The cross-rank transfers that are NOT intra-batch — these
+        # belong to NEITHER the per-batch coroutines NOR a distributed
+        # concern coroutine. They are pure per-iter scheduler bookkeeping
+        # that happens to need cross-rank coordination, so in the
+        # refactored model they are *executed directly by the scheduler*
+        # (plain Python code between/around `step` calls — no `Batch`
+        # handle, no `enter_phase`, no `BatchStorage`):
+        #
+        #   HC9 EXECUTED-BATCH-NUM CHAIN: rk0 votes how many batches
+        #     retire this iter; count propagates rk0 -> rk(n-1) via
+        #     the PP forward chain. The count isn't tied to one
+        #     request set — multiple retiring batches at this iter
+        #     share the vote. Refactored placement: a `dist.recv_object
+        #     / isend_object` chain inlined in the scheduler iter,
+        #     between the per-batch step calls.
+        #
+        #   PP-only termination consensus
+        #     (`_disagg_pp_termination_handler.terminate_pending_requests`):
+        #     ballot of pending request terminations propagated across
+        #     PP ranks every iter so KV-reuse paths free a request
+        #     symmetrically. Same shape as HC9 — payload is not tied
+        #     to one request set. Refactored placement: also scheduler-
+        #     direct code, sits in the scheduler iter tail.
+        #
+        # Anything else (HC7, HC8, HC10, the per-batch HC2/HC3, etc.) is
+        # owned by some batch's coroutine or a distributed concern; only
+        # the two above are pure scheduler-direct work.
+        #
+        # The same-rank cross-iter half concerns in (a) above are also
+        # NOT scheduler-level when viewed in the refactored model — most
+        # become internal state of either a per-batch coroutine (HC2 /
+        # HC3 belong to `sample`'s cross-iter flow) or a distributed
+        # concern coroutine (HC4 is the local end of HC10's ring; HC5 /
+        # HC5a / HC5b are isend-handle accounting inside HC10 / HC8 /
+        # HC9 respectively). Only HC1 SLOT RING reflects scheduler
+        # bookkeeping proper — and even that collapses to "scheduler
+        # holds a deque of Batch handles" in the refactor; the slot is
+        # an artifact of the current `BatchStatePP`-record style.
+        #
+        # No reorders required: the existing line order is a valid
+        # topological sort of the per-rank concern DAG.
+        # ===================================================================
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -1493,33 +1668,103 @@ class PyExecutor:
             iter_start_time = time.time()
             iter_stats = None
             while True:
+                # =========================================================
+                # ===== STEP (1) : curr P_SCHEDULE -> P_SAMPLE ============
+                # =========================================================
+                # Prepares mb_t (k=0) on this rank. On the last rank this
+                # also samples; on other ranks `_forward_step_inter_pp`
+                # produces a placeholder sampler_event so HC2's sync at
+                # next iter has something to synchronize on.
+
+                # ===== curr PHASE: P_SCHEDULE =====
+
+                # Concern: hang
+                # Task: progress watchdog tick.
                 self.hang_detector.checkpoint()
+                # Concern: profile
+                # Task: drive torch / CUDA-event profiler state machine.
                 profile_step()
+                # Concern: iter_stats (curr)
+                # Task: stamp iter_start_time. Read at curr's P_RETIRE
+                #       inside `_handle_executed_batch` ->
+                #       `_process_iter_stats`. Field carried through the
+                #       n-iter lifecycle via the slot ring (HC1).
+                # Consume: -
+                # Produce: iter_start_time (curr field)
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
+                # Concern: schedule (request intake)
+                # Task: dequeue + validate + activate new requests.
+                # Consume: -
+                # Produce: new_requests; mutates self.active_requests
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
+                # Concern: loop_control
+                # Task: shutdown gate. NOTE: PP loop breaks BEFORE the
+                #       `_handle_control_request` / disagg probes / iter
+                #       stats init, unlike the plain loop, because the
+                #       PP loop also has the `Stage 5` post-shutdown
+                #       drain below.
                 if self.should_stop_processing:
                     break
 
+                # Concern: control
+                # Task: pause loop if a control request is pending.
                 self._handle_control_request()
 
                 if self.kv_cache_transceiver:
+                    # Concern: disagg (probes — same as plain loop's
+                    #          `_prepare_and_schedule_batch` opening)
+                    # Task: opportunistic non-blocking probes that drive
+                    #       the disagg KV-transceiver state machine.
+                    # Consume: new_requests
+                    # Produce: per-request state transitions (out-of-band)
                     self._check_disagg_ctx_schedulable_status(new_requests)
                     self._check_disagg_gen_transfer_status()
 
+                # Concern: iter_stats (init)
+                # Task: allocate iter_stats record + queue-latency snapshot.
+                # Consume: -
+                # Produce: iter_stats (curr field)
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
                         self._get_new_active_requests_queue_latency())
 
+                # Concern: schedule (ADP dummy padding)
+                # Task: pad with a dummy gen request when ADP rank is empty.
+                # Consume: -
+                # Produce: self.active_requests
                 self._pad_attention_dp_dummy_request()
 
+                # Concern: schedule (distributed — HC8 PP SCHEDULE CHAIN
+                #          is its internal cross-rank coordination, not
+                #          a scheduler half concern)
+                # Task: rk0's body runs the scheduler and serializes;
+                #       non-rk0 bodies recv from prev PP rank via
+                #       recv_object and isend to next (HC5a SEND HANDLES
+                #       RING is the schedule concern's own isend
+                #       accounting). All ranks deserialize the same
+                #       decision so the same request set ends up
+                #       scheduled on every rank — that is what makes
+                #       this *intra-batch*.
+                # Consume: cross-rank: prev rank's serialized schedule
+                # Produce: scheduled_batch, fitting_disagg_gen_init_requests,
+                #          num_fitting_reqs (curr fields); cross-rank:
+                #          isend to next rank
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._pp_schedule_and_propagate(
                     microbatch_id)
                 if self.dist.rank != 0:
+                    # Concern: schedule (PP retry / local scheduler replay)
+                    # Task: non-rk0 ranks may not have enough KV; retry
+                    #       by waiting for at-least-one ctx KV transfer
+                    #       (this is a `disagg` concern call inside),
+                    #       then replay the scheduler locally so request
+                    #       state matches what rk0 saw.
+                    # Consume: scheduled_batch (PP-propagated)
+                    # Produce: scheduler-side request state mutations
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
                     # Run scheduler locally because scheduler may change llm requests' state.
@@ -1528,6 +1773,14 @@ class PyExecutor:
 
                 # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                 if self.kv_cache_transceiver:
+                    # Concern: resource (+ disagg) — same as plain loop's
+                    #          `_prepare_and_schedule_batch`.
+                    # Task: prepare KV / resource state for newly fitting
+                    #       disagg-gen-init requests; submit async KV
+                    #       recv. Then run disagg back-pressure probes.
+                    # Consume: fitting_disagg_gen_init_requests,
+                    #          scheduled_batch, num_fitting_reqs
+                    # Produce: KV blocks, recv handles (out-of-band)
                     self._prepare_disagg_gen_init(
                         fitting_disagg_gen_init_requests)
 
@@ -1548,6 +1801,10 @@ class PyExecutor:
                             # transfers to free KV blocks (see _executor_loop).
                             self._check_disagg_ctx_cache_transfer_status(0)
 
+                # Concern: schedule (telemetry)
+                # Task: stash batch_size for external introspection.
+                # Consume: scheduled_batch
+                # Produce: self.num_scheduled_requests
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
                 logger.debug(
@@ -1557,27 +1814,64 @@ class PyExecutor:
                     f'{scheduled_batch.num_generation_requests} generation requests'
                 )
 
+                # Concern: schedule (collective queue gate)
+                # Task: collective check that every TP rank has a non-empty
+                #       batch.
+                # Consume: scheduled_batch.batch_size
+                # Produce: can_queue
                 can_queue, _ = self._can_queue(scheduled_batch)
                 if not can_queue:
+                    # Concern: resource (revert)
+                    # Task: undo V2 scheduler's per-gen KV growth when
+                    #       skipping the forward.
                     self._revert_gen_alloc(scheduled_batch)
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
                     )
+                    # Half concern: HC1 SLOT RING (produce — empty slot)
+                    # Task: mark slot N as empty so the future drain at
+                    #       iter N+offset sees `executed_batch is None`
+                    #       and skips HC4 produce.
+                    # Consume: -
+                    # Produce: self.micro_batches[microbatch_id] (cleared)
                     self.micro_batches[microbatch_id] = None
                 else:
                     logger.debug(f"microbatch {microbatch_id} can be queued")
 
+                    # Concern: schedule (inflight tracking)
+                    # Task: register curr's request IDs in
+                    #       self.inflight_req_ids so the scheduler can
+                    #       skip them next iter (until tokens are
+                    #       generated). Paired with `_remove_inflight_ids`
+                    #       at P_RETIRE inside `_handle_executed_batch`
+                    #       — same `schedule` concern, two phases.
+                    # Consume: scheduled_batch
+                    # Produce: self.inflight_req_ids
                     self._add_inflight_ids(scheduled_batch)
 
                     if self.kv_cache_transceiver:
+                        # Concern: disagg
+                        # Task: promote DISAGG_GENERATION_TRANS_COMPLETE
+                        #       gen requests to GENERATION_IN_PROGRESS;
+                        #       prepend first_gen logits/logprobs.
+                        # Consume: scheduled_batch.generation_requests
+                        # Produce: per-request state (out-of-band)
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
+                    # Concern: spec_decode (dynamic draft length)
+                    # Task: pad/truncate py_draft_tokens uniform.
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    # Concern: resource
+                    # Task: allocate KV blocks. Paired with
+                    #       `update_resources` at P_RETIRE inside
+                    #       `_handle_executed_batch`.
                     self.resource_manager.prepare_resources(scheduled_batch)
 
+                    # Concern: schedule (gen-request reorder)
+                    # Task: stable-sort gen requests for disagg layout.
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
@@ -1589,27 +1883,86 @@ class PyExecutor:
                     )
 
                     if self.kv_cache_transceiver:
+                        # Concern: response (first-token)
+                        # Task: emit first-token responses early for the
+                        #       disagg client. Paired with the main
+                        #       `response` work at P_RETIRE.
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
 
+                    # ===== curr PHASE: P_FORWARD =====
                     # Stage 1.1: Async forward (all ranks) and decoding pass (last rank only)
                     if not self.dist.is_last_pp_rank:
                         with torch.cuda.nvtx.range(
                                 f"_forward_step_inter_pp pp_rank {self.dist.pp_rank}"
                         ):
+                            # Concern: forward (distributed — HC7 PP FORWARD
+                            #          CHAIN is its internal cross-rank
+                            #          coordination, intra-batch) (+ sample
+                            #          placeholder + state advance)
+                            # Task: model forward on this rank's layer
+                            #       slice. The forward body pp_recv <-
+                            #       prev rank and pp_send -> next rank
+                            #       internally — same `forward` concern
+                            #       running on every rank for the *same
+                            #       request set*, which is what creates
+                            #       the 1F1B stagger between the per-rank
+                            #       iter clocks.
+                            #       `_forward_step_inter_pp` ALSO
+                            #       constructs a *placeholder*
+                            #       sampler_event (just a recorded
+                            #       cuda.Event with no data) and runs
+                            #       `_update_request_states` so the
+                            #       stash at P_STATE_UPD has a unified
+                            #       BatchStatePP shape across ranks.
+                            #       (i.e., this single function call
+                            #       covers what the last rank breaks
+                            #       into forward + sample + state-upd.)
+                            # Consume: scheduled_batch (cross-rank: prev
+                            #          rank's activations via NCCL p2p
+                            #          — the consume side of HC7,
+                            #          internal to this concern)
+                            # Produce: sample_state (placeholder + state
+                            #          advance applied), runtime_draft_len
+                            #          (via `_update_request_states`
+                            #          embedded in this call); cross-rank:
+                            #          activations to next rank (HC7
+                            #          produce, internal to this concern)
                             sample_state = self._forward_step_inter_pp(
                                 scheduled_batch)
                     else:
                         with torch.cuda.nvtx.range(
                                 f"_forward_step_last_pp pp_rank {self.dist.pp_rank}"
                         ):
+                            # Concern: guided_decoder (curr — pre-forward)
+                            # Task: register batch with constraint
+                            #       matcher; init disagg-gen request
+                            #       matchers. Last-rank only because
+                            #       only the last rank produces logits
+                            #       to mask.
                             # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                             if self.guided_decoder is not None and self.kv_cache_transceiver:
                                 self.guided_decoder.add_batch(scheduled_batch)
                                 self.guided_decoder.init_disagg_gen_requests()
 
+                            # Concern: forward (distributed — last rank
+                            #          terminus of HC7 PP FORWARD CHAIN)
+                            # Task: model forward on the last layer slice;
+                            #       internally pp_recv from prev (HC7's
+                            #       consume side at this rank, intra-batch),
+                            #       no pp_send (terminus of the chain).
+                            # Consume: scheduled_batch (cross-rank: prev's
+                            #          activations, internal to the
+                            #          distributed `forward` concern)
+                            # Produce: batch_outputs (logits)
                             batch_outputs = self._forward_step(scheduled_batch)
 
+                            # ===== curr PHASE: P_SAMPLE (last rank only) =====
+
+                            # Concern: guided_decoder (curr — apply masks)
+                            # Task: apply matcher to logits, flag failed.
+                            # Consume: batch_outputs (logits)
+                            # Produce: guided_decoder_failed_requests
                             guided_decoder_failed_requests = None
                             if self.guided_decoder is not None:
                                 self.guided_decoder.add_batch(scheduled_batch)
@@ -1617,8 +1970,24 @@ class PyExecutor:
                                     batch_outputs['logits'])
 
                             if self.pp_multi_stream_sample:
+                                # Half concern: HC3 SAMPLE_STREAM (consume —
+                                #          last-rank cross-iter)
+                                # Task: wait for last iter's sampling on
+                                #       sample_stream to finish (paired
+                                #       with last iter's
+                                #       `finish_sample_event.record()`
+                                #       below).
+                                # Consume: self.finish_sample_event
+                                #          (cross-iter scheduler state)
+                                # Produce: -
                                 # Wait for the previous sample to finish.
                                 self.finish_sample_event.wait()
+                                # Concern: sample (curr — clone for
+                                #          stream-isolated sampling)
+                                # Task: clone batch_outputs so the next
+                                #       iter's forward can overwrite the
+                                #       originals on the default stream
+                                #       while sampling reads the clones.
                                 # Copy the batch outputs as sampler inputs
                                 # to avoid next forward step overwriting them.
                                 batch_outputs_copy = {
@@ -1628,29 +1997,82 @@ class PyExecutor:
                                 self.sample_stream.wait_stream(
                                     torch.cuda.current_stream())
                                 with torch.cuda.stream(self.sample_stream):
+                                    # Concern: sample (curr)
+                                    # Task: queue sampling kernel + D2H
+                                    #       copy of sample-state tensors
+                                    #       on sample_stream; record
+                                    #       sampler_event for next iter's
+                                    #       HC2 consume (P_SYNC_EVT).
+                                    # Consume: scheduled_batch,
+                                    #          batch_outputs_copy
+                                    # Produce: sample_state (with
+                                    #          sampler_event + .device
+                                    #          tensors), curr field
                                     sample_state = self._sample_async(
                                         scheduled_batch, batch_outputs_copy)
+                                    # Half concern: HC3 SAMPLE_STREAM (produce)
+                                    # Task: record sample-stream done
+                                    #       event for next iter's HC3
+                                    #       consume.
+                                    # Consume: -
+                                    # Produce: self.finish_sample_event
+                                    #          (cross-iter scheduler state)
                                     self.finish_sample_event.record()
                             else:
+                                # Concern: sample (curr)
+                                # Task: same as above but on the default
+                                #       stream when multi-stream sampling
+                                #       is disabled.
                                 sample_state = self._sample_async(
                                     scheduled_batch, batch_outputs)
 
                             assert sample_state is not None, "Sampling failed"
 
+                            # ===== curr PHASE: P_STATE_UPD (last rank) =====
+
+                            # Concern: guided_decoder (curr — error mark)
+                            # Task: mark grammar-failed requests after
+                            #       sample (cf. plain loop comment).
                             # Handle guided decoder errors after _sample_async to avoid state conflicts.
                             # If called before, failed requests would be marked as GENERATION_COMPLETE,
                             # causing _sample_async to fail when accessing context_chunk_size property.
                             self._handle_guided_decoder_errors(
                                 scheduled_batch, guided_decoder_failed_requests)
 
+                            # Concern: sample (curr — state advance)
+                            # Task: advance context_chunk_position; transition
+                            #       finished-context to GENERATION_*; drop
+                            #       ADP dummy. Last rank does this here;
+                            #       non-last ranks fold it into
+                            #       `_forward_step_inter_pp`.
                             self._update_request_states(scheduled_batch)
                             if not self.disable_overlap_scheduler:
+                                # Concern: spec_decode (curr — late state
+                                #          mark; last rank only)
+                                # Task: mark gen requests that will finish
+                                #       next iter so their excluded-logits
+                                #       behavior is correct in the response.
                                 self._update_generation_requests_that_will_complete_next_iteration(
                                     scheduled_batch.generation_requests)
 
                     if self.enable_iter_perf_stats:
+                        # Concern: iter_stats (curr — num_ctx_tokens key)
+                        # Task: snapshot model_engine.iter_states.num_ctx_tokens
+                        #       onto curr's iter_stats. Read at curr's
+                        #       P_RETIRE (n-1 iters later) inside
+                        #       `_process_iter_stats`.
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
+                    # Concern: iter_stats / sample / schedule (curr — pack
+                    #          per-batch fields)
+                    # Task: package curr's per-batch fields into a single
+                    #       BatchStatePP record so HC1 / HC4 can carry it
+                    #       through the slot ring + bcast queue without
+                    #       knowing about individual fields.
+                    # Consume: scheduled_batch, sample_state,
+                    #          iter_start_time, iter_stats, microbatch_id
+                    # Produce: batch_state (local; flows into HC1 produce
+                    #          and HC2 produce below)
                     batch_state = BatchStatePP(
                         scheduled_requests=scheduled_batch,
                         sample_state=sample_state,
@@ -1659,8 +2081,38 @@ class PyExecutor:
                         microbatch_id=microbatch_id,
                     )
 
+                    # Half concern: HC1 SLOT RING (produce — fill slot)
+                    # Bridge: curr's batch_state -> later iter's
+                    #          `executed_batch` consume below.
+                    # Task: stash curr's BatchStatePP in slot
+                    #       `microbatch_id` of the per-rank ring so a
+                    #       future iter (offset=-1 last rank, 1-n other
+                    #       ranks) can drain it for HC4 produce.
+                    # Consume: batch_state
+                    # Produce: self.micro_batches[microbatch_id]
                     self.micro_batches[microbatch_id] = batch_state
 
+                # =========================================================
+                # ===== STEP (2) : prev P_SYNC_EVT [+ P_HANDOFF on last rank] =
+                # =========================================================
+                # Drives mb_(t-1) (k=1) through P_SYNC_EVT. On the last
+                # rank this is also where mb_(t-1) hits P_HANDOFF (since
+                # last rank's HANDOFF deadline is iter N+1, not N+(n-1)).
+
+                # Half concern: HC2 PREV (produce + consume — last rank /
+                #          can_queue gating)
+                # Bridge: curr.sample_state.sampler_event (P_SAMPLE)
+                #          -> next iter's `previous_batch.sample_state.
+                #          sampler_event.synchronize()` consume below.
+                # Task: roll prev <- curr for next iter's HC2 consume,
+                #       AND consume prev (this iter's previous_batch) by
+                #       synchronizing its sampler_event. The non-last
+                #       rank skips the consume when `not can_queue` —
+                #       the sync is then deferred to a later iter when
+                #       the rank has another queueable batch.
+                # Consume: self.previous_batch (cross-iter scheduler state)
+                # Produce: self.previous_batch (cross-iter scheduler state),
+                #          prev's sampler_event synchronized (out-of-band)
                 # Stage 1.2: Sync sampler for previous microbatch to start new sample state comm chain.
                 # For last PP rank, we must synchronize the previous batch
                 # since we need to broadcast its sample state soon afterwards in the same iteration.
@@ -1673,9 +2125,35 @@ class PyExecutor:
                     with nvtx_range("sync_previous_sampler_event"):
                         previous_batch.sample_state.sampler_event.synchronize()
 
+                # ===== prev PHASE: P_HANDOFF (last rank) =====
+                # ===== oldest PHASE: P_HANDOFF (other ranks) =====
                 # Stage 2: Enqueue sample state for executed batch to ring broadcast it in background thread asynchronously.
                 # send/recv chain: (pp_size - 1) -> 0 -> 1 -> ... -> (pp_size - 2)
                 # intermediate ranks: send/recv sample state for next microbatch to allow overlap
+
+                # HC1 SLOT RING (consume) — scheduler bookkeeping.
+                # `ring_broadcast_sample` distributed concern (produce
+                # end on this rank): hand the freshly-executed batch
+                # off to the long-running concern that ring-broadcasts
+                # its sample state across all ranks. HC4 BCAST QUEUE
+                # is this concern's per-rank input side; the cross-rank
+                # ring (HC10) is its internal coordination — same
+                # request set seen by every rank, so it's intra-batch.
+                # Task (this block): figure out which slot's batch is
+                #       reaching its handoff deadline this iter
+                #       (`offset = -1` for last rank because last rank's
+                #       deadline is iter N+1; `offset = 1 - pp_size` for
+                #       other ranks because their deadline is iter N+(n-1)),
+                #       drain it from the slot ring, and pass it to the
+                #       distributed ring-broadcast concern via its
+                #       per-rank input queue. Clear the slot in the
+                #       same step so HC1 produce next iter doesn't see
+                #       stale data.
+                # Consume: self.micro_batches[(microbatch_id+offset) % n]
+                # Produce: self.executed_batch_queue (per-rank input of
+                #          the `ring_broadcast_sample` concern),
+                #          self.unhandled_batch_counter (loop state),
+                #          self.micro_batches[...] (cleared)
                 offset = -1 if self.dist.is_last_pp_rank else (
                     1 - self.dist.pp_size)
                 executed_microbatch_id = (microbatch_id +
@@ -1686,7 +2164,25 @@ class PyExecutor:
                     self.unhandled_batch_counter += 1
                 self.micro_batches[executed_microbatch_id] = None
 
+                # Nested helpers — one-shot definitions used only in this
+                # iter. Each closes over `microbatch_id`, `can_queue`, and
+                # locals like `executed_batches`. In a coroutine refactor
+                # these would be method calls on the schedule / response
+                # coroutines, not nested closures.
+
                 def fetch_executed_batches() -> list[BatchStatePP]:
+                    # Concern: `ring_broadcast_sample` distributed concern
+                    #          (consume end on this rank, rk0 only) —
+                    #          drain batches whose ring traversal has
+                    #          reached this rank.
+                    # Task: rk0 drains the response queue (the per-rank
+                    #       output side of HC10's reverse ring).
+                    #       Synchronous (must_get=True) when async-bcast
+                    #       disabled, else only blocks when this rank
+                    #       has no new work (`not can_queue`) so a
+                    #       productive iter isn't gated by the ring.
+                    # Consume: self.executed_batch_response_queue
+                    # Produce: executed_batches (local)
                     executed_batches = []
                     if self.pp_async_broadcast_sample_state:
                         # Wait for at least one batch to finish if no new request is available.
@@ -1703,6 +2199,24 @@ class PyExecutor:
 
                 def ring_broadcast_executed_batch_num(
                         executed_batch_num: int) -> int:
+                    # SCHEDULER-DIRECT (HC9): NOT a per-batch coroutine
+                    # and NOT a distributed concern coroutine — the
+                    # count payload spans all batches retiring this iter,
+                    # so it doesn't tie to a single request set. In the
+                    # refactored model this stays as plain code in the
+                    # scheduler's iter body (no `step`, no `Batch`, no
+                    # `enter_phase`) — same behavior, just inlined into
+                    # the scheduler instead of wrapped as a coroutine.
+                    # Task: ring-broadcast the consensus on how many
+                    #       batches retire this iter. rk0 votes;
+                    #       count propagates rk0 -> rk(n-1) via the PP
+                    #       forward chain. The HC5b SEND HANDLES RING
+                    #       (`send_expected_batch_num_handles`) is this
+                    #       block's own per-slot isend-handle accounting,
+                    #       also scheduler-direct.
+                    # Consume: cross-rank: prev rank's vote
+                    # Produce: cross-rank: isend to next rank;
+                    #          self.send_expected_batch_num_handles[mid]
                     if self.dist.is_first_pp_rank and self.dist.tp_size * self.dist.cp_size > 1:
                         with nvtx_range("tp_cp_broadcast_executed_batch_num"):
                             executed_batch_num = self.dist.tp_cp_broadcast(
@@ -1716,9 +2230,13 @@ class PyExecutor:
                                 tag=PPCommTag.EXECUTED_BATCH_NUM,
                             )
                     if not self.dist.is_last_pp_rank:
+                        # HC5b consume: wait on prior iter's isend in
+                        #              this slot.
                         self.wait_on_pp_send_handles(
                             self.send_expected_batch_num_handles, microbatch_id)
                         with nvtx_range("send_expected_batch_num"):
+                            # HC5b produce: stash this iter's isend in
+                            #              the slot.
                             self.send_expected_batch_num_handles[
                                 microbatch_id] = self.dist.isend_object(
                                     executed_batch_num,
@@ -1728,6 +2246,21 @@ class PyExecutor:
                     return executed_batch_num
 
                 def handle_executed_batches(executed_batch_num: int):
+                    # Concern: `ring_broadcast_sample` distributed concern
+                    #          (consume end on this rank, non-rk0) +
+                    #          per-batch retire dispatch.
+                    # Task: non-rk0 ranks drain executed_batch_num
+                    #       batches from response_queue and retire each.
+                    #       rk0 reuses the already-drained list from
+                    #       `fetch_executed_batches`. Each retire calls
+                    #       `_handle_executed_batch` which is the
+                    #       multi-concern P_RETIRE body (response,
+                    #       sample-apply, disagg, resource, kv_cache_events,
+                    #       iter_stats — see annotations on
+                    #       `_handle_executed_batch`).
+                    # Consume: self.executed_batch_response_queue (non-rk0),
+                    #          executed_batches (rk0)
+                    # Produce: per-batch retire side effects (out-of-band)
                     if self.dist.rank != 0:
                         dequeue_counter = 0
                         while dequeue_counter < executed_batch_num:
@@ -1743,6 +2276,15 @@ class PyExecutor:
 
                 executed_batch_num = 0
 
+                # =========================================================
+                # ===== STEP (3) : oldest P_VOTE -> P_RETIRE ==============
+                # =========================================================
+                # Drives mb_(t-(n-1)) (k=n-1) through P_VOTE then P_RETIRE.
+                # Non-last ranks: this is also where mb_(t-(n-1)) hits
+                # P_HANDOFF, so step (2) above has already enqueued it.
+
+                # ===== oldest PHASE: P_VOTE (rk0 only) =====
+
                 # Stage 3.1: The first rank determines the number of executed batches.
                 if self.dist.rank == 0:
                     executed_batches = fetch_executed_batches()
@@ -1752,13 +2294,41 @@ class PyExecutor:
                 executed_batch_num = ring_broadcast_executed_batch_num(
                     executed_batch_num)
 
+                # ===== oldest PHASE: P_RETIRE =====
                 # Stage 3.3: Handle executed batches.
                 handle_executed_batches(executed_batch_num)
 
+                # =========================================================
+                # ===== Ring rotation + iter advance ======================
+                # =========================================================
+
+                # Concern: loop_control (slot ring rotation)
+                # Task: advance the per-rank ring head. In the coroutine
+                #       refactor this is `ring.append(handle_curr);
+                #       handle_oldest = ring.popleft()`.
+                # Consume: -
+                # Produce: microbatch_id (loop state)
                 # Stage 4: March forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
+                # Concern: loop_control
+                # Task: advance global iter counter.
                 self.iter_counter += 1
 
+            # =============================================================
+            # ===== POST-SHUTDOWN DRAIN ===================================
+            # =============================================================
+            # When `should_stop_processing` broke us out of the while
+            # loop, up to (n-1) batches may still be in flight on this
+            # rank — n-1 of them parked between the bcast queue and the
+            # response queue. Drain them all here.
+            #
+            # Concern: `ring_broadcast_sample` distributed concern
+            #          (consume end — drain at shutdown) + per-batch
+            #          retire dispatch.
+            # Task: process the remaining in-flight batches so every
+            #       client gets a response.
+            # Consume: self.executed_batch_response_queue
+            # Produce: per-batch retire side effects (out-of-band)
             # Stage 5: Handle remaining executed batches in the queue.
             while self.unhandled_batch_counter > 0:
                 with nvtx_range("get_executed_batch"):
@@ -1838,23 +2408,75 @@ class PyExecutor:
                 )
 
     def _handle_executed_batch(self, executed_batch: Optional[BatchStatePP]):
+        # ===================================================================
+        # P_RETIRE body for one executed batch on the PP loop. Multi-concern,
+        # mirrors the non-overlap loop's "after _update_requests" tail
+        # (sample-apply + disagg + response + resource + kv_cache_events +
+        # iter_stats), with PP-specific additions:
+        #   * `_remove_inflight_ids` — paired with `_add_inflight_ids` at
+        #     this batch's P_SCHEDULE on this rank (n-1 iters ago in
+        #     iter-INDEX local to this rank).
+        #   * `_disagg_pp_termination_handler.terminate_pending_requests`
+        #     — PP-only ring-style consensus on which requests get
+        #     terminated this iter.
+        # All work here is at this batch's P_RETIRE phase. Some sub-blocks
+        # are global (run even if `executed_batch is None`) — they are
+        # cross-batch sweeps, not part of any single batch's lifecycle.
+        # ===================================================================
         finished_requests = []
         if executed_batch is not None:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
+                # Concern: sample (apply tokens — paired with this batch's
+                #          P_SAMPLE on the last rank, which produced
+                #          sample_state.sampler_event consumed at this
+                #          rank's P_SYNC_EVT iter and propagated through
+                #          HC10 ring broadcast)
+                # Task: write sampled tokens onto this batch's requests
+                #       via sampler.update_requests. The sampler_event is
+                #       already synchronized by step (2) on the last rank,
+                #       and on other ranks the host data was filled in by
+                #       the bcast thread / HC10 ring broadcast — so this
+                #       call doesn't block.
+                # Consume: executed_batch.sample_state
+                # Produce: per-request new tokens (out-of-band)
                 self._update_requests(executed_batch.sample_state)
 
                 scheduled_requests = executed_batch.scheduled_requests
                 if self.kv_cache_transceiver:
+                    # Concern: disagg
+                    # Task: start ctx->gen KV send for finished ctx-only
+                    #       requests in this batch (paired with the
+                    #       ctx-side recv promotion at this batch's
+                    #       P_SCHEDULE inside `_check_disagg_ctx_schedulable_status`).
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
+                # Concern: response (cancellation)
+                # Task: terminate canceled requests if possible.
                 self._handle_canceled_requests()
 
+                # Concern: response (+ perf_metric step + spec_decode gating)
+                # Task: build per-request responses for this batch,
+                #       enqueue, terminate finished. Multi-concern function
+                #       — see annotations on `_handle_responses`.
+                # Consume: self.active_requests, executed_batch.scheduled_requests
+                # Produce: finished_requests, responses (out-of-band)
                 finished_requests = self._handle_responses()
                 # Complete ctx send sessions AFTER responses are created so
                 # _handle_responses sees the request before it is terminated.
+
+                # Concern: disagg (opportunistic completion probe)
+                # Task: non-blocking sweep for ctx transfers that just
+                #       completed; terminates ctx-only requests so their
+                #       KV blocks can be reused. Strict ordering AFTER
+                #       _handle_responses so the response sees the
+                #       request before termination.
                 if self.kv_cache_transceiver:
                     self._check_disagg_ctx_cache_transfer_status(0)
                 sample_state_scheduled_requests = executed_batch.scheduled_requests
+                # Concern: resource
+                # Task: free per-request KV / resource state for finished
+                #       requests; rebalance attn metadata. Paired with
+                #       this batch's `prepare_resources` at P_SCHEDULE.
                 attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                         None)
                 kv_cache_dtype_byte_size = getattr(self.model_engine,
@@ -1864,16 +2486,53 @@ class PyExecutor:
                     sample_state_scheduled_requests, attn_metadata,
                     kv_cache_dtype_byte_size)
 
+                # Concern: schedule (inflight tracking — release)
+                # Task: remove this batch's request IDs from the inflight
+                #       set so the scheduler can pick them up next iter.
+                #       Paired with `_add_inflight_ids` at this batch's
+                #       P_SCHEDULE on this rank, n-1 iters ago.
                 self._remove_inflight_ids(scheduled_requests)
+
+        # NOTE: blocks below run unconditionally (even when executed_batch
+        # is None on a rank where no batch retired this iter). They are
+        # cross-batch sweeps that belong to a global tail of P_RETIRE.
 
         if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
         ):
+            # Concern: disagg (cross-batch)
+            # Task: end-of-iter timeout sweep over inflight async KV
+            #       transfers (regardless of which batch owns them).
             self._check_kv_transfer_timeout()
 
         if self._disagg_pp_termination_handler is not None:
+            # SCHEDULER-DIRECT: NOT a per-batch coroutine and NOT a
+            # distributed concern coroutine — same shape as HC9: every
+            # rank runs this every iter, payload is a ballot of pending
+            # terminations spanning multiple batches, no single request
+            # set involved. In the refactored model this call moves
+            # out of `_handle_executed_batch` (which becomes per-batch
+            # P_RETIRE work) and into the scheduler iter directly,
+            # alongside HC9.
+            # Task: ring-pass the termination ballot; only requests that
+            #       all PP ranks vote YES on get terminated together.
+            #       Without this NCCL would hang on KV cache reuse paths
+            #       when PP ranks asymmetrically free a request.
+            # Consume: cross-rank: prev rank's termination ballot
+            # Produce: cross-rank: isend ballot to next rank;
+            #          per-request termination (out-of-band)
             self._disagg_pp_termination_handler.terminate_pending_requests()
 
         if self.enable_iter_perf_stats and executed_batch is not None:
+            # Concern: iter_stats (curr — process)
+            # Task: end-of-lifecycle stats aggregation. Paired with
+            #       `_get_init_iter_stats` at this batch's P_SCHEDULE
+            #       (n-1 iters ago) and the `num_ctx_tokens` snapshot
+            #       at P_STATE_UPD. Reads `executed_batch.iter_stats` /
+            #       `iter_start_time` carried through the slot ring + bcast
+            #       queue (HC1 + HC4).
+            # Consume: executed_batch (iter_stats, iter_start_time,
+            #          scheduled_requests), finished_requests
+            # Produce: aggregated iter_stats record (out-of-band)
             self._process_iter_stats(
                 finished_requests,
                 self.active_requests,
@@ -3039,6 +3698,93 @@ class PyExecutor:
         #     -- so making the submit + wait explicit is a one-line move,
         #     not a control-flow change).
         # ===================================================================
+        # ===================================================================
+        # CONCERN / PHASE / HALF-CONCERN ANNOTATIONS (round 1: comments only)
+        # -------------------------------------------------------------------
+        # Concerns: same set as the plain loop (`schedule`, `disagg`,
+        # `kv_connector`, `resource`, `spec_decode`, `guided_decoder`,
+        # `forward`, `sample`, `response`, `perf_metric`, `iter_stats`,
+        # `dwdp` (not in this loop variant), `kv_cache_events`, `hang`,
+        # `profile`, `control`, `benchmark_disagg_gate`, `loop_control`).
+        #
+        # Per-batch phase order (each batch lives across 2 iters):
+        #   P_SCHEDULE -> P_FORWARD -> P_SAMPLE -> P_STATE_UPD
+        #     -> P_APPLY -> P_RESPOND
+        # The plain loop's P_APPLY/P_STATE_UPD distinction collapses here:
+        # in overlap, P_STATE_UPD belongs to iter t (curr's tail) while
+        # P_APPLY moves to iter t+1 (prev's head) so the sampler-event
+        # sync overlaps the next batch's GPU forward.
+        #
+        # Scheduler iter pattern (4 step calls + bookkeeping):
+        #     async def scheduler_iter():
+        #         await step(handle_t,    through=P_FORWARD)    # (1)
+        #         await step(handle_prev, through=P_APPLY)      # (2)
+        #         await step(handle_t,    through=P_STATE_UPD)  # (3)
+        #         await step(handle_prev, through=P_RESPOND)    # (4)
+        #         # scheduler-only bookkeeping (perf snapshot,
+        #         # iter_stats key, promotion); see HC2 below
+        #         handle_prev = handle_t
+        # The body below is annotated with the matching `step (N)` slot
+        # at every phase boundary.
+        #
+        # "Half concerns" (scheduler-level cross-batch bridges):
+        # The scheduler is the only place that touches BOTH batches'
+        # storage; bridge code is split into a *consume half* (reads one
+        # batch at some phase) and a *produce half* (writes another
+        # batch's input slot at some later phase). One half concern =
+        # one logical cross-batch arc.
+        #
+        #   HC1: prev.P_SAMPLE.sample_state
+        #          -> curr.P_FORWARD.previous_tensors_device (+ num_accepted_tokens_device)
+        #        Implementation interleaves several lines:
+        #          consume:  `previous_tensors = self.previous_batch
+        #                     and self.previous_batch.sample_state`
+        #          consume:  `use_previous_draft_tokens = self.has_previous_draft_tokens`
+        #                    (the cross-iter side-channel set by HC1's draft
+        #                    model in the *previous* iter, i.e., the consume
+        #                    half of HC3 below)
+        #          (in-bridge compute) `_handle_speculative_decoding` runs
+        #                    the draft model on prev's sample tensors and
+        #                    returns target_inputs / num_accepted_tokens_device
+        #          produce:  selects `previous_tensors_device` from
+        #                    target_inputs OR prev.sample_state.device
+        #          produce:  passes `previous_tensors_device` and
+        #                    `num_accepted_tokens_device` into
+        #                    `_forward_step(curr)` — write into curr's
+        #                    forward-input slot.
+        #
+        #   HC2 (cross-iter): curr.P_STATE_UPD.{scheduled_requests,
+        #          sample_state, iter_stats, iter_start_time}
+        #          -> next-iter prev slot (`self.previous_batch`).
+        #        consume half (this iter): reads curr's per-batch fields.
+        #        produce half (this iter): assigns into self.previous_batch.
+        #        The other end of the arc is HC1 in the *next* iter,
+        #        which reads self.previous_batch as its consume half.
+        #        `self.previous_batch = None` on empty-rank is the
+        #        cleanup variant of HC2 (still a produce half — writes
+        #        the prev slot, just to None).
+        #
+        #   HC3 (cross-iter side-channel): curr.P_FORWARD.has_previous_draft_tokens
+        #          -> next iter's HC1 `use_previous_draft_tokens` decision.
+        #        produce half (this iter, inside `_handle_speculative_decoding`):
+        #          sets `self.has_previous_draft_tokens` based on whether
+        #          the draft model produced next_draft_tokens.
+        #        consume half (next iter): reads `self.has_previous_draft_tokens`
+        #          to decide which branch of HC1's selection to take.
+        #
+        # Cross-batch *ordering* constraints (NOT half concerns — these
+        # are placement, not data forwarding through batch storage):
+        #   * `_pause_requests(curr.paused_requests)` belongs to curr's
+        #     P_SCHEDULE but its execution is deferred until after prev's
+        #     P_APPLY (V1 KV handoff). In a coroutine refactor curr's
+        #     `schedule` coroutine would yield once between
+        #     `_terminate_requests` and `_pause_requests`.
+        #   * `_update_generation_requests_that_will_complete_next_iteration`
+        #     mutates curr's gen-request state at P_STATE_UPD but must
+        #     run AFTER prev's P_RESPOND because prev's `_handle_responses`
+        #     reads `exclude_last_generation_logits` while building
+        #     responses for shared-by-id requests.
+        # ===================================================================
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
@@ -3049,34 +3795,109 @@ class PyExecutor:
             previous_tensors_device = None
             can_forward = not self.is_benchmark_disagg
             while True:
+                # =========================================================
+                # ===== STEP (1) : curr P_SCHEDULE -> P_FORWARD ===========
+                # =========================================================
+
+                # ===== curr PHASE: P_SCHEDULE =====
+
+                # Concern: hang
+                # Task: progress watchdog tick.
+                # Consume: -
+                # Produce: -
                 self.hang_detector.checkpoint()
+
+                # Concern: profile
+                # Task: drive torch / CUDA-event profiler state machine.
+                # Consume: -
+                # Produce: profiler artifacts (out-of-band)
                 profile_step()
+
+                # Concern: iter_stats (curr)
+                # Task: stamp wall-clock start of curr's iter t. Read at
+                #       prev's P_RESPOND of next iter (inside
+                #       `_process_previous_batch` -> `_process_iter_stats`)
+                #       — i.e., this is curr's iter_start_time field
+                #       carried in HC2 to the next iter.
+                # Consume: -
+                # Produce: iter_start_time (curr field)
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
+                # Concern: schedule (+ disagg + iter_stats + spec_decode + resource)
+                # Task: same fan-out as plain loop. See annotations on
+                #       `_prepare_and_schedule_batch`.
+                # Consume: -
+                # Produce: scheduled_batch, iter_stats (curr fields);
+                #          mutates self.active_requests, self.use_spec_decode
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+
+                # Concern: control
+                # Task: pause loop if a control request is pending.
+                # Consume: -
+                # Produce: -
                 self._handle_control_request()
 
+                # Concern: loop_control
+                # Task: shutdown rendezvous.
+                # Consume: scheduled_batch
+                # Produce: -
                 if scheduled_batch is None:
                     break
 
+                # Concern: benchmark_disagg_gate
+                # Task: gate curr's forward until benchmark fill complete.
+                # Consume: scheduled_batch
+                # Produce: can_forward (cross-iter loop state)
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
                     continue
 
+                # Concern: schedule (paused-request terminate)
+                # Task: V1-only — terminate paused requests at iter top.
+                #       NOTE: the *pause* counterpart of this terminate is
+                #       deferred to after prev's P_APPLY below (V1 KV
+                #       handoff ordering). Same `schedule` concern, two
+                #       split sites within curr's P_SCHEDULE.
+                # Consume: scheduled_batch.paused_requests
+                # Produce: terminated requests (out-of-band)
                 if not self._scheduler_manages_kv_suspend:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
+                # Concern: schedule (collective queue gate)
+                # Task: collective check that every TP rank has a non-empty
+                #       batch. ADP exposes a per-rank flag too, used to
+                #       drive the empty-rank branch of HC2 below.
+                # Consume: scheduled_batch.batch_size
+                # Produce: can_queue, can_queue_this_rank
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
 
                 if can_queue:
                     if self.kv_cache_transceiver:
+                        # Concern: disagg
+                        # Task: promote DISAGG_GENERATION_TRANS_COMPLETE
+                        #       gen requests to GENERATION_IN_PROGRESS;
+                        #       prepend first_gen logits/logprobs.
+                        # Consume: scheduled_batch.generation_requests
+                        # Produce: per-request state (out-of-band)
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
+                    # Concern: spec_decode (overlap-mode draft gating)
+                    # Task: decide whether the draft model should run this
+                    #       iter. Reads self.previous_batch — that's an
+                    #       allowed *coarse* read (presence/absence), not
+                    #       a half-concern, since it does not forward any
+                    #       per-batch data into curr's storage. The fine
+                    #       per-batch data forwarding happens later, in
+                    #       HC1.
+                    # Consume: self.previous_batch (cross-iter loop state)
+                    # Produce: has_draft_batch (local), self.use_spec_decode,
+                    #          model_engine.enable_spec_decode,
+                    #          per-request py_draft_tokens (when reset)
                     has_draft_batch = self.drafter is not None and self.previous_batch is not None and self.use_spec_decode and self.drafter.should_forward_draft_model(
                         scheduled_batch)
                     # Reset the draft tokens to avoid preparing resources for the draft model.
@@ -3093,30 +3914,69 @@ class PyExecutor:
                             for request in scheduled_batch.all_requests():
                                 request.py_draft_tokens = []
 
+                    # Concern: spec_decode (dynamic draft length)
+                    # Task: pad/truncate py_draft_tokens to a uniform
+                    #       length so CUDA-graph capture works.
+                    # Consume: scheduled_batch
+                    # Produce: per-request py_draft_tokens (out-of-band),
+                    #          model_engine.runtime_draft_len
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    # Concern: resource
+                    # Task: allocate KV blocks + per-resource state.
+                    # Consume: scheduled_batch
+                    # Produce: KV blocks, resource state (out-of-band)
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                 if self.kv_connector_manager:
+                    # Concern: kv_connector
+                    # Task: refresh connector metadata.
+                    # Consume: -
+                    # Produce: connector metadata (out-of-band)
                     self.kv_connector_manager.handle_metadata()
 
                 if can_queue:
+                    # Concern: kv_connector
+                    # Task: queue async KV-load (paired with
+                    #       `_kv_connector_wait_for_save` inside
+                    #       `_forward_step` at curr P_FORWARD).
+                    # Consume: scheduled_batch
+                    # Produce: connector load ops (out-of-band)
                     self._kv_connector_start_batch(scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
                 if self.kv_connector_manager:
+                    # Concern: schedule (collective queue re-check)
+                    # Task: re-evaluate can_queue after kv_connector may
+                    #       have evicted/added requests.
+                    # Consume: scheduled_batch.batch_size
+                    # Produce: can_queue, can_queue_this_rank
                     can_queue, can_queue_this_rank = self._can_queue(
                         scheduled_batch)
 
                 if not can_queue:
+                    # Concern: resource (revert)
+                    # Task: undo V2 scheduler's per-gen KV growth.
+                    # Consume: scheduled_batch
+                    # Produce: KV cache state (out-of-band)
                     self._revert_gen_alloc(scheduled_batch)
 
+                # Scheduler control flow (NOT a half concern — no
+                # per-batch data forwarded). Decides whether prev's
+                # step (2) and step (4) will be invoked this iter.
                 # If the batch is not empty on this rank, but empty on other ranks,
                 # we need to delay the update of the previous batch's sample state,
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
                 if can_queue:
 
+                    # Concern: schedule (gen-request reorder)
+                    # Task: stable-sort gen requests so those without
+                    #       py_batch_idx come first — required by
+                    #       model_engine._forward_step's batch-layout
+                    #       assumption in disagg mode.
+                    # Consume: scheduled_batch.generation_requests
+                    # Produce: scheduled_batch.generation_requests reordered
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
@@ -3128,15 +3988,53 @@ class PyExecutor:
                     )
 
                     if self.kv_cache_transceiver:
+                        # Concern: response (first-token)
+                        # Task: emit first-token response for newly
+                        #       promoted disagg-gen requests so the
+                        #       client can start streaming.
+                        # Consume: scheduled_batch.generation_requests
+                        # Produce: enqueued first-token responses
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
 
+                    # Concern: guided_decoder
+                    # Task: register batch with constraint matcher;
+                    #       init disagg-gen request matchers.
+                    # Consume: scheduled_batch
+                    # Produce: matcher per-batch state (out-of-band)
                     # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                     if self.guided_decoder is not None and self.kv_cache_transceiver:
                         self.guided_decoder.add_batch(scheduled_batch)
                         self.guided_decoder.init_disagg_gen_requests()
 
+                    # =====================================================
+                    # ===== HC1 BRIDGE: prev.P_SAMPLE -> curr.P_FORWARD ===
+                    # =====================================================
+                    # The next ~30 lines are the HC1 cross-batch bridge.
+                    # Inside a coroutine refactor this lives in the
+                    # scheduler iter, between step (1)'s P_SCHEDULE-end
+                    # rendezvous and curr's P_FORWARD body.
+                    # =====================================================
+
+                    # Half concern: HC1 (consume half on prev)
+                    # Bridge: prev.P_SAMPLE.sample_state
+                    #         -> curr.P_FORWARD.previous_tensors_device
+                    # Task: snapshot prev's sample-state container.
+                    # Consume: prev.sample_state (per-batch, prev side)
+                    # Produce: previous_tensors (local; staged for HC1
+                    #          produce half below)
                     previous_tensors = self.previous_batch and self.previous_batch.sample_state
+
+                    # Half concern: HC3 (consume half this iter, cross-iter)
+                    # Bridge: curr_at_prev_iter.P_FORWARD.has_previous_draft_tokens
+                    #         -> this iter's HC1 selection.
+                    # Task: read the side-channel flag set by the *previous*
+                    #       iter's `_handle_speculative_decoding` (HC3
+                    #       produce). Drives the HC1 produce-half branch
+                    #       below.
+                    # Consume: self.has_previous_draft_tokens (cross-iter
+                    #          side channel)
+                    # Produce: use_previous_draft_tokens (local)
                     # If there are previous draft tokens, we need to update the target requests to accept some draft tokens.
                     # When there's any accepted tokens, we can't directly use the previous batch's outputs in this iteration for the target model,
                     # so we'll set the target model's input to None and skip updating the target requests after target model forward.
@@ -3147,6 +4045,19 @@ class PyExecutor:
                     num_accepted_tokens_device = None
 
                     if has_draft_batch:
+                        # Half concern: HC1 (in-bridge compute)
+                        # Task: run the draft model on prev's sample
+                        #       tensors, computing accepted-token counts
+                        #       and packaged target_inputs ready for
+                        #       curr's forward. Internally also sets
+                        #       `self.has_previous_draft_tokens` — the
+                        #       HC3 produce half for next iter.
+                        # Consume: prev.sample_state (via previous_tensors,
+                        #          previous_tensors_device); scheduled_batch
+                        # Produce: target_inputs, num_accepted_tokens_device
+                        #          (locals; feed HC1 produce half below);
+                        #          self.has_previous_draft_tokens (HC3
+                        #          produce half, cross-iter)
                         self.execution_stream.wait_stream(
                             torch.cuda.current_stream())
                         with torch.cuda.stream(self.execution_stream):
@@ -3156,6 +4067,16 @@ class PyExecutor:
                         torch.cuda.current_stream().wait_stream(
                             self.execution_stream)
 
+                    # Half concern: HC1 (produce half on curr — selection)
+                    # Task: pick the right source for curr.P_FORWARD's
+                    #       `previous_tensors_device` slot — draft-model
+                    #       outputs if the draft ran, else prev's raw
+                    #       sample tensors.
+                    # Consume: target_inputs, use_previous_draft_tokens
+                    #          (locals from HC1/HC3 consume halves);
+                    #          prev.sample_state.device
+                    # Produce: previous_tensors_device (local; flows into
+                    #          curr.P_FORWARD via _forward_step args)
                     # Use the draft_model's outputs if we've launched the draft model.
                     # Otherwise, use the previous batch's outputs.
                     if (target_inputs is not None
@@ -3165,58 +4086,214 @@ class PyExecutor:
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
+                    # ===== curr PHASE: P_FORWARD =====
+
+                    # Concern: perf_metric (curr)
+                    # Task: allocate CUDA event handles for curr's
+                    #       forward+sample timing window.
+                    # Consume: -
+                    # Produce: gpu_forward_start, gpu_forward_end,
+                    #          gpu_sample_end (CUDA events; curr fields)
                     # GPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
+                        # Concern: forward (curr) (+ kv_connector wait_for_save)
+                        # Task: queue model forward on execution_stream;
+                        #       internally calls `_kv_connector_wait_for_save`
+                        #       (deadline-wait paired with start_batch
+                        #       above). The HC1 produce-half values
+                        #       (`previous_tensors_device`,
+                        #       `num_accepted_tokens_device`) are consumed
+                        #       here as forward inputs.
+                        # Consume: scheduled_batch, prepared resources,
+                        #          previous_tensors_device,
+                        #          num_accepted_tokens_device (HC1 produce)
+                        # Produce: batch_outputs (logits + extras),
+                        #          fwd_timing (CPU ts), forward CUDA events
                         batch_outputs = self._forward_step(
                             scheduled_batch, previous_tensors_device,
                             num_accepted_tokens_device)
 
+                # =========================================================
+                # ===== STEP (2) : prev P_APPLY ===========================
+                # =========================================================
+                # Drives prev through P_APPLY: sampler-event sync, token
+                # apply, ctx-side KV send. Sequenced AFTER curr's
+                # P_FORWARD queue (so the sync can overlap curr's GPU
+                # forward) and BEFORE curr's P_SAMPLE (which mutates
+                # the default stream).
+                # =========================================================
+
                 if self.previous_batch is not None and should_process_previous_batch:
+                    # Concern: sample (prev — apply tokens)
+                    # Task: BLOCK on prev's sampler_event, then apply
+                    #       sampled tokens to prev's requests via
+                    #       sampler.update_requests. This is the only
+                    #       point this iter that synchronously waits on
+                    #       prev's sampler event.
+                    # Consume: prev.sample_state (sampler_event +
+                    #          host tensors)
+                    # Produce: per-request new tokens, py_decoding_iter
+                    #          (out-of-band on prev's requests)
                     self._update_requests(self.previous_batch.sample_state)
 
+                    # Concern: disagg (prev — KV send) (+ kv_connector)
+                    # Task: start ctx->gen KV send for prev's finished
+                    #       ctx-only requests; opportunistic completion
+                    #       probe at the end. Multi-concern function (see
+                    #       annotations on `_send_kv_async`).
+                    # Consume: prev.scheduled_requests
+                    # Produce: KV send handles, terminated ctx requests
+                    #          (out-of-band on prev)
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
 
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
+                    # Concern: spec_decode (prev — draft cleanup)
+                    # Task: free draft KV / spec resources used by prev's
+                    #       draft model run (paired with this iter's HC1
+                    #       in-bridge `_handle_speculative_decoding`,
+                    #       which is the *next* iter's draft prep that
+                    #       used prev's slots).
+                    # Consume: prev's spec_decode state
+                    # Produce: draft resources released (out-of-band)
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
 
+                # Concern: schedule (curr — paused-request pause; deferred)
+                # Task: V1-only — pause curr's preempted requests. Same
+                #       `schedule` concern as `_terminate_requests`
+                #       above; placement deferred to after prev's
+                #       P_APPLY because V1 needs prev's KV slots to be
+                #       freed by `_update_requests` before curr's pauses
+                #       can rewrite them.
+                # Consume: scheduled_batch.paused_requests
+                # Produce: paused requests (out-of-band)
                 if not self._scheduler_manages_kv_suspend:
                     self._pause_requests(scheduled_batch.paused_requests)
 
+                # =========================================================
+                # ===== STEP (3) : curr P_SAMPLE -> P_STATE_UPD ===========
+                # =========================================================
+
                 if can_queue:
+                    # ===== curr PHASE: P_SAMPLE =====
+
                     guided_decoder_failed_requests = None
                     with self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
                         if self.guided_decoder is not None:
+                            # Concern: guided_decoder (curr)
+                            # Task: re-add curr to matcher with refreshed
+                            #       new_tokens, then mask logits via
+                            #       execute. Must run before _sample_async
+                            #       so masking affects sampling.
+                            # Consume: scheduled_batch,
+                            #          batch_outputs (logits)
+                            # Produce: guided_decoder_failed_requests,
+                            #          masked logits
                             # add_batch must be called again to have updated new tokens.
                             self.guided_decoder.add_batch(scheduled_batch)
                             guided_decoder_failed_requests = self.guided_decoder.execute(
                                 batch_outputs['logits'])
 
+                        # Concern: sample (curr)
+                        # Task: queue sampling kernel + D2H copy of
+                        #       sample-state tensors; record sampler_event
+                        #       used by *next iter*'s step (2) to sync.
+                        # Consume: scheduled_batch, batch_outputs (logits)
+                        # Produce: sample_state (sampler_event + .device
+                        #          tensors), sample_timing
                         sample_state = self._sample_async(
                             scheduled_batch, batch_outputs)
 
                     assert sample_state is not None, "Sampling failed"
 
+                    # ===== curr PHASE: P_STATE_UPD =====
+
+                    # Concern: guided_decoder (curr — error mark)
+                    # Task: mark grammar-failed curr requests as errored.
+                    #       Strict ordering: AFTER _sample_async (else
+                    #       GENERATION_COMPLETE breaks sample's
+                    #       context_chunk_size access).
+                    # Consume: scheduled_batch,
+                    #          guided_decoder_failed_requests
+                    # Produce: failed-request error responses (out-of-band)
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,
                     # causing _sample_async to fail when accessing context_chunk_size property.
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
+
+                    # Concern: sample (curr — state advance)
+                    # Task: advance context_chunk_position; transition
+                    #       finished-context requests to GENERATION_*;
+                    #       drop ADP dummy. Independent of sample_state
+                    #       value (which is still un-synced — that
+                    #       sync happens at next iter's step (2)).
+                    # Consume: scheduled_batch
+                    # Produce: per-request state (out-of-band)
                     self._update_request_states(scheduled_batch)
 
+                # =========================================================
+                # ===== STEP (4) : prev P_RESPOND =========================
+                # =========================================================
+
                 if self.previous_batch is not None and should_process_previous_batch:
+                    # Concern: response (prev) + resource (prev) +
+                    #          kv_cache_events (prev) + iter_stats (prev)
+                    # Task: prev's full P_RESPOND fan-out — see
+                    #       `_process_previous_batch`. Internally calls
+                    #       `_handle_canceled_requests`,
+                    #       `_handle_responses`, `update_resources`,
+                    #       `_add_kv_cache_events`, and
+                    #       `_process_iter_stats`. (`_process_iter_stats`
+                    #       lives here, not at end-of-iter like the plain
+                    #       loop, because iter_stats is a prev field
+                    #       populated across two iters.)
+                    # Consume: prev.scheduled_requests, prev.iter_stats,
+                    #          prev.iter_start_time
+                    # Produce: prev's responses, freed KV blocks, kv-cache
+                    #          events, iter_stats record (all out-of-band)
                     self._process_previous_batch()
+
+                    # Concern: perf_metric (prev)
+                    # Task: read prev's forward/sample CUDA events into
+                    #       per-request metric records. Deferred from
+                    #       prev's P_STATE_UPD (= last iter's tail) to
+                    #       this iter to avoid the next iter's
+                    #       create_timing_events overwriting them.
+                    # Consume: prev.scheduled_requests, prev's gpu events
+                    # Produce: per-request gpu timings (out-of-band on prev)
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
                 else:
+                    # Concern: response (collective fallback)
+                    # Task: when there's no prev to retire (first iter or
+                    #       this rank skipped), still call into the
+                    #       response collective so other ranks don't hang
+                    #       waiting for the gather/allgather inside
+                    #       `_enqueue_responses`.
+                    # Consume: -
+                    # Produce: -
                     self._enqueue_responses([])
 
+                # Concern: spec_decode (curr — late state mark)
+                # Task: mark curr's gen requests that will finish next iter
+                #       (sets state=GENERATION_TO_COMPLETE +
+                #       exclude_last_generation_logits=False).
+                #       Cross-batch ordering: MUST run after prev's
+                #       P_RESPOND because prev's `_handle_responses`
+                #       reads exclude_last_generation_logits while
+                #       building responses for shared-by-id requests.
+                #       Belongs to curr's P_STATE_UPD conceptually but
+                #       the placement is dictated by prev's response.
+                # Consume: scheduled_batch.generation_requests
+                # Produce: per-request state, exclude_last_generation_logits
+                #          (out-of-band on curr)
                 # Call set_exclude_last_generation_logits after _process_previous_batch.
                 # If set before, the response of a request may be incorrect, as it will
                 # use the wrong indices for generation logits when streaming is enabled.
@@ -3225,30 +4302,97 @@ class PyExecutor:
                         scheduled_batch.generation_requests)
 
                 if can_queue:
+                    # Concern: perf_metric (curr — tail snapshot)
+                    # Task: snapshot CUDA event handles + CPU timing onto
+                    #       curr's per-request perf records. Times are
+                    #       finalized at next iter's `compute_batch_gpu_times`.
+                    #       This block could in principle run inside
+                    #       step (3) (curr's P_STATE_UPD) — its data
+                    #       deps (`fwd_timing`, `sample_timing`) are
+                    #       resolved by then. NOTE: a possible reorder
+                    #       candidate; left here for now to keep this
+                    #       diff comments-only.
+                    # Consume: scheduled_batch, gpu_*_start/_end (events),
+                    #          fwd_timing, sample_timing
+                    # Produce: per-request perf records (out-of-band)
                     self.perf_manager.save_timing_to_requests(
                         scheduled_batch.all_requests(), gpu_forward_start,
                         gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
                         fwd_timing.end_time, sample_timing.start_time,
                         sample_timing.end_time)
                     if self.enable_iter_perf_stats:
+                        # Concern: iter_stats (curr — num_ctx_tokens key)
+                        # Task: snapshot model_engine.iter_states.num_ctx_tokens
+                        #       onto curr's iter_stats. Read at next iter's
+                        #       step (4) inside `_process_iter_stats`.
+                        # Consume: model_engine.iter_states (engine state)
+                        # Produce: iter_stats.inflight_batching_stats.num_ctx_tokens
+                        #          (curr field)
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
 
+                    # =====================================================
+                    # ===== HC2 PRODUCE: curr -> next-iter prev slot ======
+                    # =====================================================
+                    # Half concern: HC2 (produce half this iter, cross-iter)
+                    # Bridge: curr.P_STATE_UPD.{scheduled_requests,
+                    #         sample_state, iter_stats, iter_start_time}
+                    #         -> next iter's `self.previous_batch` slot.
+                    # Pair: next iter's HC1 consume + step (2) + step (4),
+                    #       which read self.previous_batch as prev.
+                    # Task: package curr into a BatchState record so next
+                    #       iter sees it as prev. This is the
+                    #       `handle_prev = handle_t` of the docstring
+                    #       pseudo-code.
+                    # Consume: scheduled_batch, sample_state,
+                    #          iter_start_time, iter_stats (curr fields)
+                    # Produce: self.previous_batch (cross-iter scheduler
+                    #          slot)
                     self.previous_batch = BatchState(
                         scheduled_requests=scheduled_batch,
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats)
                 elif not can_queue_this_rank:
+                    # Half concern: HC2 (produce half — empty-rank cleanup)
+                    # Task: cleanup variant of HC2's produce half — when
+                    #       this rank is empty, clear the prev slot so
+                    #       next iter sees no prev. The "consume half"
+                    #       on the next iter still pairs with this — it
+                    #       just sees `self.previous_batch is None` and
+                    #       skips its step (2)/(4).
+                    # Consume: -
+                    # Produce: self.previous_batch (cleared)
                     # If the batch is empty on this rank, we need to clear the previous batch.
                     self.previous_batch = None
 
+                # =========================================================
+                # ===== global / curr P_RESPOND tail ======================
+                # =========================================================
+
                 if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
+                    # Concern: disagg
+                    # Task: end-of-iter timeout sweep over inflight async
+                    #       KV transfers (cross-batch — flags any
+                    #       inflight transfer regardless of which batch
+                    #       owns the request).
+                    # Consume: -
+                    # Produce: per-request py_kv_transfer_timed_out
                     self._check_kv_transfer_timeout()
 
+                # Concern: kv_connector
+                # Task: terminate connector-flagged finished requests
+                #       (paired with `_kv_connector_start_batch` at curr
+                #       P_SCHEDULE).
+                # Consume: -
+                # Produce: terminated requests (out-of-band)
                 self._kv_connector_terminate_requests()
 
+                # Concern: loop_control
+                # Task: advance global iteration counter.
+                # Consume: -
+                # Produce: iter_counter (loop state)
                 self.iter_counter += 1
 
     @nvtx_range("_accept_draft_tokens")
