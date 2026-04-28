@@ -1969,24 +1969,74 @@ class PyExecutor:
                 self.kv_cache_manager.revert_allocate_generation(req)
 
     def _prepare_and_schedule_batch(self):
+        # ===================================================================
+        # Multi-concern fan-out called once per iter from `_executor_loop*`.
+        # All work in this body lives in P_SCHEDULE. The split into
+        # sub-concerns is what motivates eventually breaking this function
+        # apart into per-coroutine `enter_phase(P_SCHEDULE)` blocks.
+        # ===================================================================
+
+        # Concern: schedule (request intake)
+        # Task: dequeue new requests from the waiting queue, validate, and
+        #       activate. `_handle_errors` may fail invalid ones eagerly.
+        # Consume: -
+        # Produce: new_requests (local), self.active_requests (loop state)
         new_requests = self._fetch_and_activate_new_requests()
+        # Concern: loop_control
+        # Task: shutdown gate — no new work AND nothing in flight => stop.
+        # Consume: -
+        # Produce: -
         if self.should_stop_processing:
             return None, None
 
         if self.kv_cache_transceiver:
+            # Concern: disagg
+            # Task: opportunistic probes that drive the disagg KV-transceiver
+            #       state machine forward at iter top: promote ctx requests
+            #       whose peer info just arrived, completion-poll inflight
+            #       gen transfers, and timeout-sweep pending transfers.
+            #       All three are non-blocking; the deadline-waits live at
+            #       P_RESPOND (`_check_disagg_ctx_cache_transfer_status`,
+            #       `_check_kv_transfer_timeout`).
+            # Consume: -
+            # Produce: per-request state transitions (out-of-band)
             self._check_disagg_ctx_schedulable_status(new_requests)
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
 
+        # Concern: iter_stats (init)
+        # Task: allocate the iter_stats record + record queue latency for
+        #       newly arrived requests. Paired with the `_process_iter_stats`
+        #       call at P_RESPOND.
+        # Consume: -
+        # Produce: iter_stats
         iter_stats = None
         if self.enable_iter_perf_stats:
             iter_stats = self._get_init_iter_stats(
                 len(new_requests),
                 self._get_new_active_requests_queue_latency())
 
+        # Concern: schedule (ADP dummy padding)
+        # Task: when attention_dp is on, ensure every rank has a request
+        #       to participate in collectives — pad with a dummy gen
+        #       request locally if needed (terminated at P_RESPOND).
+        # Consume: -
+        # Produce: self.active_requests (loop state, possibly +1 dummy)
         self._pad_attention_dp_dummy_request()
 
         if self.drafter is not None:
+            # Concern: spec_decode (gating + draft seed)
+            # Task: resolve dynamic max_total_draft_tokens from the
+            #       draft_len schedule, decide use_spec_decode for this
+            #       iter (draft-len=0 disables; permanent-disable flag
+            #       from speculation_gate at P_RESPOND wins; otherwise
+            #       drafter heuristic). Then seed every active request's
+            #       draft_tokens with dummy zeros so the scheduler can
+            #       account for them in KV-block math.
+            # Consume: self.active_requests (loop state)
+            # Produce: self.use_spec_decode, self.max_total_draft_tokens
+            #          (loop state); model_engine.enable_spec_decode;
+            #          per-request draft_tokens / py_draft_tokens
             # Honor permanent disable flag based on rolling acceptance first
             if self.drafter.draft_len_schedule is not None:
                 batch_size_input = len(self.active_requests)
@@ -2028,17 +2078,50 @@ class PyExecutor:
             # that speculation is about to happen.
             self._prepare_draft_requests()
 
+        # Concern: schedule (core)
+        # Task: run the scheduler — pick context + generation requests
+        #       that fit, balance ADP requests across DP ranks, optional
+        #       batch-waiting heuristic. This is the only place that
+        #       writes scheduled_batch.
+        # Consume: self.active_requests, py_draft_tokens (loop state)
+        # Produce: scheduled_batch, fitting_disagg_gen_init_requests,
+        #          num_fitting_reqs
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
 
         if self.drafter is not None and not self.use_spec_decode:
+            # Concern: spec_decode (per-request disable)
+            # Task: propagate the use_spec_decode=False decision onto each
+            #       scheduled request so the forward / sample paths skip
+            #       the speculation branches.
+            # Consume: scheduled_batch
+            # Produce: per-request py_disable_speculative_decoding (out-of-band)
             for request in scheduled_batch.all_requests():
                 request.py_disable_speculative_decoding = True
 
         if self.kv_cache_transceiver:
+            # Concern: resource (+ disagg)
+            # Task: for newly-fitting disagg gen-init requests, prepare
+            #       KV cache / spec / draft resources, then submit the
+            #       async KV recv to the ctx worker. Same `resource`
+            #       concern as `prepare_resources` later in P_SCHEDULE
+            #       (both allocate KV) but for a different request set.
+            # Consume: fitting_disagg_gen_init_requests
+            # Produce: KV blocks, resource state, recv handles
+            #          (out-of-band)
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
             self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
 
+            # Concern: disagg (back-pressure probe / benchmark gate)
+            # Task: when nothing fit and no gen-init either, decide whether
+            #       to block on at-least-1 ctx transfer (gen-first only
+            #       requests would deadlock that path), or just opportunistic
+            #       cleanup. In benchmark gen-only mode, also check for
+            #       stuck disagg-gen-init requests and fail fast.
+            # Consume: scheduled_batch, fitting_disagg_gen_init_requests,
+            #          num_fitting_reqs
+            # Produce: terminated requests / errored responses
+            #          (out-of-band); may return (None, None) to break loop.
             all_gen_first = self.active_requests and all(
                 req.py_disaggregated_params and req.py_disaggregated_params.
                 schedule_style == DisaggScheduleStyle.GENERATION_FIRST
@@ -2087,6 +2170,10 @@ class PyExecutor:
                                         requests=self.active_requests)
                     return None, None
 
+        # Concern: schedule (telemetry)
+        # Task: stash batch_size for external introspection + log line.
+        # Consume: scheduled_batch
+        # Produce: self.num_scheduled_requests (loop state)
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
             f'has {len(self.active_requests)} active_requests, '
@@ -2250,6 +2337,33 @@ class PyExecutor:
         #     Any genuinely sync CPU bookkeeping that remains lives in the
         #     shared exception thread pool.
         # ===================================================================
+        # ===================================================================
+        # CONCERN / PHASE ANNOTATIONS (round 1: comments only)
+        # -------------------------------------------------------------------
+        # Each codeblock below is tagged with:
+        #   Concern : domain coroutine the code belongs to (`schedule`,
+        #             `disagg`, `kv_connector`, `resource`, `spec_decode`,
+        #             `guided_decoder`, `forward`, `sample`, `response`,
+        #             `perf_metric`, `iter_stats`, `dwdp`, `kv_cache_events`,
+        #             `save_hidden_states`, `hang`, `profile`, `control`,
+        #             `benchmark_disagg_gate`, `loop_control`).
+        #   Task    : 1-line description of what this block does.
+        #   Consume : per-batch (BatchStorage) fields read here. "-" means
+        #             the block only touches loop-/global-state, not batch
+        #             storage.
+        #   Produce : per-batch fields written here. "out-of-band" notes
+        #             writes that escape the batch (responses, GPU events,
+        #             telemetry, request-state mutations on LlmRequest).
+        #
+        # Phases (data-dependency DAG; see roadmap above):
+        #   P_SCHEDULE -> P_FORWARD -> P_SAMPLE -> P_APPLY -> P_RESPOND
+        # The double duty of `BatchPhase` (rendezvous for active-batch
+        # switching + happens-before barrier) only matters for the overlap
+        # / PP loops; for `_executor_loop` there's a single in-flight batch
+        # so phase markers here purely serve as the data-flow barrier.
+        # No reorders were required: the existing line order is already a
+        # valid topological sort of the concern DAG.
+        # ===================================================================
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
@@ -2259,65 +2373,215 @@ class PyExecutor:
             iter_stats = None
             can_forward = not self.is_benchmark_disagg
             while True:
+                # =========================================================
+                # ===== PHASE: P_SCHEDULE =================================
+                # =========================================================
+
+                # Concern: hang
+                # Task: progress watchdog tick (warns / aborts on stall).
+                # Consume: -
+                # Produce: -
                 self.hang_detector.checkpoint()
+
+                # Concern: profile
+                # Task: drive torch / CUDA-event profiler state machine.
+                # Consume: -
+                # Produce: profiler artifacts (out-of-band)
                 profile_step()
+
+                # Concern: iter_stats
+                # Task: stamp wall-clock start of this iter (used at
+                #       P_RESPOND to compute iter_latency_ms).
+                # Consume: -
+                # Produce: iter_start_time
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
+                # Concern: schedule (+ disagg + iter_stats + spec_decode + resource)
+                # Task: fat fan-out call. See annotations on
+                #       `_prepare_and_schedule_batch` for the per-concern
+                #       breakdown. High-level effect: fetch new requests,
+                #       drive disagg KV-transceiver probes, decide
+                #       use_spec_decode, run scheduler, allocate resources
+                #       for fitting disagg-gen-init requests, init iter_stats.
+                #       Returns (None, None) to signal shutdown.
+                # Consume: -
+                # Produce: scheduled_batch, iter_stats; mutates
+                #          self.active_requests, self.use_spec_decode,
+                #          self.max_total_draft_tokens
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+
+                # Concern: control
+                # Task: pause loop if a control request is pending so an
+                #       external thread can mutate executor state safely.
+                # Consume: -
+                # Produce: -
                 self._handle_control_request()
 
+                # Concern: loop_control
+                # Task: shutdown rendezvous — `scheduled_batch is None`
+                #       means `_prepare_and_schedule_batch` saw
+                #       `should_stop_processing` (or the benchmark-disagg
+                #       error path).
+                # Consume: scheduled_batch
+                # Produce: -
                 if scheduled_batch is None:
                     break
 
+                # Concern: benchmark_disagg_gate
+                # Task: in disagg-gen benchmark mode, gate the forward
+                #       pass until every gen request has finished its KV
+                #       transfer. `should_retry` skips the iter (sleep+continue).
+                # Consume: scheduled_batch
+                # Produce: can_forward (loop state across iters)
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
                     continue
 
+                # Concern: schedule (paused-request lifecycle)
+                # Task: terminate / re-pause requests preempted by the V1
+                #       scheduler. V2 manages KV suspend internally so the
+                #       block is gated on `_scheduler_manages_kv_suspend`.
+                # Consume: scheduled_batch.paused_requests
+                # Produce: terminated/paused requests (out-of-band)
                 if not self._scheduler_manages_kv_suspend:
                     self._terminate_requests(scheduled_batch.paused_requests)
                     self._pause_requests(scheduled_batch.paused_requests)
 
+                # Concern: response (init slot)
+                # Task: default the per-iter finished-request list so the
+                #       trailing iter_stats block can read it whether or
+                #       not the can_queue branch ran.
+                # Consume: -
+                # Produce: finished_requests (initial empty)
                 finished_requests = []
 
+                # Concern: schedule (collective queue gate)
+                # Task: collective check that every TP rank has a non-empty
+                #       batch — mismatched ranks would hang on collectives
+                #       inside `_forward_step`.
+                # Consume: scheduled_batch.batch_size
+                # Produce: can_queue
                 can_queue, _ = self._can_queue(scheduled_batch)
 
                 if can_queue:
                     if self.kv_cache_transceiver:
-                        # For generation requests which have completed KV cache transfer
+                        # Concern: disagg
+                        # Task: promote DISAGG_GENERATION_TRANS_COMPLETE
+                        #       gen requests to GENERATION_IN_PROGRESS,
+                        #       prepare seq-slot / sampler step, prepend
+                        #       first_gen logprobs+logits from prefill.
+                        # Consume: scheduled_batch.generation_requests
+                        # Produce: per-request state (out-of-band on requests)
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
-                        # Return the first token to the client
+                        # Concern: response (first-token)
+                        # Task: emit the *first* token response for newly
+                        #       promoted gen requests so the disagg client
+                        #       can start streaming before the first
+                        #       forward pass on this worker.
+                        #       Note: a `response` step at P_SCHEDULE,
+                        #       paired with the main `response` work at
+                        #       P_RESPOND — the same concern split across
+                        #       phases, motivating a single coroutine.
+                        # Consume: scheduled_batch.generation_requests
+                        # Produce: enqueued first-token responses (out-of-band)
                         self._handle_first_token_response(scheduled_batch)
 
+                    # Concern: spec_decode (dynamic draft length)
+                    # Task: pad/truncate every gen request's
+                    #       py_draft_tokens to a uniform draft length so
+                    #       CUDA-graph capture works; pin
+                    #       model_engine.runtime_draft_len.
+                    # Consume: scheduled_batch (batch_size, gen requests)
+                    # Produce: per-request py_draft_tokens (out-of-band),
+                    #          model_engine.runtime_draft_len (engine state)
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    # Concern: resource
+                    # Task: allocate KV blocks + per-resource-manager state
+                    #       for the scheduled batch (paired with
+                    #       `update_resources` at P_RESPOND).
+                    # Consume: scheduled_batch
+                    # Produce: KV blocks, resource-manager state (out-of-band)
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                 if self.kv_connector_manager:
+                    # Concern: kv_connector
+                    # Task: refresh connector metadata (block layouts,
+                    #       remote topology) — must run every iter.
+                    # Consume: -
+                    # Produce: connector metadata (out-of-band)
                     self.kv_connector_manager.handle_metadata()
 
                 if can_queue:
+                    # Concern: kv_connector
+                    # Task: queue async KV-load operations on the current
+                    #       stream for the scheduled batch. The wait
+                    #       (`wait_for_save`) happens implicitly inside
+                    #       `_forward_step` at P_FORWARD — same concern,
+                    #       split across two phases.
+                    # Consume: scheduled_batch
+                    # Produce: connector load ops (out-of-band)
                     self._kv_connector_start_batch(scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
                 if self.kv_connector_manager:
+                    # Concern: schedule (collective queue re-check)
+                    # Task: re-evaluate cross-rank queue consensus —
+                    #       `take_scheduled_requests_pending_load` may have
+                    #       removed/added requests, so the previous
+                    #       can_queue is potentially stale.
+                    # Consume: scheduled_batch.batch_size
+                    # Produce: can_queue
                     can_queue, _ = self._can_queue(scheduled_batch)
 
                 if not can_queue:
+                    # Concern: resource (revert)
+                    # Task: undo V2 scheduler's per-gen KV growth when the
+                    #       forward is skipped — without this the host
+                    #       page-index buffer overflows after enough
+                    #       skipped iters.
+                    # Consume: scheduled_batch.generation_requests
+                    # Produce: KV cache state (out-of-band)
                     self._revert_gen_alloc(scheduled_batch)
 
                 if can_queue:
+                    # =====================================================
+                    # ===== PHASE: P_FORWARD ==============================
+                    # =====================================================
+
                     # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
                     # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                     if self.guided_decoder is not None:
+                        # Concern: guided_decoder
+                        # Task: register the batch with the constraint
+                        #       matcher; init disagg-gen request matchers.
+                        #       Must run before the drafter (drafter needs
+                        #       valid matchers) and before engine forward
+                        #       (forward updates prev_seq_slot).
+                        # Consume: scheduled_batch
+                        # Produce: matcher per-batch state (out-of-band)
                         self.guided_decoder.add_batch(scheduled_batch)
                         if self.kv_cache_transceiver:
                             self.guided_decoder.init_disagg_gen_requests()
 
                     if self.drafter is not None and self.use_spec_decode:
+                        # Concern: spec_decode (drafter forward)
+                        # Task: roll back rejected draft tokens, run the
+                        #       *draft* model on execution_stream, pad
+                        #       resulting draft tokens for CUDA-graph,
+                        #       re-register the batch with guided_decoder
+                        #       (draft tokens are now the real ones), and
+                        #       roll back draft-token mask. The
+                        #       guided_decoder calls are interleaved
+                        #       because the matcher state follows the
+                        #       drafter's rewriting of py_draft_tokens.
+                        # Consume: scheduled_batch
+                        # Produce: per-request py_draft_tokens (out-of-band),
+                        #          guided_decoder matcher state
                         if self.guided_decoder is not None:
                             self.guided_decoder.rollback_rejected_tokens()
                         with request_context(
@@ -2340,16 +2604,53 @@ class PyExecutor:
                             if hasattr(self.drafter, "guided_decoder"):
                                 self.guided_decoder.rollback_draft_tokens()
 
-                    # GPU and CPU timing for perf metrics
+                    # Concern: perf_metric
+                    # Task: allocate three CUDA event handles used to
+                    #       bracket the forward+sample timing window.
+                    #       Same concern as `record_perf_events` /
+                    #       `save_timing_to_requests` /
+                    #       `compute_batch_gpu_times` — single
+                    #       perf_metric coroutine, four phases.
+                    # Consume: -
+                    # Produce: gpu_forward_start, gpu_forward_end,
+                    #          gpu_sample_end (CUDA events)
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
                         if self.dwdp_manager is not None:
+                            # Concern: dwdp
+                            # Task: prefetch the first MoE expert layers'
+                            #       weights so they overlap with attention
+                            #       compute on the forward critical path.
+                            # Consume: -
+                            # Produce: H2D weight transfers (out-of-band)
                             self.dwdp_manager.prefetch_first_layers()
+                        # Concern: forward (+ kv_connector wait_for_save)
+                        # Task: queue model forward on execution_stream;
+                        #       internally also calls
+                        #       `_kv_connector_wait_for_save` which is the
+                        #       deadline-wait counterpart of
+                        #       `_kv_connector_start_batch` at P_SCHEDULE.
+                        # Consume: scheduled_batch, prepared resources,
+                        #          py_draft_tokens, runtime_draft_len
+                        # Produce: batch_outputs (logits + extras),
+                        #          fwd_timing (CPU ts), forward CUDA events
                         batch_outputs = self._forward_step(scheduled_batch)
 
+                    # =====================================================
+                    # ===== PHASE: P_SAMPLE ===============================
+                    # =====================================================
+
+                    # Concern: guided_decoder
+                    # Task: apply the constraint matcher to logits — masks
+                    #       disallowed tokens and flags requests that
+                    #       violated their grammar. Must run before
+                    #       _sample_async (in same P_SAMPLE) so masking
+                    #       affects sampling.
+                    # Consume: batch_outputs (logits)
+                    # Produce: guided_decoder_failed_requests, masked logits
                     guided_decoder_failed_requests = None
                     if self.guided_decoder is not None:
                         guided_decoder_failed_requests = self.guided_decoder.execute(
@@ -2357,23 +2658,62 @@ class PyExecutor:
 
                     with self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
+                        # Concern: sample
+                        # Task: run HandleLogits / HandleAdditionalOutputs,
+                        #       queue the sampling kernel, queue the D2H
+                        #       copy of sample-state tensors, record
+                        #       sampler_event for the P_APPLY sync.
+                        # Consume: scheduled_batch, batch_outputs (logits)
+                        # Produce: sample_state (with sampler_event +
+                        #          .device tensors), sample_timing
                         sample_state = self._sample_async(
                             scheduled_batch, batch_outputs)
 
+                    # Concern: perf_metric
+                    # Task: snapshot CUDA event handles + CPU
+                    #       start/end timestamps onto each request's perf
+                    #       record. Events are still un-synced; the actual
+                    #       times are computed at P_RESPOND
+                    #       (`compute_batch_gpu_times`).
+                    # Consume: scheduled_batch, gpu_*_start/_end (events),
+                    #          fwd_timing, sample_timing
+                    # Produce: per-request perf records (out-of-band)
                     self.perf_manager.save_timing_to_requests(
                         scheduled_batch.all_requests(), gpu_forward_start,
                         gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
                         fwd_timing.end_time, sample_timing.start_time,
                         sample_timing.end_time)
 
+                    # =====================================================
+                    # ===== PHASE: P_APPLY ================================
+                    # =====================================================
+
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,
                     # causing _sample_async to fail when accessing context_chunk_size property.
+
+                    # Concern: guided_decoder
+                    # Task: mark grammar-failed requests as errored.
+                    #       Strict ordering constraint: must run AFTER
+                    #       _sample_async (else GENERATION_COMPLETE
+                    #       breaks sample's context_chunk_size access)
+                    #       but BEFORE _update_requests writes tokens.
+                    # Consume: scheduled_batch,
+                    #          guided_decoder_failed_requests
+                    # Produce: failed-request error responses (out-of-band)
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
 
                     # Handle SaveHiddenStates mode - save hidden states after forward
                     if not self.is_warmup:
+                        # Concern: save_hidden_states
+                        # Task: persist hidden states captured during
+                        #       forward (eagle3 / EAGLE training data
+                        #       capture). Reads model_engine.spec_metadata
+                        #       which is written by `_forward_step`.
+                        # Consume: scheduled_batch,
+                        #          model_engine.spec_metadata (engine state)
+                        # Produce: hidden-state files (out-of-band)
                         spec_resource_mgr = self.resource_manager.resource_managers.get(
                             ResourceManagerType.SPEC_RESOURCE_MANAGER)
                         if spec_resource_mgr is not None and hasattr(
@@ -2383,21 +2723,111 @@ class PyExecutor:
                             spec_resource_mgr.process_and_save(
                                 scheduled_batch, spec_metadata)
 
+                    # Concern: sample (state advance)
+                    # Task: advance context_chunk_position; transition
+                    #       finished-context requests to
+                    #       GENERATION_IN_PROGRESS / GENERATION_TO_COMPLETE;
+                    #       drop the ADP dummy request. Independent of
+                    #       sample_state — only needs scheduled_batch —
+                    #       so could in principle run at P_SAMPLE.
+                    #       Kept at P_APPLY here because the overlap loop
+                    #       has a separate P_STATE_UPD slot for it; the
+                    #       plain loop folds it into P_APPLY.
+                    # Consume: scheduled_batch
+                    # Produce: per-request state (out-of-band)
                     self._update_request_states(scheduled_batch)
+
+                    # Concern: sample (apply tokens)
+                    # Task: BLOCK on sampler_event, then call
+                    #       sampler.update_requests to write the sampled
+                    #       tokens onto each request. This is the only
+                    #       point in the loop that synchronously waits on
+                    #       the sample-state D2H copy.
+                    # Consume: sample_state (sampler_event +
+                    #          .host tensors)
+                    # Produce: per-request new tokens, py_decoding_iter
+                    #          (out-of-band)
                     self._update_requests(sample_state, self.resource_manager)
 
+                    # =====================================================
+                    # ===== PHASE: P_RESPOND ==============================
+                    # =====================================================
+
+                    # Concern: disagg (+ kv_connector)
+                    # Task: for finished context-only requests, start the
+                    #       async KV send to the gen worker AND respond;
+                    #       also lets kv_connector flag-finished requests
+                    #       start their async transfer. Probes
+                    #       _check_disagg_ctx_cache_transfer_status(0) at
+                    #       the end (opportunistic completion sweep).
+                    #       Multi-concern function — see annotations on
+                    #       `_send_kv_async`.
+                    # Consume: scheduled_batch, request finish state
+                    # Produce: KV send handles (out-of-band), terminated
+                    #          context-only requests
                     self._send_kv_async(scheduled_batch.all_requests())
 
+                    # Concern: response (cancellation)
+                    # Task: terminate canceled requests if possible
+                    #       (deferred when an in-progress KV transfer
+                    #       blocks termination).
+                    # Consume: self.canceled_req_ids (external),
+                    #          self.active_requests (loop state)
+                    # Produce: cancellation responses + termination
+                    #          (out-of-band)
                     self._handle_canceled_requests()
+
+                    # Concern: response (+ perf_metric step + spec_decode gating)
+                    # Task: build per-request responses, enqueue, terminate
+                    #       finished requests. ALSO appends step-level
+                    #       perf metrics (perf_metric concern leaking in)
+                    #       and updates speculation_gate rolling
+                    #       acceptance (spec_decode concern leaking in).
+                    #       See annotations inside `_handle_responses`.
+                    # Consume: self.active_requests, scheduled_batch,
+                    #          per-request py_decoding_iter / draft_tokens
+                    # Produce: finished_requests, responses (out-of-band),
+                    #          self.speculation_permanently_disabled
+                    #          (loop state)
                     finished_requests = self._handle_responses()
                     # Complete ctx send sessions AFTER responses are created so
                     # _handle_responses sees the request before it is terminated.
+
+                    # Concern: disagg
+                    # Task: opportunistic probe of ctx-side KV-transfer
+                    #       completion; terminates ctx-only requests whose
+                    #       KV blocks have finished sending. Strict
+                    #       ordering: AFTER _handle_responses so the
+                    #       response sees the request before termination.
+                    #       Same concern as `_send_kv_async` and the
+                    #       `_check_disagg_*` calls at P_SCHEDULE — one
+                    #       coroutine, four phases.
+                    # Consume: -
+                    # Produce: terminated requests (out-of-band)
                     if self.kv_cache_transceiver:
                         self._check_disagg_ctx_cache_transfer_status(0)
                     # Compute GPU times after _handle_responses creates metric entries
                     # (safe in non-overlap mode: no next iteration to overwrite events)
+
+                    # Concern: perf_metric
+                    # Task: read forward/sample CUDA events into per-request
+                    #       metric records. Only safe in non-overlap mode
+                    #       — the overlap loop must defer this to next
+                    #       iter to avoid event reuse races.
+                    # Consume: scheduled_batch, gpu_*_start/_end (events)
+                    # Produce: per-request gpu timings (out-of-band)
                     self.perf_manager.compute_batch_gpu_times(
                         scheduled_batch.all_requests())
+
+                    # Concern: resource
+                    # Task: free per-request KV / resource state for
+                    #       finished requests; rebalance attention
+                    #       metadata bookkeeping. Paired with
+                    #       `prepare_resources` at P_SCHEDULE.
+                    # Consume: scheduled_batch,
+                    #          model_engine.attn_metadata (engine state)
+                    # Produce: KV blocks freed, resource-manager state
+                    #          (out-of-band)
                     attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                             None)
                     kv_cache_dtype_byte_size = getattr(
@@ -2406,15 +2836,50 @@ class PyExecutor:
                         scheduled_batch, attn_metadata,
                         kv_cache_dtype_byte_size)
                     if self.enable_kv_cache_events:
+                        # Concern: kv_cache_events
+                        # Task: drain queued KV-cache events into the
+                        #       iter-event buffer so user pollers can see
+                        #       them after this iter.
+                        # Consume: -
+                        # Produce: kv-cache event records (out-of-band)
                         self._add_kv_cache_events()
+
+                # NOTE: blocks below run unconditionally (whether or not
+                # can_queue was True) — they are still P_RESPOND in the
+                # data-flow DAG but live outside the can_queue branch.
 
                 if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
+                    # Concern: disagg
+                    # Task: end-of-iter timeout sweep over inflight async
+                    #       KV transfers; flips py_kv_transfer_timed_out
+                    #       on requests whose transfer exceeded the
+                    #       configured deadline.
+                    # Consume: -
+                    # Produce: per-request py_kv_transfer_timed_out
+                    #          (out-of-band)
                     self._check_kv_transfer_timeout()
 
+                # Concern: kv_connector
+                # Task: terminate connector-flagged finished requests —
+                #       paired with `_kv_connector_start_batch` at
+                #       P_SCHEDULE (start vs terminate, two phases of
+                #       one concern).
+                # Consume: -
+                # Produce: terminated requests (out-of-band)
                 self._kv_connector_terminate_requests()
 
                 if self.enable_iter_perf_stats and sample_state is not None:
+                    # Concern: iter_stats
+                    # Task: snapshot model_engine.iter_states.num_ctx_tokens
+                    #       and run end-of-iter stats aggregation. Paired
+                    #       with the iter_start_time stamp at P_SCHEDULE
+                    #       and the `_get_init_iter_stats` call inside
+                    #       `_prepare_and_schedule_batch`.
+                    # Consume: scheduled_batch, sample_state,
+                    #          finished_requests, iter_start_time,
+                    #          iter_stats
+                    # Produce: aggregated iter_stats record (out-of-band)
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                         'num_ctx_tokens']
                     self._process_iter_stats(
@@ -2424,6 +2889,12 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
+                # Concern: loop_control
+                # Task: advance the global iteration counter (used by
+                #       next iter's profilers, perf metric keys, log
+                #       prefixes).
+                # Consume: -
+                # Produce: iter_counter (loop state)
                 self.iter_counter += 1
 
     def _prepare_draft_requests(self):
@@ -3557,6 +4028,21 @@ class PyExecutor:
 
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
+        # ===================================================================
+        # Multi-concern. All work here is at P_RESPOND.
+        #   * `disagg` block: starts ctx-side KV send for finished context
+        #     requests (paired with the ctx-side recv promotion at
+        #     P_SCHEDULE in `_check_disagg_ctx_schedulable_status`).
+        #   * `kv_connector` block: kicks off async save for finished
+        #     requests via the connector manager (paired with
+        #     `_kv_connector_start_batch` and `wait_for_save` at
+        #     P_SCHEDULE/P_FORWARD, and `_kv_connector_terminate_requests`
+        #     later at P_RESPOND).
+        #   * trailing `disagg` probe: opportunistic completion sweep for
+        #     ctx KV transfers (same concern as the call later in
+        #     `_executor_loop`, kept here so freshly-started transfers can
+        #     be reaped if they completed synchronously).
+        # ===================================================================
 
         def kv_connector_request_finished(req: LlmRequest):
             try:
@@ -3571,6 +4057,12 @@ class PyExecutor:
                     self.async_transfer_manager.start_transfer(req)
 
         if self.kv_cache_transceiver:
+            # Concern: disagg
+            # Task: start async ctx->gen KV send for finished ctx-only
+            #       requests; respond_and_send_async also produces the
+            #       ctx-side response packet.
+            # Consume: scheduled_requests
+            # Produce: ctx-side responses + send handles (out-of-band)
             for req in scheduled_requests:
                 if req.is_context_only_request and (
                         req.is_context_finished or req.is_finished_due_to_length
@@ -3584,6 +4076,14 @@ class PyExecutor:
                         req.py_kv_transfer_start_time = time.time()
 
         if self.kv_connector_manager:
+            # Concern: kv_connector
+            # Task: ask the connector to flag finished requests for async
+            #       save and start their transfer. In overlap mode the
+            #       finished requests come from the *previous* batch; in
+            #       non-overlap mode they come from the current
+            #       scheduled_requests.
+            # Consume: scheduled_requests / self.previous_batch
+            # Produce: connector save handles (out-of-band)
             if not self.disable_overlap_scheduler:
                 requests = self.previous_batch.scheduled_requests.all_requests(
                 ) if self.previous_batch is not None else []
@@ -3594,6 +4094,12 @@ class PyExecutor:
                     kv_connector_request_finished(req)
 
         if self.kv_cache_transceiver:
+            # Concern: disagg (opportunistic completion probe)
+            # Task: non-blocking sweep for ctx transfers that already
+            #       completed since iter top — terminates those requests
+            #       so their KV blocks can be reused next iter.
+            # Consume: -
+            # Produce: terminated requests (out-of-band)
             self._check_disagg_ctx_cache_transfer_status(0)
 
     def _get_disagg_reqs_in_error_state(self):
@@ -3676,6 +4182,14 @@ class PyExecutor:
                 num_accepted_tokens_device=num_accepted_tokens_device)
 
         try:
+            # Concern: forward
+            # Task: collect per-request flags (gather_context_logits,
+            #       cache indirection); queue the model forward on
+            #       execution_stream so it overlaps with main-stream
+            #       KVCacheTransferManager onboard/offload work.
+            # Consume: scheduled_requests, prepared resources,
+            #          new_tensors_device, num_accepted_tokens_device
+            # Produce: outputs (logits + extras)
             gather_context_logits = any(
                 a.py_return_context_logits
                 for a in scheduled_requests.context_requests)
@@ -3694,6 +4208,12 @@ class PyExecutor:
             # before downstream operations use the outputs.
             torch.cuda.current_stream().wait_stream(self.execution_stream)
 
+            # Concern: kv_connector
+            # Task: deadline-wait counterpart of `_kv_connector_start_batch`
+            #       at P_SCHEDULE — must complete before the next iter's
+            #       prepare_resources reuses block layouts.
+            # Consume: -
+            # Produce: -
             self._kv_connector_wait_for_save()
 
             return outputs
@@ -3997,6 +4517,18 @@ class PyExecutor:
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
+        # ===================================================================
+        # Multi-concern. Primary concern is `response`; this body also
+        # interleaves three other concerns that share the per-request
+        # iteration:
+        #   * `perf_metric`: append_step_metrics / update_perf_metrics.
+        #   * `disagg`: KV-transfer timeout cleanup, disagg ctx-state
+        #     terminate-policy fork.
+        #   * `spec_decode`: speculation_gate rolling acceptance update
+        #     (which can flip self.speculation_permanently_disabled and
+        #     thus disable spec_decode at the *next* iter's P_SCHEDULE).
+        # All work here is at P_RESPOND.
+        # ===================================================================
         new_responses = []
         requests_to_terminate = []
         # Requests terminated by _check_disagg_ctx_cache_transfer_status (DISAGG_CONTEXT_COMPLETE);
@@ -4011,11 +4543,19 @@ class PyExecutor:
 
         for request in self.active_requests:
             req_id = request.py_request_id
+            # Concern: response (dummy)
+            # Task: ADP dummy never produces a response; just terminate.
             # no responses for dummy request, and finish it
             if request.is_attention_dp_dummy:
                 requests_to_terminate.append(request)
                 continue
 
+            # Concern: disagg (timeout cleanup)
+            # Task: requests whose KV transfer timed out (flagged by
+            #       `_check_kv_transfer_timeout` at P_SCHEDULE / P_RESPOND)
+            #       are cancelled and erred. Multi-concern leak: this
+            #       branch belongs to the `disagg` coroutine in the
+            #       refactored design, not `response`.
             # Check if generation request needs cleanup due to KV cache transfer timeout
             if request.py_kv_transfer_timed_out:
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
@@ -4025,6 +4565,10 @@ class PyExecutor:
                         requests=[request])
                 continue
 
+            # Concern: response (skip-emit) + perf_metric (step)
+            # Task: gen request still in transmission OR overlap-mode's
+            #       first-token already emitted at P_SCHEDULE — skip the
+            #       response but still record per-step metrics.
             if request.is_generation_only_request() and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
@@ -4039,10 +4583,17 @@ class PyExecutor:
                     new_active_requests.append(request)
                     continue
 
+            # Concern: response (per-request snapshot)
+            # Task: copy py_draft_tokens / py_decoding_iter onto the C++
+            #       response-visible fields so the response packet sees a
+            #       consistent view of the request.
             request.draft_tokens = request.py_draft_tokens if get_draft_token_length(
                 request) > 0 else []
             request.decoding_iter = request.py_decoding_iter
 
+            # Concern: perf_metric
+            # Task: append the per-step metric record for this request
+            #       (token time, decode latency, etc).
             self.perf_manager.append_step_metrics(
                 request, self.iter_counter, batch_token_time=batch_token_time)
 
@@ -4052,6 +4603,9 @@ class PyExecutor:
             if request.return_perf_metrics and request.py_decoding_iter >= 1:
                 request.update_perf_metrics(self.iter_counter)
 
+            # Concern: response (build / enqueue)
+            # Task: build the response packet on iter==1, on finish, or
+            #       on the streaming interval; stash for batch enqueue.
             request_done = False
             if request.py_decoding_iter == 1 or request.is_finished or \
                     request.py_decoding_iter % self.stream_interval == 0:
@@ -4062,6 +4616,16 @@ class PyExecutor:
                     new_responses.append((req_id, response))
 
             if request_done:
+                # Concern: spec_decode (rolling acceptance gate)
+                # Task: feed this request's avg_decoded_tokens_per_iter
+                #       into speculation_gate; flipping
+                #       speculation_permanently_disabled here is what
+                #       makes `_prepare_and_schedule_batch` set
+                #       use_spec_decode=False on the *next* iter.
+                #       Cross-iter feedback edge: P_RESPOND -> next
+                #       iter's P_SCHEDULE.
+                # Consume: per-request avg_decoded_tokens_per_iter
+                # Produce: self.speculation_permanently_disabled (loop state)
                 if (self.drafter is not None and getattr(
                         self.model_engine, 'enable_spec_decode', False)
                         and not self.speculation_permanently_disabled
@@ -4087,6 +4651,13 @@ class PyExecutor:
                                     f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
                                 )
 
+                # Concern: disagg / response (terminate-policy fork)
+                # Task: pick the right termination bucket. Disagg context-
+                #       complete requests were already terminated by
+                #       `_check_disagg_ctx_cache_transfer_status`; only
+                #       record them for stats. Otherwise terminate now,
+                #       except for ctx requests still in transmission
+                #       (their KV is still being sent).
                 # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
                 # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
                 # path is fixed.
