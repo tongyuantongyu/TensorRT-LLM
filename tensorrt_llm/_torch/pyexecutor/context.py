@@ -93,27 +93,73 @@ if TYPE_CHECKING:
 
     from .concerns import Concerns
     from .executor_request_queue import ExecutorRequestQueue
+    # Forward refs for service types defined alongside concerns
+    # (likely in ``concerns/_services.py`` once written).
+    from .concerns import (  # noqa: F401
+        ClientChannel,
+        RequestPool,
+        TerminationService,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
 class Service:
     """Truly cross-cutting service objects. Immutable.
 
-    HIGH BAR for membership. A candidate belongs here ONLY if it is
-    used by MULTIPLE concerns AND has no natural single-owner concern.
+    Two kinds of members coexist here:
 
-    Almost every "service" in the legacy ``PyExecutor.__init__``
-    actually belongs to a single concern and should live as an
-    instance attribute on that concern's class -- e.g.,
+    1. **Cross-rank primitives** with no natural single owner. The
+       canonical member is ``dist`` -- the cross-rank communicator
+       used by schedule, forward, sample, response, disagg,
+       kv_connector, etc.
+
+    2. **Cross-cutting service objects** that own state previously
+       smeared across many ``PyExecutor`` methods. These exist
+       because the underlying state (``active_requests``, response
+       delivery, request termination) is touched by MANY concerns
+       AND a few standalone utilities (``fail_requests``); making
+       any single concern its owner would force every other concern
+       to reach into that one. The services are:
+
+       * ``pool: RequestPool`` -- owns ``active_requests`` and
+         ``inflight_req_ids`` (PP). Methods: ``add_active(reqs)``,
+         ``remove_active(reqs)``, ``mark_inflight(reqs)`` /
+         ``unmark_inflight(reqs)``, ``is_drained()``,
+         iteration / filtered views. Replaces direct
+         ``self.active_requests.…`` accesses scattered across
+         legacy code.
+       * ``client: ClientChannel`` -- the loop-side write surface
+         of the response side of ``MessagePort``. Owns the body of
+         the legacy ``_enqueue_responses`` (TP gather +
+         cross-thread put + per-request fan-out to
+         ``result_wait_queues``). Methods: ``enqueue(items)``.
+         Concerns and utilities call this instead of poking
+         ``MessagePort`` directly for response output.
+       * ``termination: TerminationService`` -- owns
+         ``DisaggPPTerminationHandler`` reference and the
+         resource-free + ``result_wait_queues`` cleanup. Methods:
+         ``terminate(req)`` (replaces ``_terminate_request`` +
+         ``_do_terminate_request``).
+
+    The ``fail_requests(ctx, reqs, msg)`` utility (free function
+    in ``concerns/_shared.py``) composes all three: marks state,
+    removes from pool, enqueues error responses, terminates.
+
+    Almost every other "service" in the legacy
+    ``PyExecutor.__init__`` belongs to a single concern and should
+    live as an instance attribute on that concern's class -- e.g.,
 
     +---------------------------+----------------------------+
-    | legacy ``PyExecutor`` field | owning concern             |
+    | legacy ``PyExecutor`` field | owning concern / service   |
     +===========================+============================+
     | ``model_engine``          | ``ForwardConcern``         |
     | ``sampler``               | ``SampleConcern``          |
     | ``scheduler``             | ``ScheduleConcern``        |
     | ``kv_cache_manager``      | ``ResourceConcern``        |
-    | ``resource_manager``      | ``ResourceConcern``        |
+    | ``resource_manager``      | ``ResourceConcern`` (also  |
+    |                           | ``TerminationService``     |
+    |                           | uses for ``free_resources``|
+    |                           | -- inject the same ref)    |
     | ``drafter``               | ``SpecDecodeConcern``      |
     | ``speculation_gate``      | ``SpecDecodeConcern``      |
     | ``guided_decoder``        | ``GuidedDecoderConcern``   |
@@ -125,18 +171,31 @@ class Service:
     | ``dwdp_manager``          | ``DwdpConcern``            |
     | ``execution_stream``      | ``ForwardConcern`` (owns)  |
     | ``sample_stream``         | ``SampleConcern`` (owns)   |
+    | ``active_requests``       | ``RequestPool`` (svc.pool) |
+    | ``inflight_req_ids``      | ``RequestPool`` (svc.pool) |
+    | ``responses``+CV+         | ``ClientChannel``          |
+    | ``result_wait_queues``    | (svc.client) +             |
+    |                           | ``MessagePort`` (data)     |
+    | ``_disagg_pp_termination_ | ``TerminationService``     |
+    | handler``                 | (svc.termination)          |
     +---------------------------+----------------------------+
 
-    Realistically this dataclass stays at 1-3 fields. The canonical
-    member is ``dist`` -- the cross-rank communicator, used by
-    schedule, forward, sample, response, disagg, kv_connector, etc.
+    Member count discipline: HIGH BAR for adding a fourth service
+    beyond the four above (``dist``, ``pool``, ``client``,
+    ``termination``). Anything new must be used by multiple
+    concerns AND have no natural single-owner concern.
     """
 
     # --- Always available ---
     dist: "Distributed" = None
 
+    # --- Cross-cutting services (own state previously on PyExecutor) ---
+    pool: "RequestPool" = None
+    client: "ClientChannel" = None
+    termination: "TerminationService" = None
+
     # Add more ONLY if a candidate fails the "single owner concern"
-    # test above. If you find yourself adding a 4th field, audit the
+    # test above. If you find yourself adding a 5th field, audit the
     # candidates first.
 
 

@@ -54,9 +54,10 @@ Why a coroutine even without state-threading
 
 Concerns like ``DisaggConcern`` or ``ResourceConcern`` could in
 principle expose two or three methods (e.g.,
-``Resource.prepare(...)`` at FORWARD_1, ``Resource.update(...)`` at
-RESPOND_7), called from the BATCH body at the right phases. We don't
-do that. The coroutine form has two real advantages:
+``Resource.prepare(...)`` at RESOURCE_PREP_1,
+``Resource.update(...)`` at RESPOND_8), called from the BATCH body
+at the right phases. We don't do that. The coroutine form has two
+real advantages:
 
 1. **One source of truth for the concern's lifecycle.** The body
    reads top-to-bottom in phase order, with ``await enter_phase(P)``
@@ -154,13 +155,13 @@ Skeleton::
                 self._check_disagg_ctx_schedulable_status()
                 self._check_disagg_gen_transfer_status()
 
-            # FORWARD_1: prepare disagg-gen-transmission-complete
-            r1, _ = await enter_phase(BatchPhase.FORWARD_1)
+            # FORWARD_2: prepare disagg-gen-transmission-complete
+            r1, _ = await enter_phase(BatchPhase.FORWARD_2)
             if self.transceiver:
                 self._prepare_disagg_gen_transmission_complete(r1.scheduled_batch)
 
-            # RESPOND_7: send_kv_async + opportunistic probe
-            r7, _ = await enter_phase(BatchPhase.RESPOND_7)
+            # RESPOND_8: send_kv_async + opportunistic probe
+            r7, _ = await enter_phase(BatchPhase.RESPOND_8)
             for req in r7.scheduled_batch.all_requests():
                 if req.is_context_only_request and ...:
                     self.transfer_mgr.start_transfer(req)
@@ -196,7 +197,7 @@ separate; see ``context.py`` for the threading rationale)::
                 await resume(disagg)
             # ...
 
-        async with batch_phase(BatchPhase.FORWARD_1):
+        async with batch_phase(BatchPhase.FORWARD_2):
             if disagg is not None:
                 await resume(disagg)
             await resume(forward)
@@ -219,7 +220,7 @@ RUNTIME GUARANTEES THAT MAKE THIS WORK
 - **Done short-circuit**. When a concern's coroutine returns, its
   ``Concern.done`` flips True. Subsequent ``resume(handle)`` calls
   return immediately without entering the Driver. So a concern that
-  finishes early (e.g., last yield at RESPOND_7) is a no-op for any
+  finishes early (e.g., last yield at RESPOND_8) is a no-op for any
   later phases the BATCH still iterates through.
 
 - **Strict progression**. Successive ``enter_phase`` calls from the
@@ -292,7 +293,7 @@ Lives on the concern class as an instance attribute. Example::
             self.drafter = drafter
             self.speculation_gate = speculation_gate
             # Cross-iter latch -- written by `record_acceptance` (called
-            # by ResponseConcern at RESPOND_7), read by this concern's
+            # by ResponseConcern at RESPOND_8), read by this concern's
             # coroutine at next iter's SCHEDULE_0.
             self.permanently_disabled = False
 
@@ -330,7 +331,7 @@ Example::
 
     class ResponseConcern:
         async def handle_batch(self, ctx: Context):
-            r7, _ = await enter_phase(BatchPhase.RESPOND_7)
+            r7, _ = await enter_phase(BatchPhase.RESPOND_8)
             ...
             for finished_request in finished:
                 # Peer call via ctx.crn -- NOT via a stored attribute.
@@ -348,6 +349,145 @@ that walks ``ctx.crn.<X>`` references in concern source and fails on
 unwired peers. For now, the runtime-discovery model is simpler.
 
 ==============================================================================
+SHARED SERVICES (``ctx.svc.*``)
+==============================================================================
+
+Three loop-thread service objects own state previously smeared
+across many ``PyExecutor`` methods. They live on ``ctx.svc`` (see
+``context.py``'s ``Service`` dataclass) and are reachable from any
+concern + any standalone utility:
+
+``ctx.svc.pool: RequestPool``
+    Owns the ``active_requests`` list and the PP-only
+    ``inflight_req_ids`` set. Single owner of "what's currently in
+    flight in the executor (across iterations)". Methods:
+
+    * ``add_active(reqs)`` -- admit new fetched requests + ADP dummy.
+    * ``remove_active(reqs)`` -- evict finished or failed requests.
+    * ``mark_inflight(reqs)`` / ``unmark_inflight(reqs)`` -- PP
+      slot-ring exclusion set add / remove.
+    * Iteration helpers (``__iter__``, ``count_schedulable()``,
+      filtered views for disagg-state subsets, etc.).
+    * ``is_drained() -> bool`` -- empty pool predicate (used by the
+      SCHEDULER's ``should_stop_processing`` check).
+
+    Used by: schedule concern (admit, schedule iteration), response
+    concern (evict finished), disagg concern (filtered views,
+    mark/unmark inflight on PP), ``fail_requests`` utility,
+    SCHEDULER iter (``is_drained``).
+
+``ctx.svc.client: ClientChannel``
+    The loop-side write surface of the response side of
+    ``MessagePort``. Encapsulates the body of the legacy
+    ``_enqueue_responses`` (TP gather, cross-thread put on
+    ``MessagePort.responses`` + ``response_cv.notify_all``,
+    per-request fan-out to ``MessagePort.result_wait_queues``).
+    Methods:
+
+    * ``enqueue(items: List[Tuple[req_id, LlmResponse]])``.
+
+    Used by: response concern (handle_responses, handle_first_token,
+    handle_canceled), ``fail_requests`` utility (error responses).
+    Concerns and utilities call this instead of poking
+    ``MessagePort`` directly for response output.
+
+``ctx.svc.termination: TerminationService``
+    Owns the ``DisaggPPTerminationHandler`` reference and the
+    resource-free + ``result_wait_queues`` cleanup logic. Body of
+    the legacy ``_terminate_request`` + ``_do_terminate_request``.
+    Methods:
+
+    * ``terminate(req)`` -- terminate one request (PP-aware
+      dispatch).
+
+    Used by: response concern (response retire, cancellation),
+    schedule concern (paused-request termination), disagg concern
+    (ctx-cache transfer probe, KV transfer timeout),
+    ``fail_requests`` utility, SCHEDULER's catastrophic handler.
+
+Why services and not concerns:
+
+* These objects own EXECUTOR-WIDE mutable state (the request pool,
+  the cross-thread response queues, the termination handler).
+  Concerns own per-batch lifecycles; this state outlives any one
+  batch.
+* They have NO per-batch coroutine. Their methods are called
+  synchronously from concerns (and from ``fail_requests``); no
+  ``handle_batch`` involved.
+* Multiple concerns mutate them, so a single concern can't be the
+  owner without forcing the others to reach into it.
+
+==============================================================================
+FAILURE HANDLING
+==============================================================================
+
+Two distinct failure modes; the legacy ``_handle_errors`` conflated
+them.
+
+Mode A -- catastrophic
+----------------------
+
+A concern can't recover; the rest of the loop can't proceed. In
+the new design the concern's coroutine just ``raise``s -- no
+special helper, no ``try/except`` wrapper around the body. The
+exception propagates:
+
+    concern body -- raise --> BATCH body -- (re-raise) -->
+    SCHEDULER iter (catches at the top of its loop) -->
+    fail_requests(ctx, list(ctx.svc.pool), msg) +
+    ctx.port.shutdown_event.set()
+
+The intermediate ``GeneratorExit`` thrown into still-suspended
+concerns by the Driver runs their ``finally:`` for concern-LOCAL
+cleanup (CUDA event handles, partial buffers) -- but NOT for the
+failing of requests, which is the SCHEDULER's job.
+
+Mode B -- per-request fail-fast
+-------------------------------
+
+A specific subset of requests is bad; the rest of the batch (and
+the loop) continues. The concern calls
+``fail_requests(ctx, reqs, msg)`` and continues its own work. The
+utility (free function in ``concerns/_shared.py``):
+
+    def fail_requests(ctx, reqs, msg):
+        error_responses = []
+        for req in reqs:
+            req.state = LlmRequestState.GENERATION_COMPLETE
+            error_responses.append((req.py_request_id, LlmResponse(
+                request_id=req.py_request_id,
+                error_msg=msg,
+                client_id=req.py_client_id,
+            )))
+        ctx.svc.pool.remove_active(reqs)
+        ctx.svc.client.enqueue(error_responses)
+        for req in reqs:
+            ctx.svc.termination.terminate(req)
+
+``scheduled_batch`` is IMMUTABLE
+--------------------------------
+
+After fail-fast, the failed request stays in any
+``BatchStorage.scheduled_batch`` snapshot that included it.
+Concerns that subsequently iterate ``scheduled_batch`` either:
+
+* iterate ``scheduled_batch.context_requests`` /
+  ``.generation_requests`` and check ``req.state`` (the fail-fast
+  marker); or
+* iterate ``ctx.svc.pool`` instead, which the fail-fast removed
+  from already; or
+* call resource / sample functions that are idempotent on
+  already-terminated requests.
+
+Today's legacy code already follows this discipline. Only ONE
+explicit ``state != GENERATION_COMPLETE`` check survives in the
+hot path (in ``_update_request_states_tp``); other sites either
+iterate ``active_requests`` (auto-excluded after fail-fast) or
+rely on idempotency. The new design preserves this -- with a
+small ``iter_live(reqs)`` helper available where the discipline
+is awkward.
+
+==============================================================================
 THE Concerns BAG
 ==============================================================================
 
@@ -359,6 +499,10 @@ None`` before use.
 
 Currently empty (placeholder); real fields are filled in as concerns
 are implemented.
+
+The services live in ``ctx.svc`` (NOT ``ctx.crn``). Concerns and
+utilities reach them via ``ctx.svc.pool`` / ``ctx.svc.client`` /
+``ctx.svc.termination``.
 
 ==============================================================================
 PLANNED CONCERNS
@@ -390,14 +534,19 @@ PHASE 1 -- minimum viable plain loop
 |        |                     |              | ``can_queue`` +          |
 |        |                     |              | inflight_ids (multi-     |
 |        |                     |              | phase: SCHEDULE_0 +      |
-|        |                     |              | RESPOND_7 inflight       |
-|        |                     |              | cleanup)                 |
+|        |                     |              | RESPOND_8 inflight       |
+|        |                     |              | cleanup). Uses           |
+|        |                     |              | ``ctx.svc.pool`` for all |
+|        |                     |              | active_requests +        |
+|        |                     |              | inflight_ids access.     |
 +--------+---------------------+--------------+--------------------------+
-| 4      | ResourceConcern     | coroutine    | ``prepare_resources`` at |
-|        |                     |              | FORWARD_1 +              |
+| 4      | ResourceConcern     | coroutine    | ``prepare_resources``    |
+|        |                     |              | (main scheduled batch +  |
+|        |                     |              | disagg-gen-init holder)  |
+|        |                     |              | at RESOURCE_PREP_1 +     |
 |        |                     |              | ``update_resources`` /   |
 |        |                     |              | ``revert_gen_alloc`` at  |
-|        |                     |              | RESPOND_7                |
+|        |                     |              | RESPOND_8                |
 +--------+---------------------+--------------+--------------------------+
 | 5      | ForwardConcern      | method       | model forward call       |
 |        |                     |              | (single-phase per rank;  |
@@ -405,16 +554,24 @@ PHASE 1 -- minimum viable plain loop
 |        |                     |              | NCCL p2p -- HC7)         |
 +--------+---------------------+--------------+--------------------------+
 | 6      | SampleConcern       | coroutine    | ``sample_async`` at      |
-|        |                     |              | SAMPLE_2 +               |
+|        |                     |              | SAMPLE_3 +               |
 |        |                     |              | ``update_request_states``|
 |        |                     |              | / ``update_requests``    |
-|        |                     |              | at APPLY_6               |
+|        |                     |              | at APPLY_7               |
 +--------+---------------------+--------------+--------------------------+
 | 7      | ResponseConcern     | coroutine    | first-token (SCHEDULE_0, |
 |        |                     |              | disagg gate optional) +  |
 |        |                     |              | ``handle_canceled`` +    |
 |        |                     |              | ``handle_responses`` at  |
-|        |                     |              | RESPOND_7                |
+|        |                     |              | RESPOND_8. Uses          |
+|        |                     |              | ``ctx.svc.client.enqueue``|
+|        |                     |              | for all response output, |
+|        |                     |              | ``ctx.svc.pool.remove_   |
+|        |                     |              | active`` to evict        |
+|        |                     |              | finished, ``ctx.svc.     |
+|        |                     |              | termination.terminate``  |
+|        |                     |              | for cancellation /       |
+|        |                     |              | retire termination.      |
 +--------+---------------------+--------------+--------------------------+
 
 After phase 1, the plain loop runs end-to-end with non-disagg,
@@ -430,15 +587,15 @@ PHASE 2 -- iteration telemetry (still plain loop)
 |        |                     |              | SCHEDULE_0 + num_ctx_    |
 |        |                     |              | tokens snapshot +        |
 |        |                     |              | ``process_iter_stats``   |
-|        |                     |              | at FINALIZE_8 (gated by  |
+|        |                     |              | at FINALIZE_9 (gated by  |
 |        |                     |              | ``enable_iter_perf_      |
 |        |                     |              | stats``; optional)       |
 +--------+---------------------+--------------+--------------------------+
 | 9      | PerfMetricConcern   | coroutine    | CUDA timing events       |
-|        |                     |              | created at FORWARD_1,    |
+|        |                     |              | created at FORWARD_2,    |
 |        |                     |              | recorded around forward  |
 |        |                     |              | / sample, used at        |
-|        |                     |              | RESPOND_7                |
+|        |                     |              | RESPOND_8                |
 |        |                     |              | (``compute_batch_gpu_    |
 |        |                     |              | times``)                 |
 +--------+---------------------+--------------+--------------------------+
@@ -450,51 +607,56 @@ PHASE 3 -- optional features (any order; pick by need)
 | order  | concern              | shape        | scope                    |
 +========+======================+==============+==========================+
 | 10     | SpecDecodeConcern    | coroutine    | gating (SCHEDULE_0) +    |
-|        |                      |              | drafter run (FORWARD_1)  |
+|        |                      |              | drafter run (FORWARD_2)  |
 |        |                      |              | + ``record_acceptance``  |
 |        |                      |              | hook called by Response  |
-|        |                      |              | at RESPOND_7. Owns       |
+|        |                      |              | at RESPOND_8. Owns       |
 |        |                      |              | ``permanently_disabled`` |
 |        |                      |              | latch.                   |
 +--------+----------------------+--------------+--------------------------+
-| 11     | DisaggConcern        | coroutine    | KV transceiver probes    |
-|        |                      |              | (SCHEDULE_0) + transmis- |
-|        |                      |              | sion-complete (FORWARD_1)|
-|        |                      |              | + ``send_kv_async`` +    |
+| 11     | DisaggConcern        | coroutine    | KV transceiver probes +  |
+|        |                      |              | package                  |
+|        |                      |              | ``disagg_gen_init_to_    |
+|        |                      |              | prepare`` (SCHEDULE_0) + |
+|        |                      |              | async KV recv submission |
+|        |                      |              | (RESOURCE_PREP_1) +      |
+|        |                      |              | transmission-complete    |
+|        |                      |              | (FORWARD_2) +            |
+|        |                      |              | ``send_kv_async`` +      |
 |        |                      |              | ctx-cache transfer probe |
-|        |                      |              | (RESPOND_7)              |
+|        |                      |              | (RESPOND_8)              |
 +--------+----------------------+--------------+--------------------------+
 | 12     | KvConnectorConcern   | coroutine    | ``handle_metadata`` +    |
 |        |                      |              | ``start_batch`` (FORWARD |
 |        |                      |              | _1) + ``wait_for_save``  |
-|        |                      |              | (FORWARD_1) +            |
+|        |                      |              | (FORWARD_2) +            |
 |        |                      |              | ``terminate_requests``   |
-|        |                      |              | (RESPOND_7)              |
+|        |                      |              | (RESPOND_8)              |
 +--------+----------------------+--------------+--------------------------+
 | 13     | GuidedDecoderConcern | coroutine    | ``add_batch`` + ``init_  |
 |        |                      |              | disagg_gen_requests``    |
-|        |                      |              | (FORWARD_1) +            |
+|        |                      |              | (FORWARD_2) +            |
 |        |                      |              | ``execute(logits)``      |
-|        |                      |              | (SAMPLE_2) +             |
+|        |                      |              | (SAMPLE_3) +             |
 |        |                      |              | ``handle_errors``        |
-|        |                      |              | (APPLY_6). Failed-       |
+|        |                      |              | (APPLY_7). Failed-       |
 |        |                      |              | request list also threads|
-|        |                      |              | from SAMPLE_2 to APPLY_6 |
+|        |                      |              | from SAMPLE_3 to APPLY_7 |
 |        |                      |              | as a coroutine local.    |
 +--------+----------------------+--------------+--------------------------+
 | 14     | DwdpConcern          | method       | first-layer weight       |
-|        |                      |              | prefetch at FORWARD_1    |
+|        |                      |              | prefetch at FORWARD_2    |
 |        |                      |              | (single phase)           |
 +--------+----------------------+--------------+--------------------------+
 | 15     | KvCacheEventsConcern | method       | ``flush_iteration_       |
-|        |                      |              | events`` at RESPOND_7    |
+|        |                      |              | events`` at RESPOND_8    |
 |        |                      |              | (single phase, gated by  |
 |        |                      |              | ``enable_kv_cache_       |
 |        |                      |              | events``)                |
 +--------+----------------------+--------------+--------------------------+
 | 16     | SaveHiddenStates     | method       | ``spec_resource_mgr.     |
 |        | Concern              |              | process_and_save`` at    |
-|        |                      |              | APPLY_6 (single phase,   |
+|        |                      |              | APPLY_7 (single phase,   |
 |        |                      |              | gated by SaveHiddenStates|
 |        |                      |              | spec mode)               |
 +--------+----------------------+--------------+--------------------------+
@@ -547,7 +709,8 @@ THE LOOP-LAYER ENTRY POINT
 ``run_loop(ctx)`` (or whatever we name the loop function) is the loop
 thread's entry point. It receives ``ctx`` from the thread launch in
 ``PyExecutorCoro.__init__`` and runs the SCHEDULER iter forever (until
-``ctx.port.shutdown_event`` is set or the request stream drains).
+``ctx.port.shutdown_event`` is set or the request stream drains, as
+detected via ``ctx.svc.pool.is_drained()``).
 
 The SCHEDULER iter is also a free function ``async def
 scheduler_iter(ctx)`` (or method on a small ``Scheduler`` class
@@ -563,6 +726,10 @@ class, NOT ``PyExecutorCoro``). It owns:
 - Cross-rank scheduler-direct, NOT-tied-to-any-batch collectives:
   HC9 ``retire_vote`` (PP only); ``terminate_pending_requests``
   ballot (PP-only).
+- The catastrophic exception handler at the top of its loop -- when
+  a batch's coroutine propagates an exception out, SCHEDULER calls
+  ``fail_requests(ctx, list(ctx.svc.pool), msg)`` and sets
+  ``ctx.port.shutdown_event``. See FAILURE HANDLING above.
 
 Inside the iter, for each fresh batch the SCHEDULER constructs a
 ``Batch`` handle (with ``BatchStorage``), starts ``batch_body(ctx)``
@@ -573,7 +740,8 @@ step(handle, through=Phase)``.
 The thread cut: ``run_loop`` and everything it transitively calls
 (SCHEDULER iter, ``batch_body``, concern coroutines) are loop-thread
 only. ``PyExecutorCoro`` instance methods are main-thread only. The
-two communicate strictly through ``ctx.port``.
+two communicate strictly through ``ctx.port`` (with ``ctx.svc.client``
+as the LOOP-side write surface for the response side of port).
 """
 
 import dataclasses

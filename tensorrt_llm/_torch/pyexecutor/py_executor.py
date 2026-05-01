@@ -342,27 +342,34 @@ class PyExecutor:
       individually want to do this exact unit, vs being a fan-out
       of distinct steps?".
 
-      The surviving 2b set:
-        * ``_terminate_request`` / ``_do_terminate_request`` --
-          atomic request termination dispatch. Called from
-          normal-path concern code (response RESPOND_7, schedule
+      The surviving 2b set lands on three NEW services exposed via
+      ``ctx.svc.*`` (see ``concerns.py`` "SHARED SERVICES" + the
+      ``Service`` dataclass docstring in ``context.py``):
+
+        * ``_terminate_request`` / ``_do_terminate_request`` ->
+          ``ctx.svc.termination.terminate(req)``. Called from
+          normal-path concern code (response RESPOND_8, schedule
           paused-request handling, disagg / kv_connector terminate
           sweeps), the SCHEDULER's catastrophic-error handler, and
           the per-request ``fail_requests`` utility.
-        * ``fail_requests(reqs, msg)`` (NEW; surviving body of
+        * ``fail_requests(ctx, reqs, msg)`` (NEW free function in
+          ``concerns/_shared.py``; surviving body of
           ``_handle_errors``'s per-request fail-fast mode -- see
-          1b notes above): set ``GENERATION_COMPLETE`` per req,
-          build + enqueue error responses, remove from active
-          set, terminate. Called by concerns that detect a
-          specific bad subset (validation failure, timeout,
-          guided-decoder grammar failure, ...) and by the
-          SCHEDULER's catastrophic-error handler with the active
-          set.
+          1b notes above). Composes three services:
+          ``ctx.svc.pool.remove_active(reqs)``,
+          ``ctx.svc.client.enqueue(error_responses)``,
+          ``ctx.svc.termination.terminate(req)``. Called by
+          concerns that detect a specific bad subset (validation
+          failure, timeout, guided-decoder grammar failure, ...)
+          and by the SCHEDULER's catastrophic-error handler with
+          the active set.
 
-      Refactor home: method on a small ``ctx.svc.termination`` (or
-      ``ctx.svc.errors``) service so service-side dependencies
-      (PP termination handler, response queue, etc.) live as
-      instance state, accessible from any concern.
+      Two more services in the same shape exist alongside
+      ``termination`` -- ``RequestPool`` (owns ``active_requests``
+      + ``inflight_req_ids``) and ``ClientChannel`` (owns response
+      output / TP gather / cross-thread put). The methods that
+      land on those services are categorized 2a-on-the-service
+      below (see per-method REFACTOR comments).
 
     Special / scheduler-direct
     --------------------------
@@ -752,22 +759,24 @@ class PyExecutor:
             self.kv_connector_manager.wait_for_initialization()
 
     # REFACTOR: 1b (multi-concern, inlined+split) -- body interleaves four
-    # concerns per request: ``response`` (fast-path create + enqueue when
-    # the request is still active), ``disagg`` (``end_transfer``),
-    # ``schedule`` (``active_requests.remove``), and ``2b`` termination
-    # (``_terminate_request`` dispatch). Both callers (disagg's ctx-cache
-    # probe and kv_connector's terminate sweep) iterate completed
-    # transfers and call this per request.
+    # services / concerns per request: ``response`` (fast-path create
+    # + ``ctx.svc.client.enqueue`` when the request is still active),
+    # ``disagg`` (``end_transfer``), ``ctx.svc.pool.remove_active``,
+    # and ``ctx.svc.termination.terminate``. Both callers (disagg's
+    # ctx-cache probe and kv_connector's terminate sweep) iterate
+    # completed transfers and call this per request.
     #
-    # Refactor direction: split per concern. Concrete sequencing options
-    # depending on how cleanly the dependencies fall out:
-    #   (a) Inline the per-request 4-step dance into each caller's body
-    #       and call the concern-owned methods directly. Each call site
-    #       gets ~4 lines of explicit dispatch instead of one method
-    #       call -- but the dependencies are visible.
+    # Refactor direction: split per concern, using the services for
+    # the cross-cutting parts:
+    #   (a) Inline the per-request 4-step dance into each caller
+    #       (disagg / kv_connector concerns), calling
+    #       ``ctx.svc.client.enqueue``, ``ctx.svc.pool.remove_active``,
+    #       and ``ctx.svc.termination.terminate`` directly. Each call
+    #       site gets ~4 lines but the dependencies are visible.
     #   (b) Move the "fast-path response for completed transfer" piece
-    #       into a method on the response concern that disagg /
-    #       kv_connector invoke; the rest stays in disagg.
+    #       into a method on the response concern (or on
+    #       ``ClientChannel`` if it's purely a response build) that
+    #       disagg / kv_connector invoke; the rest stays in disagg.
     # Pick (b) once the response concern is wired; until then, do not
     # treat this method as a destination for new logic.
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
@@ -1049,8 +1058,9 @@ class PyExecutor:
 
     # REFACTOR: SPECIAL -- scheduler-direct shutdown gate. Read by the
     # scheduler iter (loop_control), not by any per-batch concern. New
-    # design: inline into the scheduler iter body alongside the
-    # shutdown latch in ``MessagePort``.
+    # design: inline into the scheduler iter body as
+    # ``ctx.port.is_shutdown and ctx.svc.pool.is_drained() and
+    # ctx.port.waiting_queue.empty()``.
     @property
     def should_stop_processing(self):
         return self.is_shutdown and len(self.active_requests) == 0 and \
@@ -1389,7 +1399,7 @@ class PyExecutor:
                 self.stats.pop(0)
             self.stats.append((stats, req_stats, self._latest_kv_iter_stats))
 
-    # REFACTOR: 2a (concern: iter_stats) -- FINALIZE_8 step.
+    # REFACTOR: 2a (concern: iter_stats) -- FINALIZE_9 step.
     def _process_iter_stats(
         self,
         finished_requests: list[LlmRequest],
@@ -2610,7 +2620,7 @@ class PyExecutor:
     # disagg ctx-cache probe + resource update + schedule inflight-id
     # remove, plus cross-batch global tail (kv-transfer timeout sweep,
     # PP termination ballot, iter_stats process). Each branch goes to
-    # its concern's APPLY_6 / RESPOND_7 / FINALIZE_8 block; scheduler-
+    # its concern's APPLY_7 / RESPOND_8 / FINALIZE_9 block; scheduler-
     # direct items (termination ballot) move to scheduler iter.
     def _handle_executed_batch(self, executed_batch: Optional[BatchStatePP]):
         # ===================================================================
@@ -2772,7 +2782,7 @@ class PyExecutor:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
 
-    # REFACTOR: 2a (concern: spec_decode) -- FORWARD_1 step (per-batch
+    # REFACTOR: 2a (concern: spec_decode) -- FORWARD_2 step (per-batch
     # uniform draft-token padding for CUDA-graph compat).
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
@@ -3077,7 +3087,7 @@ class PyExecutor:
         return scheduled_batch, iter_stats
 
     # REFACTOR: 2a (concern: kv_connector) -- start async KV-load at
-    # SCHEDULE_0 / FORWARD_1.
+    # SCHEDULE_0 / FORWARD_2.
     def _kv_connector_start_batch(self, scheduled_batch):
         if self.kv_connector_manager:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
@@ -4741,9 +4751,9 @@ class PyExecutor:
         return result_tensors, num_accepted_tokens
 
     # REFACTOR: 1b (multi-concern, inlined+split) -- annotated in-line as
-    # overlap's prev-batch RESPOND_7 fan-out across response + resource
+    # overlap's prev-batch RESPOND_8 fan-out across response + resource
     # + kv_cache_events + iter_stats. Body splits into the respective
-    # concerns' RESPOND_7 / FINALIZE_8 blocks.
+    # concerns' RESPOND_8 / FINALIZE_9 blocks.
     def _process_previous_batch(self):
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
@@ -4998,6 +5008,9 @@ class PyExecutor:
 
     # REFACTOR: 2a (concern: schedule) -- fetch step entry point used by
     # ``_prepare_and_schedule_batch``; invokes validation + activation.
+    # In the new design: the schedule concern's fetch step at
+    # SCHEDULE_0; admits via ``ctx.svc.pool.add_active(reqs)`` instead
+    # of ``self.active_requests.extend(...)``.
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
 
         def _respond_if_invalid(request: LlmRequest) -> bool:
@@ -5024,7 +5037,7 @@ class PyExecutor:
         self.active_requests.extend(validated_requests)
         return validated_requests
 
-    # REFACTOR: 2a (concern: kv_cache_events) -- RESPOND_7 step.
+    # REFACTOR: 2a (concern: kv_cache_events) -- RESPOND_8 step.
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
@@ -5206,7 +5219,7 @@ class PyExecutor:
 
         return
 
-    # REFACTOR: 2a (concern: disagg) -- SCHEDULE_0 / RESPOND_7 sweep.
+    # REFACTOR: 2a (concern: disagg) -- SCHEDULE_0 / RESPOND_8 sweep.
     @nvtx_range("_check_kv_transfer_timeout")
     def _check_kv_transfer_timeout(self):
         if not self.kv_cache_transceiver:
@@ -5257,6 +5270,10 @@ class PyExecutor:
             gen_first_ctx_requests)
 
     # REFACTOR: 2a (concern: schedule) -- ADP padding helper.
+    # Body becomes ``ctx.svc.pool.count_schedulable()`` -- it filters
+    # the pool by the "not awaiting KV transfer" predicate. Lives on
+    # the pool service, not the schedule concern, because other
+    # callers may want it too.
     def _count_schedulable_active_requests(self) -> int:
         """Count active requests that are ready for scheduling.
 
@@ -5313,6 +5330,9 @@ class PyExecutor:
         return True
 
     # REFACTOR: 2a (concern: schedule) -- ADP dummy padding at SCHEDULE_0.
+    # Admit the dummy via ``ctx.svc.pool.add_active(dummy)``; the later
+    # eviction (in sample's state-advance) calls
+    # ``ctx.svc.pool.remove_active([dummy])``.
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
@@ -5349,28 +5369,26 @@ class PyExecutor:
     # KV resources for it (resource side), submit the async KV recv
     # (disagg side).
     #
-    # Refactor direction: pass ``disagg_gen_init_to_prepare`` through
-    # ``BatchStorage``. AT LEAST 2 phases are required because the
-    # happens-before rule on storage views means a write at phase P is
-    # visible only to readers at phases > P -- two concerns at the
-    # SAME phase cannot exchange storage data.
+    # Split across SCHEDULE_0 -> RESOURCE_PREP_1 (the latter phase
+    # was added precisely to make this split possible -- the
+    # happens-before rule on storage views means writes at phase P
+    # are visible only at phases > P, so two concerns at the SAME
+    # phase cannot exchange storage data):
     #
-    # Minimal 2-phase split:
-    #   * Phase A: schedule writes ``fitting_disagg_gen_init_requests``
-    #     AND disagg packages it into ``disagg_gen_init_to_prepare``
-    #     (both writes at the same phase are fine -- they're written
-    #     by their respective concerns, just both to A's write view).
-    #   * Phase B (> A): resource reads ``disagg_gen_init_to_prepare``
-    #     and runs ``prepare_resources`` for it; disagg reads
-    #     ``fitting_disagg_gen_init_requests`` and runs the async KV
-    #     recv. Both reads + both follow-on actions can co-exist at B.
+    #   * SCHEDULE_0: ``schedule`` writes
+    #     ``fitting_disagg_gen_init_requests``;
+    #     ``disagg`` packages it into ``disagg_gen_init_to_prepare``
+    #     (both writes go to SCHEDULE_0's write view -- legal because
+    #     the writers are different concerns).
+    #   * RESOURCE_PREP_1: ``resource`` reads
+    #     ``disagg_gen_init_to_prepare`` and runs ``prepare_resources``
+    #     for each resource manager type;
+    #     ``disagg`` reads ``fitting_disagg_gen_init_requests`` and
+    #     calls ``_recv_disagg_gen_cache`` to submit the async KV recv.
     #
-    # Concretely this needs adding one new ``BatchPhase`` between
-    # ``SCHEDULE_0`` (=A) and ``FORWARD_1`` -- e.g. ``RESOURCE_PREP_1``
-    # -- and renumbering the rest. (3 phases would be cleaner -- one
-    # for each step -- but the 2-phase split is sufficient and keeps
-    # the enum smaller; per ``concerns.py``'s ">20 phases is too many"
-    # guidance we should hold the line at 2.)
+    # See ``BatchPhase.RESOURCE_PREP_1`` and the
+    # ``disagg_gen_init_to_prepare`` field in
+    # ``batch_storage.py`` for the storage / phase contract.
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
         if fitting_disagg_gen_init_requests:
@@ -5391,7 +5409,7 @@ class PyExecutor:
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 
-    # REFACTOR: 2a (concern: disagg) -- FORWARD_1 step that promotes
+    # REFACTOR: 2a (concern: disagg) -- FORWARD_2 step that promotes
     # transmission-complete gen requests + sets up sampler step.
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
@@ -5501,9 +5519,9 @@ class PyExecutor:
         return
 
     # REFACTOR: 1b (multi-concern, inlined+split) -- annotated in-line as
-    # RESPOND_7 fan-out across disagg (start ctx KV send + opportunistic
+    # RESPOND_8 fan-out across disagg (start ctx KV send + opportunistic
     # probe) + kv_connector (flag finished requests for async save).
-    # Body splits into the respective concerns' RESPOND_7 blocks.
+    # Body splits into the respective concerns' RESPOND_8 blocks.
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
         # ===================================================================
@@ -5643,7 +5661,7 @@ class PyExecutor:
         self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
         self._check_cache_transfer_errors("generation requests")
 
-    # REFACTOR: 2a (concern: forward) -- FORWARD_1 main step. Internally
+    # REFACTOR: 2a (concern: forward) -- FORWARD_2 main step. Internally
     # invokes ``_kv_connector_wait_for_save`` (kv_connector deadline
     # wait) -- in the new design that becomes a kv_connector method
     # called from forward's body, not folded in here.
@@ -5770,7 +5788,7 @@ class PyExecutor:
         for request in scheduled_requests.generation_requests:
             request.gen_iters += 1
 
-    # REFACTOR: 2a (concern: sample) -- STATE_UPD_3 dispatch (TP/CP/HELIX).
+    # REFACTOR: 2a (concern: sample) -- STATE_UPD_4 dispatch (TP/CP/HELIX).
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
         cp_config = self.dist.cp_config
@@ -5786,7 +5804,7 @@ class PyExecutor:
                     f'Unsupported cp type {cp_type.name}.')
         self._update_request_states_tp(scheduled_requests)
 
-    # REFACTOR: 2a (concern: sample) -- SAMPLE_2 main step.
+    # REFACTOR: 2a (concern: sample) -- SAMPLE_3 main step.
     @nvtx_range("_sample_async")
     def _sample_async(self, scheduled_batch,
                       batch_outputs) -> SampleState | None:
@@ -5838,7 +5856,7 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
-    # REFACTOR: 2a (concern: sample) -- APPLY_6 main step (blocks on
+    # REFACTOR: 2a (concern: sample) -- APPLY_7 main step (blocks on
     # sampler_event, applies sampled tokens to requests).
     @nvtx_range("_update_requests")
     def _update_requests(self,
@@ -5883,18 +5901,27 @@ class PyExecutor:
     # subset), benchmark gen-only KV exhaustion (the active set,
     # explicitly named).
     #
-    # In the new design this becomes a 2b utility: call it
-    # ``fail_requests(reqs, msg)``. Body matches the current
-    # per-request branch of ``_handle_errors``: set
-    # ``GENERATION_COMPLETE`` per req, build + enqueue error
-    # responses, remove from active_requests, terminate each via
-    # ``_terminate_request``. Touches multiple concerns' state but
-    # is a coherent atomic operation -- same trade-off as
-    # ``_terminate_request`` itself.
+    # In the new design this becomes a 2b free-function utility:
+    # ``fail_requests(ctx, reqs, msg)`` in ``concerns/_shared.py``.
+    # Body composes three services::
     #
-    # Refactor home for ``fail_requests``: method on a small
-    # ``ctx.svc.errors`` service (or co-located on
-    # ``ctx.svc.termination``).
+    #     def fail_requests(ctx, reqs, msg):
+    #         error_responses = []
+    #         for req in reqs:
+    #             req.state = LlmRequestState.GENERATION_COMPLETE
+    #             error_responses.append((req.py_request_id, LlmResponse(
+    #                 request_id=req.py_request_id,
+    #                 error_msg=msg,
+    #                 client_id=req.py_client_id,
+    #             )))
+    #         ctx.svc.pool.remove_active(reqs)
+    #         ctx.svc.client.enqueue(error_responses)
+    #         for req in reqs:
+    #             ctx.svc.termination.terminate(req)
+    #
+    # Touches multiple service-owned bits of state but each call is
+    # itself a single-purpose service method -- the utility is just
+    # the composition. Same trade-off as ``_terminate_request``.
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
                        *,
@@ -5920,27 +5947,24 @@ class PyExecutor:
         for request in failed_requests:
             self._terminate_request(request)
 
-    # REFACTOR: 2b (shared helper, NON-interleaving) -- single-purpose
-    # dispatcher: defers to ``DisaggPPTerminationHandler`` if present
-    # (and the request is not a dummy), otherwise calls the direct
-    # ``_do_terminate_request`` path. Each caller treats it as one
-    # opaque "terminate this request" call.
+    # REFACTOR: 2a-on-service -- body becomes
+    # ``ctx.svc.termination.terminate(req)``. The
+    # ``DisaggPPTerminationHandler`` reference lives as instance
+    # state on ``TerminationService``; the dispatch (PP handler vs
+    # direct path) is the body of ``terminate``. The legacy
+    # ``_do_terminate_request`` collapses into the same method.
     #
-    # In the new design, callers come from THREE sites (normal +
-    # both error modes from ``_handle_errors``):
-    # * Normal path: response concern's RESPOND_7 (handle_responses
+    # Callers in the new design come from THREE sites:
+    # * Normal path: response concern's RESPOND_8 (handle_responses
     #   + cancellation), schedule concern's paused-request
     #   termination, the disagg / kv_connector
     #   ``_end_transfer_and_maybe_terminate`` replacement.
-    # * Error Mode A (catastrophic) -- SCHEDULER's top-of-loop
-    #   exception handler iterates the active set and calls this on
-    #   each.
-    # * Error Mode B (per-request fail-fast) -- the ``fail_requests``
-    #   2b utility iterates the named subset and calls this on each.
-    #
-    # Refactor home: method on a small ``ctx.svc.termination`` service
-    # so the ``DisaggPPTerminationHandler`` reference lives as
-    # instance state. Free function alternative also viable.
+    # * Error Mode A (catastrophic): SCHEDULER's top-of-loop
+    #   exception handler iterates the active set and calls
+    #   ``ctx.svc.termination.terminate(req)`` on each.
+    # * Error Mode B (per-request fail-fast): the
+    #   ``fail_requests(ctx, reqs, msg)`` utility iterates the
+    #   named subset and calls it on each.
     def _terminate_request(self, request: LlmRequest):
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
@@ -5952,16 +5976,12 @@ class PyExecutor:
         else:
             self._do_terminate_request(request)
 
-    # REFACTOR: 2b (shared helper) -- atomic "really terminate now":
-    # free resources (resource-manager side) + drop from
-    # ``result_wait_queues`` (response-side per-request fan-out).
-    # Called from ``_terminate_request`` and passed as the terminator
-    # callback to ``DisaggPPTerminationHandler``. The body touches two
-    # concerns' state but represents the natural unit of "really
-    # terminate now" -- splitting into resource-side and response-side
-    # halves would force every caller to do both, with no benefit.
-    # Refactor home: co-locate on the ``ctx.svc.termination`` service
-    # alongside ``_terminate_request``.
+    # REFACTOR: 2a-on-service -- body folds INTO
+    # ``ctx.svc.termination.terminate(req)`` (collapsed with
+    # ``_terminate_request``'s dispatch). Was the "direct path"
+    # branch + the ``DisaggPPTerminationHandler`` callback; in the
+    # new design the service exposes one ``terminate`` method that
+    # picks the right path internally.
     def _do_terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
 
@@ -5991,7 +6011,11 @@ class PyExecutor:
 
         return self.kv_cache_transceiver.cancel_request(request)
 
-    # REFACTOR: 2a (concern: response) -- RESPOND_7 cancellation handler.
+    # REFACTOR: 2a (concern: response) -- RESPOND_8 cancellation handler.
+    # Reads ``ctx.port.canceled_req_ids`` (cross-thread incoming),
+    # builds error responses for cancelled requests via
+    # ``ctx.svc.client.enqueue(...)``, terminates via
+    # ``ctx.svc.termination.terminate(req)``.
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
         if len(self.canceled_req_ids) == 0:
@@ -6022,8 +6046,13 @@ class PyExecutor:
         self.canceled_req_ids.clear()
         self.canceled_req_ids.extend(still_pending_canceled_ids)
 
-    # REFACTOR: 2a (concern: response) -- response enqueue (TP gather +
-    # cross-thread put on ``MessagePort``-owned queues).
+    # REFACTOR: 2a-on-service -- body moves to
+    # ``ctx.svc.client.enqueue(items)`` (the ``ClientChannel``
+    # service). Encapsulates TP gather + cross-thread put on
+    # ``MessagePort.responses`` + ``response_cv.notify_all`` +
+    # per-request fan-out to ``MessagePort.result_wait_queues``.
+    # All concerns / utilities that emit responses (response,
+    # ``fail_requests``) call this via the service.
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
@@ -6061,7 +6090,8 @@ class PyExecutor:
                 self.response_cv.notify_all()
 
     # REFACTOR: 2a (concern: response) -- SCHEDULE_0 first-token emission
-    # for newly-promoted disagg-gen requests.
+    # for newly-promoted disagg-gen requests. Body builds first-token
+    # responses and calls ``ctx.svc.client.enqueue(items)``.
     @nvtx_range("_handle_first_token_response")
     def _handle_first_token_response(self, scheduled_batch):
         new_responses = []
@@ -6097,11 +6127,18 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
 
     # REFACTOR: 1b (multi-concern, inlined+split) -- annotated in-line as
-    # RESPOND_7 fan-out across response (build / enqueue / terminate) +
+    # RESPOND_8 fan-out across response (build / enqueue / terminate) +
     # perf_metric (per-step metrics) + spec_decode (rolling acceptance
     # gate -- cross-iter feedback) + disagg (timeout cleanup +
     # ctx-complete terminate-policy fork). Body splits into the
-    # respective concerns' RESPOND_7 blocks.
+    # respective concerns' RESPOND_8 blocks.
+    #
+    # Response concern's body (the bulk of this method) becomes:
+    # iterates ``ctx.svc.pool``, builds responses, calls
+    # ``ctx.svc.client.enqueue(items)`` for output, calls
+    # ``ctx.svc.pool.remove_active(finished)`` for the post-iter
+    # rewrite, calls ``ctx.svc.termination.terminate(req)`` for the
+    # retire-now branch.
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
         # ===================================================================
@@ -6322,6 +6359,7 @@ class PyExecutor:
 
     # REFACTOR: 2a (concern: schedule) -- PP inflight-id tracking add at
     # SCHEDULE_0 (paired with ``_remove_inflight_ids`` at P_RETIRE).
+    # Body becomes ``ctx.svc.pool.mark_inflight(reqs)``.
     def _add_inflight_ids(self, scheduled_requests: ScheduledRequests):
         """Add request IDs of current sampling requests to self.inflight_req_ids.
 
@@ -6344,6 +6382,7 @@ class PyExecutor:
 
     # REFACTOR: 2a (concern: schedule) -- PP inflight-id tracking remove
     # at P_RETIRE inside ``_handle_executed_batch``.
+    # Body becomes ``ctx.svc.pool.unmark_inflight(reqs)``.
     def _remove_inflight_ids(self, scheduled_requests: ScheduledRequests):
         """Remove request IDs of current sampling requests from self.inflight_req_ids."""
         for req in scheduled_requests.context_requests_last_chunk:
@@ -6385,7 +6424,7 @@ class PyExecutor:
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()
 
-    # REFACTOR: 2a (concern: guided_decoder) -- APPLY_6 step (mark
+    # REFACTOR: 2a (concern: guided_decoder) -- APPLY_7 step (mark
     # grammar-failed requests as errored).
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,
