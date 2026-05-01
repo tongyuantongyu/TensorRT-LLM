@@ -127,17 +127,21 @@ from __future__ import annotations
 import contextvars
 import dataclasses
 import os
+import queue
+import threading
+import time
 import types
 import weakref
 from contextlib import asynccontextmanager
 from enum import IntEnum
-from typing import Any, AsyncIterator, Coroutine, Generator, List, Optional, Protocol, Tuple
+from typing import Any, AsyncIterator, Callable, Coroutine, Generator, List, Optional, Protocol, Tuple
 
 __all__ = [
     "Driver",
     "Batch",
     "Concern",
     "again",
+    "disable_hang_detect",
     "enter_phase",
     "batch_phase",
     "phased_field",
@@ -537,6 +541,36 @@ class _RetryRequest:
     """
 
 
+@dataclasses.dataclass(frozen=True)
+class _HangControl:
+    """A coroutine has yielded a ``disable_hang_detect`` enter/exit message.
+
+    The Driver tracks ONE Driver-global ``_hang_paused`` flag (not
+    per-coroutine: the pause is global, in effect while ANY coroutine
+    runs after the enter and before the matching exit).
+
+    On ``disabled=True`` (CM enter):
+
+    - If ``_hang_paused`` is already ``True``: throw
+      ``RuntimeError("disable_hang_detect() does not nest")`` into
+      the coroutine. The CM's ``__aenter__`` propagates it out;
+      because the inner CM body never ran, the outer CM's flag
+      stays set and its ``__aexit__`` cleans up normally.
+    - Else: set ``_hang_paused = True`` and send ``pause()`` to the
+      watchdog (so the watchdog stops timing out until the matching
+      ``resume()``).
+
+    On ``disabled=False`` (CM exit): clear the flag and send
+    ``resume()`` to the watchdog.
+
+    Outside of a Driver (e.g., a unit test driving a coroutine by
+    hand), the message is unhandled and the coroutine simply
+    suspends at the yield until something sends ``None`` back.
+    """
+
+    disabled: bool
+
+
 class _RetryToken:
     """Singleton type for the :data:`_RETRY` sentinel.
 
@@ -601,6 +635,18 @@ def _yield_retry() -> Generator[_RetryRequest, None, None]:
     awaited primitive.
     """
     yield _RetryRequest()
+
+
+@types.coroutine
+def _yield_hang_control(disabled: bool) -> Generator[_HangControl, None, None]:
+    """Yield a ``_HangControl(disabled)``. Resume value is always ``None``.
+
+    The Driver flips its per-coroutine hang-disabled flag and re-sends
+    immediately, so this looks like a no-op from the coroutine's point
+    of view -- which is exactly what the user-facing ``async with
+    disable_hang_detect()`` CM wants.
+    """
+    yield _HangControl(disabled)
 
 
 # --------------------------------------------------------------------------- #
@@ -717,6 +763,45 @@ async def again() -> None:
             "enter_phase(Py)` returned in a concern."
         )
     await _yield_retry()
+
+
+@asynccontextmanager
+async def disable_hang_detect() -> AsyncIterator[None]:
+    """Async CM that pauses the runtime hang watchdog inside the body.
+
+    Use sparingly, around code the coroutine is intentionally going to
+    spend longer than the watchdog timeout in -- typically a single
+    blocking sync syscall, a long wait on an external event, or
+    one-shot startup work that's known to take minutes.
+
+    The pause is GLOBAL on the Driver: while the body is open, the
+    watchdog is paused regardless of which coroutine is currently
+    being driven. If the body inside the CM yields control to other
+    coroutines (e.g., via ``await again()`` cascading up to the
+    parent), those other coroutines run with the watchdog still
+    paused. The watchdog re-arms only when the matching CM exit
+    runs.
+
+    NESTING IS A PROGRAMMING ERROR. Entering this CM while it is
+    already active -- whether nested in the same coroutine or
+    entered separately by another coroutine while the first hasn't
+    exited -- raises ``RuntimeError`` synchronously from
+    ``__aenter__``, surfaced inside the offending coroutine. The
+    pause flag is a single bool, not a counter; double-clearing on
+    paired exits would silently re-enable the watchdog while the
+    outer caller still expected it paused.
+
+    Cooperative: depends on the Driver to interpret the secret
+    ``_HangControl`` yield. Outside of :class:`Driver` -- e.g.,
+    when a unit test drives a coroutine by hand via
+    ``coro.send(None)`` -- the yield is unhandled, the body just
+    runs, and there is no watchdog to pause anyway.
+    """
+    await _yield_hang_control(disabled=True)
+    try:
+        yield
+    finally:
+        await _yield_hang_control(disabled=False)
 
 
 async def resume(child: "Concern") -> None:
@@ -1017,6 +1102,176 @@ async def _do_step(
 
 
 # --------------------------------------------------------------------------- #
+# Hang watchdog (used by Driver)
+# --------------------------------------------------------------------------- #
+
+
+def _default_on_hang(context: str) -> None:
+    """Default Driver hang callback: log error + dump every thread's stack.
+
+    ``context`` is a short string identifying the most recently
+    resumed coroutine (e.g., ``"ScheduleConcern.handle_batch at
+    phase SCHEDULE_0"``) or a placeholder when nothing has been
+    resumed yet. It's the watchdog's best guess at what got stuck.
+
+    Imports ``logger`` and ``print_all_stacks`` lazily so this module
+    can be imported without dragging in the rest of TensorRT-LLM (the
+    coroutine runtime is structurally generic and tests import it on
+    its own).
+    """
+    from tensorrt_llm._utils import print_all_stacks
+    from tensorrt_llm.logger import logger
+
+    logger.error(f"Hang detected by Driver watchdog. Last activity: {context}")
+    print_all_stacks()
+
+
+class _HangWatchdog:
+    """Background watchdog driven by the Driver's main loop.
+
+    ONE daemon thread + ONE ``queue.Queue`` -- no asyncio event loop.
+    The Driver sends four kinds of messages:
+
+    - :meth:`notify` ``(coro_name, phase)``: heartbeat. The Driver
+      calls this just before each ``coro.send`` / ``coro.throw``.
+      The worker resets its timer and stashes the pair for
+      inclusion in the hang report if a future timeout fires.
+
+      ``coro_name`` is the COROUTINE'S ``__qualname__`` extracted
+      by the Driver -- NOT the coroutine object itself. Passing
+      strings only means the worker thread never holds a reference
+      to a coroutine, so a paused watchdog can't keep a finished
+      coroutine alive across thread boundaries.
+
+    - :meth:`pause`: worker stops timing out and blocks indefinitely
+      for the next message.
+    - :meth:`resume`: worker re-enters the timing-wait state.
+    - :meth:`stop`: worker exits cleanly; the Driver joins the
+      thread.
+
+    Worker logic is deliberately minimal: wait ``timeout`` seconds
+    for ANY message; if none arrives, call ``on_hang(context)``.
+    Re-fires every ``timeout`` interval until a message arrives.
+    The Driver loop and watchdog loop are lightweight enough (a few
+    µs per iteration) to be ignored in the timeout budget.
+
+    The watchdog has no knowledge of coroutine identity beyond the
+    ``(name, phase)`` it stashed for context; ``pause`` / ``resume``
+    are global toggles, mirroring :func:`disable_hang_detect`'s
+    Driver-global ``_hang_paused`` flag.
+
+    The thread + queue choice (rather than asyncio) is intentional:
+    the watchdog has exactly one job (timed wait + callback) and the
+    Driver itself is sync. A second asyncio loop in another thread
+    would add a layer of machinery that buys nothing here.
+    """
+
+    _PAUSE: object = object()
+    _RESUME: object = object()
+    _STOP: object = object()
+
+    def __init__(self, timeout: float, on_hang: Callable[[str], None]) -> None:
+        if timeout <= 0:
+            raise ValueError(f"hang timeout must be positive, got {timeout!r}")
+        self._timeout = timeout
+        self._on_hang = on_hang
+        self._queue: "queue.Queue[object]" = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._worker,
+            name="trtllm-hang-watchdog",
+            daemon=True,
+        )
+        self._started = False
+        self._stopped = False
+
+    def start(self) -> None:
+        """Spawn the watchdog thread. Idempotent."""
+        if self._started:
+            return
+        self._started = True
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the watchdog to exit and join the thread. Idempotent.
+
+        Safe to call even if :meth:`start` was never invoked -- in
+        that case it's a no-op (no thread to join).
+        """
+        if not self._started or self._stopped:
+            return
+        self._stopped = True
+        self._queue.put(self._STOP)
+        self._thread.join()
+
+    def notify(self, coro_name: str, phase: Optional[IntEnum]) -> None:
+        """Heartbeat. Resets the watchdog's per-cycle timer.
+
+        ``coro_name`` is a STRING identifying the coroutine the
+        Driver is about to resume (typically its ``__qualname__``).
+        Passing the name -- not the coroutine object -- keeps the
+        watchdog thread from holding a coroutine reference, which
+        could otherwise survive past the coroutine's logical end
+        of life and confuse handle / object cleanup.
+
+        The pair is stashed by the worker; included in the hang
+        report's ``context`` string if the watchdog later fires.
+        """
+        self._queue.put((coro_name, phase))
+
+    def pause(self) -> None:
+        """Suspend timeout-waiting until the next :meth:`resume`."""
+        self._queue.put(self._PAUSE)
+
+    def resume(self) -> None:
+        """Re-enter timeout-waiting after a :meth:`pause`."""
+        self._queue.put(self._RESUME)
+
+    def _worker(self) -> None:
+        paused = False
+        # Most recent ``(coro_name, phase)`` notify; used to format
+        # the hang report's context. ``None`` until the first notify
+        # arrives. Both are cheap immutable values; no coroutine
+        # reference held across the thread boundary.
+        last_notify: Optional[Tuple[str, Optional[IntEnum]]] = None
+        while True:
+            try:
+                wait_timeout: Optional[float] = None if paused else self._timeout
+                msg = self._queue.get(timeout=wait_timeout)
+            except queue.Empty:
+                self._fire(last_notify)
+                continue
+
+            if msg is self._STOP:
+                return
+            if msg is self._PAUSE:
+                paused = True
+                continue
+            if msg is self._RESUME:
+                paused = False
+                continue
+            # Notify: ``(coro_name, phase)`` tuple. Always update
+            # ``last_notify`` -- even while paused -- so a hang
+            # right after the next ``resume`` reports the most
+            # recent activity rather than a stale one.
+            last_notify = msg  # type: ignore[assignment]
+
+    def _fire(self, last_notify: Optional[Tuple[str, Optional[IntEnum]]]) -> None:
+        if last_notify is None:
+            context = "(no coroutine had been resumed yet)"
+        else:
+            coro_name, phase = last_notify
+            phase_str = phase.name if phase is not None else "<unset>"
+            context = f"{coro_name} at phase {phase_str}"
+        try:
+            self._on_hang(context)
+        except BaseException:
+            # Don't let on_hang failures kill the watchdog thread.
+            # Logging the swallowed exception here would itself be
+            # fragile; leave it to the on_hang callback to be robust.
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
 
@@ -1063,9 +1318,39 @@ class Driver:
     Shutdown is Python-native: ``close()`` throws ``GeneratorExit``
     into the main coroutine. Children held on the stack are closed
     in LIFO order so deep unwinds run their cleanup before parents.
+
+    Hang detection (optional)
+    -------------------------
+
+    Pass ``hang_timeout`` (seconds) to enable a builtin watchdog. The
+    Driver sends a ``notify(coro, phase)`` heartbeat to a background
+    daemon thread before each ``coro.send`` / ``coro.throw`` call;
+    the watchdog fires ``on_hang(context)`` if no message arrives
+    within ``hang_timeout`` seconds (default callback: log error +
+    dump every thread's stack via :func:`_default_on_hang`). The
+    watchdog is started inside :meth:`run` and joined on shutdown.
+
+    Coroutines that intentionally do long sync work can wrap that
+    section in ``async with disable_hang_detect(): ...`` -- the
+    Driver flips a Driver-global ``_hang_paused`` flag and sends
+    ``pause()`` to the watchdog. The pause is global: while the CM
+    body is open, no coroutine driven by this Driver is timed.
+    The CM does NOT nest (re-entry raises ``RuntimeError`` from the
+    inner ``__aenter__``).
+
+    ``hang_timeout=None`` (the default) leaves the watchdog disabled,
+    so unit tests don't pay for it. The non-nesting check on
+    ``disable_hang_detect`` still applies regardless of whether the
+    watchdog is enabled (the flag is independent state).
     """
 
-    def __init__(self, main: _CoroutineLike) -> None:
+    def __init__(
+        self,
+        main: _CoroutineLike,
+        *,
+        hang_timeout: Optional[float] = None,
+        on_hang: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self._main_handle: _RootHandle = _RootHandle(main)
         # Stack of currently-active handles:
         #   (handle, target_phase_or_None, last_storage_or_None)
@@ -1077,6 +1362,22 @@ class Driver:
         # Used for the "child already past target" short-circuit and
         # for the strict-progression check.
         self._suspensions: dict[int, Tuple[IntEnum, object]] = {}
+        # Global "hang detection paused" flag. ``True`` between any
+        # ``disable_hang_detect`` enter and its matching exit;
+        # nesting check raises ``RuntimeError`` into the offending
+        # coroutine when the inner enter sees this already ``True``.
+        # Independent of whether the watchdog is enabled -- the
+        # nesting check fires either way.
+        self._hang_paused: bool = False
+        # Optional watchdog. Created here, started in ``_run_in_context``,
+        # stopped in ``_close_all``'s wrapper.
+        if hang_timeout is None:
+            self._watchdog: Optional[_HangWatchdog] = None
+        else:
+            self._watchdog = _HangWatchdog(
+                timeout=hang_timeout,
+                on_hang=on_hang or _default_on_hang,
+            )
 
     # --------------------------------------------------------------- run #
 
@@ -1093,16 +1394,29 @@ class Driver:
 
         Normal completion returns; exceptions propagate. Neither is
         interpreted as policy.
+
+        If a ``hang_timeout`` was given to ``__init__``, the watchdog
+        thread is spawned here and joined on the way out (whether
+        ``_drive`` returns normally or raises).
         """
         ctx = contextvars.copy_context()
         ctx.run(self._run_in_context)
 
     def _run_in_context(self) -> None:
         """Inner of :meth:`run`. Runs in a fresh contextvars.Context."""
+        if self._watchdog is not None:
+            self._watchdog.start()
         try:
-            self._drive()
+            try:
+                self._drive()
+            finally:
+                self._close_all()
         finally:
-            self._close_all()
+            # Stop the watchdog last so it stays alive across
+            # ``_close_all``'s teardown -- a hang during shutdown
+            # should still fire.
+            if self._watchdog is not None:
+                self._watchdog.stop()
 
     def _drive(self) -> None:
         """Main loop: pump the top of stack, dispatch on yielded requests."""
@@ -1113,6 +1427,30 @@ class Driver:
         while self._stack:
             handle, target, last_storage = self._stack[-1]
             coro = handle.coro
+
+            # Watchdog heartbeat: send a ``notify(name, phase)``
+            # message before BOTH ``send`` and ``throw`` paths so
+            # an exception throw is also bounded. The watchdog
+            # resets its timer on any message; the phase comes from
+            # the coroutine's most recent suspension (``None`` if
+            # it has never yielded a ``_WaitRequest`` -- e.g.,
+            # the scheduler root).
+            #
+            # The coroutine's ``__qualname__`` is extracted here
+            # (cheap attribute lookup; the name string is shared
+            # across all instances of the same async function) so
+            # the watchdog never holds a coroutine reference. That
+            # avoids the watchdog thread keeping a finished
+            # coroutine alive past its logical end of life --
+            # important because :class:`Concern` / :class:`Batch`
+            # ``__del__`` rely on prompt coroutine GC.
+            if self._watchdog is not None:
+                prev = self._suspensions.get(id(coro))
+                coro_name = getattr(coro, "__qualname__", None) or repr(coro)
+                self._watchdog.notify(
+                    coro_name,
+                    prev[0] if prev is not None else None,
+                )
 
             try:
                 if send_exc is not None:
@@ -1217,6 +1555,43 @@ class Driver:
                     continue
                 self._stack.pop()
                 send_value = _RETRY
+            elif isinstance(request, _HangControl):
+                # ``async with disable_hang_detect(): ...`` -- enter or
+                # exit. Flip the GLOBAL ``_hang_paused`` flag and
+                # mirror the change to the watchdog. Resume the same
+                # coroutine immediately on the next loop iteration
+                # with no return value (no stack change; no
+                # suspension record update).
+                if request.disabled:
+                    if self._hang_paused:
+                        # Nesting is forbidden: throw into the
+                        # offending coroutine. Outer CM's flag stays
+                        # True; its ``__aexit__`` clears it normally.
+                        send_exc = RuntimeError(
+                            "disable_hang_detect() does not nest. The CM is "
+                            "already active in this Driver run; do not nest "
+                            "another inside its body, in this coroutine or "
+                            "any other concurrently driven by this Driver."
+                        )
+                        continue
+                    self._hang_paused = True
+                    if self._watchdog is not None:
+                        self._watchdog.pause()
+                else:
+                    # Exit. The CM's ``__aexit__`` only runs after a
+                    # successful ``__aenter__``, so this should always
+                    # find the flag set; if not, something has gone
+                    # very wrong (e.g., somebody yielded a raw
+                    # ``_HangControl(False)`` outside the CM).
+                    assert self._hang_paused, (
+                        "disable_hang_detect() exit without matching enter; "
+                        "did something yield _HangControl(False) outside "
+                        "the CM?"
+                    )
+                    self._hang_paused = False
+                    if self._watchdog is not None:
+                        self._watchdog.resume()
+                send_value = None
             else:
                 raise RuntimeError(f"Unknown request yielded by coroutine: {request!r}")
 
@@ -1245,6 +1620,15 @@ class Driver:
                 pass
             handle.done = True
         self._suspensions.clear()
+        # The pause flag is intentionally NOT cleared here -- if a
+        # coroutine was inside ``disable_hang_detect`` when shutdown
+        # started, ``coro.close()`` raises ``GeneratorExit`` into the
+        # body, which runs the CM's ``finally`` and yields the
+        # matching ``_HangControl(False)``. But that yield is no
+        # longer dispatched (we're tearing down the Driver), so the
+        # flag would leak to a future ``run()``. Reset it so a
+        # reused Driver starts clean.
+        self._hang_paused = False
         if not main_closed:
             try:
                 self._main_handle.coro.close()

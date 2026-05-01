@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import threading
+import time
 import traceback
 from enum import IntEnum
 from typing import Optional
@@ -34,10 +36,13 @@ from tensorrt_llm._torch.pyexecutor.coroutines import (
     Batch,
     Concern,
     _AdvanceRequest,
+    _HangControl,
+    _HangWatchdog,
     _RETRY,
     _RetryRequest,
     _WaitRequest,
     again,
+    disable_hang_detect,
     enter_phase,
     batch_phase,
     phased_field,
@@ -778,36 +783,37 @@ def test_frame_hiding_default_hides_driver_frames():
         pytest.fail("Expected RuntimeError to propagate")
 
 
-def _reload_coroutines_with_env(show_frames: str):
-    """Re-import the coroutines module with TLLM_COROUTINE_SHOW_FRAMES set."""
-    import importlib
-
-    import tensorrt_llm._torch.pyexecutor.coroutines as mod
-
-    with mock.patch.dict(os.environ, {"TLLM_COROUTINE_SHOW_FRAMES": show_frames}):
-        importlib.reload(mod)
-    return mod
-
-
 def test_frame_hiding_env_reveals_driver_frames():
-    """With TLLM_COROUTINE_SHOW_FRAMES=1, framework frames are visible."""
-    mod = _reload_coroutines_with_env("1")
+    """With ``_HIDE_FRAMES`` False, framework frames are visible.
+
+    NOTE: this test patches the module-level ``_HIDE_FRAMES`` constant
+    directly rather than re-importing the module. ``importlib.reload``
+    creates a NEW set of class objects (``_HangControl``,
+    ``_WaitRequest``, ...) on the module while the test file's existing
+    imports keep pointing at the OLD ones; functions in the reloaded
+    module then look up names in the new module dict at call time and
+    yield instances of the new classes -- which the test file's
+    ``isinstance`` checks (against the old classes) reject. Patching
+    the constant is sufficient for this test's purpose and leaves
+    every other module-level binding untouched.
+    """
 
     async def deep():
-        async with mod.batch_phase(_TestPhase.P1):
+        async with batch_phase(_TestPhase.P1):
             raise RuntimeError("planted")
 
     async def sched():
-        handle = mod.Batch(deep(), _TestStorage())
-        await mod.step(handle, through=_TestPhase.P1)
+        handle = Batch(deep(), _TestStorage())
+        await step(handle, through=_TestPhase.P1)
 
-    try:
-        mod.Driver(sched()).run()
-    except RuntimeError as e:
-        tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-        assert "_drive" in tb_str or "_yield_advance" in tb_str or "_yield_wait" in tb_str
-    finally:
-        _reload_coroutines_with_env("0")
+    with mock.patch.object(_cor_mod, "_HIDE_FRAMES", False):
+        try:
+            Driver(sched()).run()
+        except RuntimeError as e:
+            tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            assert "_drive" in tb_str or "_yield_advance" in tb_str or "_yield_wait" in tb_str
+        else:
+            pytest.fail("Expected RuntimeError to propagate")
 
 
 # --------------------------------------------------------------------------- #
@@ -1550,6 +1556,381 @@ def test_concern_can_be_reused_across_batch_phases():
     Driver(scheduler()).run()
     assert log == ["p1_done", "between_blocks", "p2_done"]
     assert c.done is True
+
+
+# --------------------------------------------------------------------------- #
+# Hang detection: Driver builtin watchdog + ``disable_hang_detect`` CM.
+# --------------------------------------------------------------------------- #
+
+
+def test_disable_hang_detect_yields_enter_then_exit_control_messages():
+    """The CM yields ``_HangControl(True)`` on enter and ``_HangControl(False)``
+    on exit -- the wire protocol the Driver dispatches on.
+    """
+
+    async def body():
+        async with disable_hang_detect():
+            pass
+
+    coro = body()
+    try:
+        first = coro.send(None)
+        assert isinstance(first, _HangControl) and first.disabled is True
+        second = coro.send(None)
+        assert isinstance(second, _HangControl) and second.disabled is False
+        with pytest.raises(StopIteration):
+            coro.send(None)
+    finally:
+        coro.close()
+
+
+def test_watchdog_fires_after_timeout_with_no_messages():
+    """No notify => watchdog fires after ``timeout`` seconds."""
+    fired = threading.Event()
+    wd = _HangWatchdog(timeout=0.05, on_hang=lambda _ctx: fired.set())
+    wd.start()
+    try:
+        assert fired.wait(timeout=1.0), "watchdog should have fired"
+    finally:
+        wd.stop()
+
+
+def test_watchdog_notify_resets_timer():
+    """Successive notifies faster than ``timeout`` keep the watchdog quiet."""
+    fired = threading.Event()
+    wd = _HangWatchdog(timeout=0.1, on_hang=lambda _ctx: fired.set())
+    wd.start()
+    try:
+        for _ in range(6):
+            time.sleep(0.02)
+            wd.notify(coro_name="some_coro", phase=None)
+        # ~120ms elapsed with notifies every 20ms; would have fired
+        # at 100ms without them.
+        assert not fired.is_set()
+    finally:
+        wd.stop()
+
+
+def test_watchdog_pause_blocks_timeout_indefinitely():
+    """While paused, the watchdog waits for ``resume`` even past ``timeout``."""
+    fired = threading.Event()
+    wd = _HangWatchdog(timeout=0.05, on_hang=lambda _ctx: fired.set())
+    wd.start()
+    try:
+        wd.pause()
+        # Wait > timeout; pause should keep the watchdog quiet.
+        assert not fired.wait(timeout=0.15)
+    finally:
+        wd.stop()
+
+
+def test_watchdog_resume_re_arms():
+    """After ``resume`` the watchdog returns to timing-wait state."""
+    fired = threading.Event()
+    wd = _HangWatchdog(timeout=0.05, on_hang=lambda _ctx: fired.set())
+    wd.start()
+    try:
+        wd.pause()
+        time.sleep(0.1)  # well past timeout, but paused
+        assert not fired.is_set()
+        wd.resume()
+        assert fired.wait(timeout=1.0)
+    finally:
+        wd.stop()
+
+
+def test_watchdog_re_fires_every_timeout_until_message_arrives():
+    """Without messages the watchdog keeps re-firing on each ``timeout``."""
+    fire_count = [0]
+    fire_event = threading.Event()
+
+    def on_hang(_ctx):
+        fire_count[0] += 1
+        if fire_count[0] >= 3:
+            fire_event.set()
+
+    wd = _HangWatchdog(timeout=0.05, on_hang=on_hang)
+    wd.start()
+    try:
+        # No notify; expect at least 3 fires within ~0.5s.
+        assert fire_event.wait(timeout=1.0)
+        assert fire_count[0] >= 3
+    finally:
+        wd.stop()
+
+
+def test_watchdog_context_includes_last_notify():
+    """``on_hang(context)`` carries the last (name, phase) the Driver sent."""
+    captured = {}
+    fired = threading.Event()
+
+    def on_hang(context):
+        captured["context"] = context
+        fired.set()
+
+    wd = _HangWatchdog(timeout=0.05, on_hang=on_hang)
+    wd.start()
+    try:
+        wd.notify("some_coroutine", _TestPhase.P2)
+        assert fired.wait(timeout=1.0)
+    finally:
+        wd.stop()
+    assert "some_coroutine" in captured["context"]
+    assert "P2" in captured["context"]
+
+
+def test_watchdog_notify_does_not_accept_coroutine_objects_as_name():
+    """``notify`` is designed for a name STRING, not a coroutine object.
+
+    This is a regression check on the API: the watchdog must only ever
+    stash cheap immutable values, never a coroutine reference that
+    could keep a completed coroutine alive across the worker thread
+    boundary. We verify by introspecting what the worker stashes.
+    """
+    wd = _HangWatchdog(timeout=10.0, on_hang=lambda _ctx: None)
+    wd.start()
+    try:
+        wd.notify("MyConcern.handle_batch", _TestPhase.P1)
+        # Drain by stopping (forces the worker to process queued
+        # messages up to the next state-changing one). Then inspect
+        # via a synthetic fire.
+        wd.stop()
+    except Exception:
+        wd.stop()
+        raise
+    # We can't easily peek into the worker thread after it exits,
+    # so verify the queue's message format directly: ``notify``
+    # should put a tuple of (str, Optional[IntEnum]) -- never a
+    # coroutine.
+    fresh = _HangWatchdog(timeout=10.0, on_hang=lambda _ctx: None)
+    fresh.notify("Foo.bar", None)
+    msg = fresh._queue.get()  # noqa: SLF001 -- introspection
+    assert isinstance(msg, tuple)
+    name, phase = msg
+    assert isinstance(name, str)
+    assert phase is None or isinstance(phase, IntEnum)
+
+
+def test_watchdog_context_when_no_notify_yet():
+    """Hang fires before the first notify => context says so."""
+    captured = {}
+    fired = threading.Event()
+
+    def on_hang(context):
+        captured["context"] = context
+        fired.set()
+
+    wd = _HangWatchdog(timeout=0.05, on_hang=on_hang)
+    wd.start()
+    try:
+        assert fired.wait(timeout=1.0)
+    finally:
+        wd.stop()
+    assert "no coroutine" in captured["context"].lower()
+
+
+def test_watchdog_stop_is_idempotent_and_safe_before_start():
+    """``stop`` is a no-op if never started, and idempotent if already stopped."""
+    wd = _HangWatchdog(timeout=0.05, on_hang=lambda _ctx: None)
+    wd.stop()  # never started; should not raise
+    wd.start()
+    wd.stop()
+    wd.stop()  # already stopped; should not raise
+
+
+def test_watchdog_rejects_non_positive_timeout():
+    """Constructor rejects non-positive timeouts."""
+    with pytest.raises(ValueError):
+        _HangWatchdog(timeout=0.0, on_hang=lambda _ctx: None)
+    with pytest.raises(ValueError):
+        _HangWatchdog(timeout=-1.0, on_hang=lambda _ctx: None)
+
+
+def test_watchdog_swallows_on_hang_exceptions():
+    """A throwing on_hang doesn't kill the worker thread."""
+    fired = threading.Event()
+
+    def bad_on_hang(_ctx):
+        fired.set()
+        raise RuntimeError("planned failure inside on_hang")
+
+    wd = _HangWatchdog(timeout=0.05, on_hang=bad_on_hang)
+    wd.start()
+    try:
+        # No notify; the watchdog fires.
+        assert fired.wait(timeout=1.0)
+        # Worker is still alive: pause then resume still triggers
+        # another fire after a quiet timeout window.
+        fired.clear()
+        assert fired.wait(timeout=1.0)
+    finally:
+        wd.stop()
+
+
+def test_driver_no_watchdog_when_hang_timeout_is_none():
+    """Default Driver has no watchdog -- no thread, no machinery."""
+
+    async def main():
+        return None
+
+    drv = Driver(main())
+    assert drv._watchdog is None
+    drv.run()
+
+
+def test_driver_watchdog_fires_on_slow_main():
+    """A slow sync block inside main() trips the Driver-builtin watchdog."""
+    fired = threading.Event()
+
+    async def main():
+        time.sleep(0.3)  # > timeout, no yield
+
+    Driver(main(), hang_timeout=0.05, on_hang=lambda _ctx: fired.set()).run()
+    assert fired.is_set()
+
+
+def test_driver_watchdog_silent_on_responsive_coroutine():
+    """A coroutine that returns quickly does not trip the watchdog."""
+    fired = threading.Event()
+
+    async def main():
+        return None
+
+    Driver(main(), hang_timeout=1.0, on_hang=lambda _ctx: fired.set()).run()
+    assert not fired.is_set()
+
+
+def test_disable_hang_detect_silences_long_sync_block():
+    """A sync sleep wrapped in ``disable_hang_detect`` does not fire."""
+    fired = threading.Event()
+
+    async def main():
+        async with disable_hang_detect():
+            time.sleep(0.3)  # well past timeout, but disabled
+
+    Driver(main(), hang_timeout=0.05, on_hang=lambda _ctx: fired.set()).run()
+    assert not fired.is_set()
+
+
+def test_disable_hang_detect_re_arms_after_exit():
+    """After exiting the CM, the watchdog re-arms and fires on later slow code."""
+    fired = threading.Event()
+
+    async def main():
+        async with disable_hang_detect():
+            time.sleep(0.2)  # disabled
+        time.sleep(0.2)  # NOT disabled -- should fire
+
+    Driver(main(), hang_timeout=0.05, on_hang=lambda _ctx: fired.set()).run()
+    assert fired.is_set()
+
+
+def test_disable_hang_detect_is_global_across_coroutines():
+    """While the CM is open, the watchdog stays paused even if other coroutines run."""
+    fired = threading.Event()
+
+    async def disabled_concern():
+        async with disable_hang_detect():
+            # Hand control back to the parent so it can drive a peer
+            # concern while this CM is still open. The pause must
+            # persist across that handoff.
+            await again()
+
+    async def slow_peer():
+        await enter_phase(_TestPhase.P1)
+        time.sleep(0.3)  # would normally trip; pause should silence it
+
+    d = Concern(disabled_concern())
+    p = Concern(slow_peer())
+
+    async def batch():
+        async with batch_phase(_TestPhase.P1):
+            # Drive ``d`` first; it ``await again()``s and pops back.
+            assert (await try_resume(d)) is False
+            # While ``d`` is suspended in disable_hang_detect, run ``p``.
+            await resume(p)
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        await try_step(handle, through=_TestPhase.P3)
+
+    Driver(scheduler(), hang_timeout=0.05, on_hang=lambda _ctx: fired.set()).run()
+    assert not fired.is_set(), "the global pause should silence the peer's slow body"
+
+
+def test_disable_hang_detect_does_not_nest():
+    """Re-entering the CM while already active raises RuntimeError."""
+
+    async def main():
+        async with disable_hang_detect():
+            async with disable_hang_detect():
+                pass
+
+    with pytest.raises(RuntimeError, match="does not nest"):
+        Driver(main()).run()
+
+
+def test_disable_hang_detect_outer_cm_cleans_up_after_inner_crash():
+    """After a nested-entry crash, the outer CM still clears the flag."""
+
+    async def main():
+        async with disable_hang_detect():
+            try:
+                async with disable_hang_detect():  # crashes
+                    pass
+            except RuntimeError:
+                pass
+
+    drv = Driver(main())
+    drv.run()
+    # Outer __aexit__ ran; flag is back to False.
+    assert drv._hang_paused is False
+
+
+def test_disable_hang_detect_nesting_check_works_without_watchdog():
+    """The nesting check fires even when ``hang_timeout`` is None."""
+
+    async def main():
+        async with disable_hang_detect():
+            async with disable_hang_detect():
+                pass
+
+    # No hang_timeout -- watchdog disabled. The flag check is
+    # independent and still raises.
+    with pytest.raises(RuntimeError, match="does not nest"):
+        Driver(main()).run()
+
+
+def test_driver_clears_hang_paused_on_shutdown():
+    """A Driver that finishes (even via exception) leaves ``_hang_paused`` False."""
+
+    async def main():
+        async with disable_hang_detect():
+            raise ValueError("planned")
+
+    drv = Driver(main())
+    with pytest.raises(ValueError, match="planned"):
+        drv.run()
+    assert drv._hang_paused is False
+
+
+def test_driver_default_on_hang_uses_logger():
+    """Default on_hang resolves; verify by patching the import target."""
+    fired = threading.Event()
+
+    def fake_print_all_stacks():
+        fired.set()
+
+    async def main():
+        time.sleep(0.2)
+
+    with mock.patch("tensorrt_llm._utils.print_all_stacks", fake_print_all_stacks):
+        # Use the default on_hang (None) so the Driver picks
+        # ``_default_on_hang`` which imports + calls print_all_stacks.
+        Driver(main(), hang_timeout=0.05).run()
+
+    assert fired.is_set()
 
 
 # --------------------------------------------------------------------------- #

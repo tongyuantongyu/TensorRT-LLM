@@ -121,7 +121,7 @@ class Service:
     | ``async_transfer_manager``| ``DisaggConcern``          |
     | ``kv_connector_manager``  | ``KvConnectorConcern``     |
     | ``perf_manager``          | ``PerfMetricConcern``      |
-    | ``hang_detector``         | ``HangConcern``            |
+    | ``hang_detector``         | runtime ``Driver`` builtin |
     | ``dwdp_manager``          | ``DwdpConcern``            |
     | ``execution_stream``      | ``ForwardConcern`` (owns)  |
     | ``sample_stream``         | ``SampleConcern`` (owns)   |
@@ -241,7 +241,6 @@ class MessagePort:
     - ``control_request_queue`` + ``control_request_barrier`` +
       ``control_action_done``        -- synchronous control actions
     - ``shutdown_event``              -- shutdown signal
-    - ``hang_detector_event``         -- watchdog signal
     - ``canceled_req_ids``            -- request cancellation set
     - ``waiting_queue``               -- pre-active queue
     - ``responses`` + ``result_wait_queues`` -- per-request response
