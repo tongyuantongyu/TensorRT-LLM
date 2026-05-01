@@ -269,6 +269,130 @@ class AsyncTransferManager:
 
 
 class PyExecutor:
+    """Legacy executor with per-method refactor categorization comments.
+
+    Refactor categorization scheme (read this before scanning the per-method
+    comments below)
+    ===========================================================================
+
+    Each method / property below carries a one-line ``# REFACTOR:`` comment
+    above its definition (above any decorators). The categories mirror the
+    plan in ``concerns.py`` and ``context.py``:
+
+    Category 1 (NOT in the new coroutine loop)
+    ------------------------------------------
+
+    - ``1a (public API)``: called by user code from the main thread.
+      Includes lifecycle (``__init__`` / ``start_worker`` / ``shutdown`` /
+      ``__enter__`` / ``__exit__``) and the data-plane methods
+      (``enqueue_request*`` / ``await_responses`` / ``cancel_request`` /
+      ``get_latest_*`` / etc.).
+
+    - ``1b (legacy loop runtime)``: the legacy executor loops themselves
+      (``_executor_loop`` / ``_executor_loop_overlap`` / ``_executor_loop_pp``)
+      and immediate runtime helpers (``_event_loop_wrapper``,
+      ``_executor_loop_cleanup``). Also marks methods that disappear
+      in the new design with their work distributed elsewhere:
+
+      * Multi-concern fan-outs annotated in-line in the loop body
+        (split into the respective concerns' phase blocks):
+        ``_prepare_and_schedule_batch``, ``_handle_executed_batch``,
+        ``_process_previous_batch``, ``_send_kv_async``,
+        ``_handle_responses``.
+      * Loop-side dispatchers: ``_handle_special_queue_items``.
+      * Inter-concern sequencing helpers identified by review (split
+        with data passed through ``BatchStorage`` across at least 2
+        phases): ``_prepare_disagg_gen_init`` (disagg -> resource ->
+        disagg), ``_end_transfer_and_maybe_terminate`` (response ->
+        disagg -> schedule -> termination).
+      * Failing-path helper that conflates two distinct modes:
+        ``_handle_errors``. Splits in the new design into
+        - Mode A (catastrophic, no ``requests=`` arg): concerns
+          just ``raise``; the SCHEDULER catches at the top of its
+          loop, calls the Mode B utility on the active set, and
+          sets the shutdown latch.
+        - Mode B (per-request fail-fast, with ``requests=`` arg):
+          becomes a 2b utility ``fail_requests(reqs, msg)``.
+        Per-concern ``finally:`` blocks handle concern-LOCAL
+        cleanup (CUDA event handles, etc.); the failing of
+        REQUESTS is the SCHEDULER's / ``fail_requests``'s job, not
+        per-concern work.
+      * Legacy machinery eliminated by coroutine semantics (no
+        replacement needed): ``wait_on_pp_send_handles`` (slot rings
+        of ``isend`` handles become coroutine locals).
+
+    Category 2 (will live INSIDE the new coroutine loop)
+    ----------------------------------------------------
+
+    - ``2a (concern: <name>)``: used by exactly ONE concern in the new
+      design. Will move INTO that concern's class. The ``<name>`` matches
+      the concern name in ``concerns.py`` -- e.g., ``schedule``, ``forward``,
+      ``sample``, ``response``, ``disagg``, ``kv_connector``, ``spec_decode``,
+      ``guided_decoder``, ``perf_metric``, ``iter_stats``, ``profile``,
+      ``control``, ``benchmark_disagg_gate``, ``kv_cache_events``,
+      ``ring_broadcast_sample``.
+
+    - ``2b (shared helper, NON-interleaving)``: GENUINELY general-purpose
+      code that multiple concerns call individually. Bodies do NOT
+      interleave concerns -- that's the criterion that distinguishes
+      2b from the "interleaves, needs splitting" 1b sub-set above.
+      Bodies MAY touch multiple concerns' state when they represent
+      a coherent atomic operation (e.g., "really terminate this
+      request"); the distinguishing test is "would each concern
+      individually want to do this exact unit, vs being a fan-out
+      of distinct steps?".
+
+      The surviving 2b set:
+        * ``_terminate_request`` / ``_do_terminate_request`` --
+          atomic request termination dispatch. Called from
+          normal-path concern code (response RESPOND_7, schedule
+          paused-request handling, disagg / kv_connector terminate
+          sweeps), the SCHEDULER's catastrophic-error handler, and
+          the per-request ``fail_requests`` utility.
+        * ``fail_requests(reqs, msg)`` (NEW; surviving body of
+          ``_handle_errors``'s per-request fail-fast mode -- see
+          1b notes above): set ``GENERATION_COMPLETE`` per req,
+          build + enqueue error responses, remove from active
+          set, terminate. Called by concerns that detect a
+          specific bad subset (validation failure, timeout,
+          guided-decoder grammar failure, ...) and by the
+          SCHEDULER's catastrophic-error handler with the active
+          set.
+
+      Refactor home: method on a small ``ctx.svc.termination`` (or
+      ``ctx.svc.errors``) service so service-side dependencies
+      (PP termination handler, response queue, etc.) live as
+      instance state, accessible from any concern.
+
+    Special / scheduler-direct
+    --------------------------
+
+    - ``SPECIAL``: used by neither a concern nor the legacy loop directly.
+      Typically scheduler-iter-direct code (the SCHEDULER is not a concern
+      -- see ``concerns.py``'s "THE SCHEDULER SIDE" section), or a
+      cross-thread state flag with non-trivial reader/writer split.
+
+    Threading note
+    ==============
+
+    ``PyExecutor`` is a single class today, but the refactor splits its
+    surface into:
+
+    - a main-thread side: ``PyExecutorCoro.__init__`` builds everything,
+      then exposes a small public API (data-plane methods, lifecycle,
+      shutdown). 1a + 1b methods stay here (1b methods get DELETED once
+      the new loop replaces them).
+
+    - a loop-thread side: a ``run_loop(ctx)`` entry point owned by the
+      new coroutine SCHEDULER. 2a methods move into their respective
+      concern classes; 2b methods become standalone helpers callable
+      from inside the loop layer; SPECIAL methods become inlined into
+      the SCHEDULER iter or the loop's bootstrap code.
+
+    The ``# REFACTOR:`` line on each method below records where it
+    will land.
+    """
+
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
     # If the number of micro batches is too small, the executor will spend too much time in synchronization.
@@ -276,6 +400,7 @@ class PyExecutor:
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
 
+    # REFACTOR: 1a (public API) -- main-thread lifecycle (constructor).
     def __init__(
             self,
             resource_manager,
@@ -595,6 +720,7 @@ class PyExecutor:
         if start_worker:
             self.start_worker()
 
+    # REFACTOR: 1a (public API) -- ``__init__`` helper, runs on main thread.
     def _maybe_init_kv_connector_manager(self):
         if self.kv_connector_manager is not None:
             if self.kv_cache_transceiver is not None:
@@ -625,6 +751,25 @@ class PyExecutor:
 
             self.kv_connector_manager.wait_for_initialization()
 
+    # REFACTOR: 1b (multi-concern, inlined+split) -- body interleaves four
+    # concerns per request: ``response`` (fast-path create + enqueue when
+    # the request is still active), ``disagg`` (``end_transfer``),
+    # ``schedule`` (``active_requests.remove``), and ``2b`` termination
+    # (``_terminate_request`` dispatch). Both callers (disagg's ctx-cache
+    # probe and kv_connector's terminate sweep) iterate completed
+    # transfers and call this per request.
+    #
+    # Refactor direction: split per concern. Concrete sequencing options
+    # depending on how cleanly the dependencies fall out:
+    #   (a) Inline the per-request 4-step dance into each caller's body
+    #       and call the concern-owned methods directly. Each call site
+    #       gets ~4 lines of explicit dispatch instead of one method
+    #       call -- but the dependencies are visible.
+    #   (b) Move the "fast-path response for completed transfer" piece
+    #       into a method on the response concern that disagg /
+    #       kv_connector invoke; the rest stays in disagg.
+    # Pick (b) once the response concern is wired; until then, do not
+    # treat this method as a destination for new logic.
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
         if self.kv_cache_transceiver and request in self.active_requests:
             # Fast-transfer: KV transfer completed in the same iteration
@@ -649,6 +794,9 @@ class PyExecutor:
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
+    # REFACTOR: 1b (legacy loop runtime) -- threading-target wrapper that
+    # runs on ``worker_thread`` and dispatches to one of the legacy
+    # ``_executor_loop*`` variants. Disappears with the new loop.
     def _event_loop_wrapper(self):
         try:
             # Skip line profiler during warmup/memory estimation phase to avoid
@@ -665,10 +813,15 @@ class PyExecutor:
         finally:
             self._executor_loop_cleanup()
 
+    # REFACTOR: SPECIAL -- one-way main-thread setter (warmup driver) read
+    # by multiple loop-thread sites (profiler, benchmark gate, several
+    # concerns). After refactor, lives in ``Configuration.is_warmup``
+    # (effectively immutable after warmup completes).
     @property
     def is_warmup(self) -> bool:
         return getattr(self, "_is_warmup", False)
 
+    # REFACTOR: SPECIAL -- see ``is_warmup`` getter above.
     @is_warmup.setter
     def is_warmup(self, value: bool):
         self._is_warmup = value
@@ -677,6 +830,9 @@ class PyExecutor:
         if self.draft_model_engine is not None:
             self.draft_model_engine.is_warmup = value
 
+    # REFACTOR: 1a (public API) -- main-thread lifecycle; spawns the
+    # legacy worker_thread (and PP broadcast thread). New design starts
+    # ``run_loop`` on its own loop thread instead.
     def start_worker(self):
         with self.worker_lock:
             if not self.worker_started:
@@ -705,6 +861,7 @@ class PyExecutor:
                 logger.info("Starting the async worker for sampler D2H copies")
                 self.sampler.async_worker_start()
 
+    # REFACTOR: 1a (public API) -- ``__init__`` helper, runs on main thread.
     def _set_global_steady_clock_offset(self):
         assert self.global_rank >= 0, "rank should be >= 0"
 
@@ -724,12 +881,15 @@ class PyExecutor:
             f"Setting global_steady_clock_offset: {global_steady_clock_offset} seconds for rank {self.global_rank}"
         )
 
+    # REFACTOR: 1a (public API) -- context manager entry.
     def __enter__(self):
         return self
 
+    # REFACTOR: 1a (public API) -- context manager exit; calls ``shutdown``.
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
 
+    # REFACTOR: 1a (public API) -- enqueue user requests.
     def enqueue_requests(
         self,
         requests: List[ExecutorRequest],
@@ -745,6 +905,7 @@ class PyExecutor:
                     self.result_wait_queues[req_id] = result_wait_queue
         return req_ids
 
+    # REFACTOR: 1a (public API) -- block until responses are available.
     def await_responses(
         self,
         id: Optional[Union[List[int], int]] = None,
@@ -770,6 +931,7 @@ class PyExecutor:
 
         return responses
 
+    # REFACTOR: 1a (public API) -- request cancellation entry point.
     def cancel_request(self, id: int):
         """
         Cancel the request with provided request id
@@ -778,6 +940,7 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_cancel_request(id)
 
+    # REFACTOR: 1a (public API) -- main-thread shutdown entry point.
     def shutdown(self):
         """
         Signals the server to shutdown.
@@ -829,12 +992,14 @@ class PyExecutor:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
 
+    # REFACTOR: 1a (public API).
     def can_enqueue_requests(self) -> bool:
         """
         Indicates if the current process is allowed to enqueue requests
         """
         return self.executor_request_queue.can_enqueue_request()
 
+    # REFACTOR: 1a (public API).
     def get_latest_iteration_stats(self):
         """
         Returns the per-iterations statistics computed since last call to this method.
@@ -849,6 +1014,7 @@ class PyExecutor:
             self.stats = []
         return latest_stats
 
+    # REFACTOR: 1a (public API).
     def get_latest_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
@@ -858,9 +1024,11 @@ class PyExecutor:
         events = kv_cache_manager.get_latest_events(0)
         return events
 
+    # REFACTOR: 1a (public API) -- main-thread blocking wait for shutdown.
     def wait_shutdown(self):
         self.shutdown_event.wait()
 
+    # REFACTOR: 1a (public API) -- single-request enqueue variant.
     def enqueue_request(
             self,
             request: ExecutorRequest,
@@ -875,14 +1043,22 @@ class PyExecutor:
                 self.result_wait_queues[req_id] = result_wait_queue
         return req_id
 
+    # REFACTOR: 1a (public API).
     def set_gather_responses(self, gather_all_responses):
         self.gather_all_responses = gather_all_responses
 
+    # REFACTOR: SPECIAL -- scheduler-direct shutdown gate. Read by the
+    # scheduler iter (loop_control), not by any per-batch concern. New
+    # design: inline into the scheduler iter body alongside the
+    # shutdown latch in ``MessagePort``.
     @property
     def should_stop_processing(self):
         return self.is_shutdown and len(self.active_requests) == 0 and \
             len(self.waiting_queue) == 0
 
+    # REFACTOR: 2a (concern: profile) -- per-iter profiler tick CM. New
+    # design: ``ProfileConcern.tick(ctx)`` method called from
+    # ``batch_body`` at SCHEDULE_0.
     @contextmanager
     def _profiler(self):
         it = -1
@@ -1012,6 +1188,7 @@ class PyExecutor:
                 torch.cuda.cudart().cudaProfilerStop()
                 calibrator.stop()
 
+    # REFACTOR: 2a (concern: iter_stats) -- SCHEDULE_0 init step.
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
         stats = IterationStats()
@@ -1041,6 +1218,7 @@ class PyExecutor:
 
         return stats
 
+    # REFACTOR: 2a (concern: iter_stats) -- helper for ``_process_iter_stats``.
     def _populate_req_stats(
             self, finished_requests: List[LlmRequest],
             active_requests: List[LlmRequest],
@@ -1097,6 +1275,7 @@ class PyExecutor:
 
         return req_stats
 
+    # REFACTOR: 2a (concern: iter_stats) -- helper for ``_process_iter_stats``.
     def _update_iter_stats(self, stats, iter_latency_ms, num_completed_requests,
                            scheduled_batch, micro_batch_id) -> IterationStats:
         stats.iter_latency_ms = iter_latency_ms
@@ -1200,6 +1379,7 @@ class PyExecutor:
                 draft_latency_ms) / float(iter_latency_ms)
         return stats
 
+    # REFACTOR: 2a (concern: iter_stats) -- helper for ``_process_iter_stats``.
     def _append_iter_stats(self,
                            stats: IterationStats,
                            req_stats: Optional[List[RequestStats]] = None):
@@ -1209,6 +1389,7 @@ class PyExecutor:
                 self.stats.pop(0)
             self.stats.append((stats, req_stats, self._latest_kv_iter_stats))
 
+    # REFACTOR: 2a (concern: iter_stats) -- FINALIZE_8 step.
     def _process_iter_stats(
         self,
         finished_requests: list[LlmRequest],
@@ -1233,6 +1414,8 @@ class PyExecutor:
                                     batch_state.scheduled_requests,
                                     micro_batch_id), req_stats)
 
+    # REFACTOR: 1b (legacy loop runtime) -- post-loop teardown for the
+    # legacy loops; called from ``_event_loop_wrapper``'s finally.
     def _executor_loop_cleanup(self):
 
         for i in range(self.num_micro_batches):
@@ -1246,6 +1429,10 @@ class PyExecutor:
             self.response_cv.notify_all()
         self.shutdown_event.set()
 
+    # REFACTOR: 2a (concern: schedule) -- PP variant of the schedule
+    # concern's SCHEDULE_0 work. Implements HC8 (PP schedule chain): rk0
+    # schedules + serializes; other ranks recv + isend along the PP
+    # forward chain, then deserialize.
     def _pp_schedule_and_propagate(self, microbatch_id: int):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
 
@@ -1294,6 +1481,8 @@ class PyExecutor:
                 self.active_requests)
         return scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs
 
+    # REFACTOR: 2a (concern: schedule) -- PP variant of the schedule
+    # concern; non-rk0 retry loop on KV-cache exhaustion.
     def _pp_retry_until_can_schedule(self, scheduled_batch):
         """
         If current rank cannot run the scheduled batch, it will retry following steps until it has enough KV cache resources or reach maximum retry count:
@@ -1336,6 +1525,8 @@ class PyExecutor:
                 f"Reach maximum PP retry count ({self.pp_scheduler_max_retry_count}) but still cannot run first PP's schedule result. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value. Or you can set `TLLM_PP_SCHEDULER_MAX_RETRY_COUNT` to a larger value to allow more retries."
             )
 
+    # REFACTOR: 1b (legacy loop runtime) -- legacy PP executor loop; will
+    # be replaced by the new coroutine SCHEDULER's PP variant.
     def _executor_loop_pp(self):
         # ===================================================================
         # 3-LAYER COROUTINE REFACTOR ROADMAP -- PIPELINE-PARALLEL LOOP
@@ -2336,6 +2527,10 @@ class PyExecutor:
                 self._handle_executed_batch(executed_batch)
                 self.unhandled_batch_counter -= 1
 
+    # REFACTOR: 2a (concern: ring_broadcast_sample) -- the long-running
+    # bcast THREAD's body. New design: replaced by the
+    # ``RingBroadcastSampleConcern`` long-running coroutine spanning
+    # ``(n-1)`` scheduler iters per batch (no separate thread).
     def _broadcast_sample_state_loop(self):
         logger.debug(
             f"Starting broadcast sample state loop for pp_rank {self.dist.pp_rank}"
@@ -2366,6 +2561,9 @@ class PyExecutor:
         set_thread_local_mpi_comm(None)
         new_mpi_comm.Free()
 
+    # REFACTOR: 2a (concern: ring_broadcast_sample) -- per-batch ring hop
+    # body: recv from prev rank, push into response queue, isend to next
+    # rank. Becomes one phase block inside the new long-running concern.
     def _ring_broadcast_sample_state(
         self,
         executed_batch: Optional[BatchStatePP],
@@ -2407,6 +2605,13 @@ class PyExecutor:
                     tag=tag,
                 )
 
+    # REFACTOR: 1b (multi-concern, inlined+split) -- PP P_RETIRE body:
+    # sample-apply + disagg send_kv + response (canceled + responses) +
+    # disagg ctx-cache probe + resource update + schedule inflight-id
+    # remove, plus cross-batch global tail (kv-transfer timeout sweep,
+    # PP termination ballot, iter_stats process). Each branch goes to
+    # its concern's APPLY_6 / RESPOND_7 / FINALIZE_8 block; scheduler-
+    # direct items (termination ballot) move to scheduler iter.
     def _handle_executed_batch(self, executed_batch: Optional[BatchStatePP]):
         # ===================================================================
         # P_RETIRE body for one executed batch on the PP loop. Multi-concern,
@@ -2540,12 +2745,35 @@ class PyExecutor:
                 executed_batch.microbatch_id % self.dist.pp_size,
             )
 
+    # REFACTOR: 1b (legacy machinery; ELIMINATED by new design) -- this
+    # helper exists only because the legacy loop stashes ``isend``
+    # handles in per-microbatch slot rings (``send_handles``,
+    # ``send_schedule_handles``, ``send_expected_batch_num_handles``)
+    # and waits on the previous slot's handle when reusing it.
+    #
+    # In the new design every concern that does ``isend_object`` is a
+    # coroutine that holds the handle as a local variable and waits on
+    # it directly later in its OWN body:
+    #
+    # - HC10 ``ring_broadcast_sample`` distributed concern (per-batch
+    #   coroutine): ``handle = isend_object(...)`` near the end of the
+    #   body, ``handle.wait()`` before the body returns. No slot ring.
+    # - HC5a schedule's PP variant (per-batch coroutine): same pattern;
+    #   schedule's coroutine waits on its own ``isend`` before
+    #   completing.
+    # - HC5b ``retire_vote`` (per-iter scheduler-direct): no
+    #   coroutine; wait immediately after isend (the payload is just
+    #   an int so the cost is negligible) or use blocking ``send_object``.
+    #
+    # Result: the slot rings + this helper all go away.
     @nvtx_range("wait_on_pp_send_handles")
     def wait_on_pp_send_handles(self, send_handles, microbatch_id):
         if send_handles[microbatch_id] is not None:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
 
+    # REFACTOR: 2a (concern: spec_decode) -- FORWARD_1 step (per-batch
+    # uniform draft-token padding for CUDA-graph compat).
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
         """Handle dynamic draft length for the current batch.
@@ -2595,6 +2823,8 @@ class PyExecutor:
         else:
             self.model_engine.runtime_draft_len = self.model_engine.max_total_draft_tokens
 
+    # REFACTOR: 2a (concern: schedule) -- collective ``can_queue`` gate
+    # at SCHEDULE_0.
     def _can_queue(self, scheduled_batch):
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
@@ -2609,6 +2839,8 @@ class PyExecutor:
 
         return can_queue, can_queue_this_rank
 
+    # REFACTOR: 2a (concern: resource) -- revert per-gen KV growth when
+    # the batch is skipped on this rank (V2 scheduler only).
     def _revert_gen_alloc(self, scheduled_batch):
         """Revert KV cache capacity growth when the batch is skipped.
 
@@ -2627,6 +2859,10 @@ class PyExecutor:
             for req in scheduled_batch.generation_requests:
                 self.kv_cache_manager.revert_allocate_generation(req)
 
+    # REFACTOR: 1b (multi-concern, inlined+split) -- annotated in-line as
+    # a SCHEDULE_0 fan-out across schedule + disagg + iter_stats +
+    # spec_decode + resource. Body splits into the respective concerns'
+    # SCHEDULE_0 blocks; nothing remains as a monolithic method.
     def _prepare_and_schedule_batch(self):
         # ===================================================================
         # Multi-concern fan-out called once per iter from `_executor_loop*`.
@@ -2840,6 +3076,8 @@ class PyExecutor:
             f'{scheduled_batch.num_generation_requests} generation requests')
         return scheduled_batch, iter_stats
 
+    # REFACTOR: 2a (concern: kv_connector) -- start async KV-load at
+    # SCHEDULE_0 / FORWARD_1.
     def _kv_connector_start_batch(self, scheduled_batch):
         if self.kv_connector_manager:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
@@ -2848,17 +3086,22 @@ class PyExecutor:
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
 
+    # REFACTOR: 2a (concern: kv_connector) -- end-of-iter terminate of
+    # connector-flagged finished requests.
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
                 self._end_transfer_and_maybe_terminate(req)
 
+    # REFACTOR: 2a (concern: kv_connector) -- deadline-wait paired with
+    # ``_kv_connector_start_batch``; called from inside ``_forward_step``.
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.worker.wait_for_save(
                 torch.cuda.current_stream())
 
+    # REFACTOR: 2a (concern: benchmark_disagg_gate) -- helper for the gate.
     def _is_benchmark_disagg_fill_complete(
             self, scheduled_batch: ScheduledRequests) -> bool:
         """Check whether all benchmark disagg requests have completed KV transfer.
@@ -2898,6 +3141,7 @@ class PyExecutor:
                 f"total_gen_count={total_gen_count} (local={local_gen_count})")
         return False
 
+    # REFACTOR: 2a (concern: benchmark_disagg_gate) -- SCHEDULE_0 gate.
     def _check_benchmark_disagg_gate(self, scheduled_batch: ScheduledRequests,
                                      can_forward: bool) -> tuple[bool, bool]:
         """Gate the forward pass until all benchmark disagg requests are ready.
@@ -2929,6 +3173,8 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+    # REFACTOR: 1b (legacy loop runtime) -- legacy plain executor loop;
+    # replaced by the new coroutine SCHEDULER's plain variant.
     def _executor_loop(self):
         # ===================================================================
         # 3-LAYER COROUTINE REFACTOR ROADMAP -- PLAIN LOOP
@@ -3556,6 +3802,7 @@ class PyExecutor:
                 # Produce: iter_counter (loop state)
                 self.iter_counter += 1
 
+    # REFACTOR: 2a (concern: spec_decode) -- SCHEDULE_0 helper.
     def _prepare_draft_requests(self):
         try:
             # Set draft tokens here to make the KV cache manager
@@ -3580,6 +3827,8 @@ class PyExecutor:
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
+    # REFACTOR: 2a (concern: control) -- SCHEDULE_0 control-request
+    # rendezvous (cooperates with main-thread ``control_action`` CM).
     def _handle_control_request(self):
         if len(self.active_requests) == 0 and \
             len(self.waiting_queue) == 0 and \
@@ -3594,6 +3843,9 @@ class PyExecutor:
             self.control_action_done.wait()
             self.control_action_done.clear()
 
+    # REFACTOR: 1a (public API) -- main-thread CM that cooperates with
+    # the loop-thread ``_handle_control_request`` (control concern) via
+    # ``MessagePort`` queues / events.
     @contextmanager
     def control_action(self):
         """
@@ -3621,6 +3873,8 @@ class PyExecutor:
             self.control_action_done.set()
             self.control_request_barrier.clear()
 
+    # REFACTOR: 1b (legacy loop runtime) -- legacy overlap executor loop;
+    # replaced by the new coroutine SCHEDULER's overlap variant.
     def _executor_loop_overlap(self):
         # ===================================================================
         # 3-LAYER COROUTINE REFACTOR ROADMAP -- OVERLAP LOOP
@@ -4395,6 +4649,8 @@ class PyExecutor:
                 # Produce: iter_counter (loop state)
                 self.iter_counter += 1
 
+    # REFACTOR: 2a (concern: spec_decode) -- overlap-mode HC1 in-bridge
+    # helper; computes accepted-token count from prev's sample tensors.
     @nvtx_range("_accept_draft_tokens")
     def _accept_draft_tokens(
         self, scheduled_batch: ScheduledRequests,
@@ -4484,6 +4740,10 @@ class PyExecutor:
 
         return result_tensors, num_accepted_tokens
 
+    # REFACTOR: 1b (multi-concern, inlined+split) -- annotated in-line as
+    # overlap's prev-batch RESPOND_7 fan-out across response + resource
+    # + kv_cache_events + iter_stats. Body splits into the respective
+    # concerns' RESPOND_7 / FINALIZE_8 blocks.
     def _process_previous_batch(self):
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
@@ -4501,6 +4761,9 @@ class PyExecutor:
             self._process_iter_stats(finished_requests, self.active_requests,
                                      self.previous_batch)
 
+    # REFACTOR: 2a (concern: forward) -- PP non-last-rank variant of
+    # forward; collapses forward + sample placeholder + state advance
+    # into one call so ``BatchStorage`` has a unified shape across ranks.
     def _forward_step_inter_pp(self, scheduled_batch) -> SampleState:
         self._forward_step(scheduled_batch)
         sampler_event = torch.cuda.Event()
@@ -4513,6 +4776,7 @@ class PyExecutor:
             runtime_draft_len=self.model_engine.runtime_draft_len,
         )
 
+    # REFACTOR: 2a (concern: schedule) -- request validation in fetch path.
     def _validate_token_id_range(self, request: LlmRequest) -> None:
         if isinstance(self.model_engine.model, DecoderModelForCausalLM):
             # Only skip token‐range checks for Llama4 when the request has multimodal data
@@ -4536,6 +4800,7 @@ class PyExecutor:
                     self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
 
+    # REFACTOR: 2a (concern: schedule) -- request validation in fetch path.
     def _validate_request(self, request: LlmRequest):
         # Validate beam width
         sampling_config = request.sampling_config
@@ -4552,6 +4817,7 @@ class PyExecutor:
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
 
+    # REFACTOR: 2a (concern: schedule) -- helper for the fetch path.
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_active_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
@@ -4597,6 +4863,7 @@ class PyExecutor:
 
         waiting_queue.add_requests(new_requests)
 
+    # REFACTOR: 2a (concern: schedule) -- helper for the fetch path.
     def _pop_from_waiting_queue(
         self,
         waiting_queue: WaitingQueue,
@@ -4618,6 +4885,7 @@ class PyExecutor:
             max_num_active_requests=self.max_num_active_requests,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
 
+    # REFACTOR: 2a (concern: schedule) -- main entry of the fetch step.
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
             self, waiting_queue: WaitingQueue,
@@ -4682,6 +4950,11 @@ class PyExecutor:
                               exclude_last_generation_logits=self.
                               _should_exclude_last_generation_logits())
 
+    # REFACTOR: 1b (multi-concern, inlined+split) -- per-item dispatcher
+    # at fetch time: shutdown signals -> ``MessagePort.is_shutdown``;
+    # cancellation items -> ``response`` cancellation set; control items
+    # -> ``control`` queue. Splits into the respective concerns'
+    # SCHEDULE_0 input handling.
     def _handle_special_queue_items(
             self,
             new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
@@ -4703,6 +4976,8 @@ class PyExecutor:
 
         return accepted_new_requests
 
+    # REFACTOR: 2a (concern: iter_stats) -- queue-latency metric writer
+    # invoked by the fetch path at SCHEDULE_0.
     def _update_new_active_requests_queue_latency(
             self, new_requests: List[RequestQueueItem]):
         """Update queue latency metrics for new requests."""
@@ -4711,12 +4986,18 @@ class PyExecutor:
             new_requests, now)
         self.new_active_requests_queue_latency_ms += latency
 
+    # REFACTOR: 2a (concern: iter_stats) -- queue-latency metric reader.
     def _get_new_active_requests_queue_latency(self) -> float:
         return self.new_active_requests_queue_latency_ms
 
+    # REFACTOR: 2a (concern: disagg) -- disagg's first-token logit
+    # snapshot uses this flag (also accessed directly as the property
+    # ``self.should_exclude_last_generation_logits``).
     def _should_exclude_last_generation_logits(self) -> bool:
         return self.should_exclude_last_generation_logits
 
+    # REFACTOR: 2a (concern: schedule) -- fetch step entry point used by
+    # ``_prepare_and_schedule_batch``; invokes validation + activation.
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
 
         def _respond_if_invalid(request: LlmRequest) -> bool:
@@ -4743,6 +5024,7 @@ class PyExecutor:
         self.active_requests.extend(validated_requests)
         return validated_requests
 
+    # REFACTOR: 2a (concern: kv_cache_events) -- RESPOND_7 step.
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
@@ -4752,6 +5034,8 @@ class PyExecutor:
         # to be transferred to main thread when user needs them.
         kv_cache_manager.flush_iteration_events()
 
+    # REFACTOR: 2a (concern: schedule) -- ADP request balancer used by
+    # ``_schedule``.
     def _balance_adp_requests(self, context_requests: list[LlmRequest],
                               generation_requests: list[LlmRequest]):
         balanced_context_requests = context_requests
@@ -4804,6 +5088,7 @@ class PyExecutor:
                     balanced_context_requests = context_requests
         return balanced_context_requests
 
+    # REFACTOR: 2a (concern: schedule) -- batch-wait helper.
     @staticmethod
     def _compute_scheduled_tokens(context_requests, generation_requests):
         """Compute the total number of scheduled tokens for batch waiting decisions.
@@ -4848,6 +5133,8 @@ class PyExecutor:
                                        for gen_req in generation_requests)
         return num_scheduled_ctx_tokens + num_scheduled_gen_tokens
 
+    # REFACTOR: 2a (concern: schedule) -- batch-wait policy applied by
+    # ``_schedule``.
     def _waiting_requests(self, context_requests: list[LlmRequest],
                           generation_requests: list[LlmRequest]):
         """
@@ -4868,6 +5155,7 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
         return context_requests
 
+    # REFACTOR: 2a (concern: schedule) -- main scheduling pass.
     @nvtx_range("_schedule")
     def _schedule(self):
         scheduler_output = self.scheduler.schedule_request(
@@ -4895,6 +5183,7 @@ class PyExecutor:
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
 
+    # REFACTOR: 2a (concern: disagg) -- SCHEDULE_0 probe.
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
 
@@ -4917,6 +5206,7 @@ class PyExecutor:
 
         return
 
+    # REFACTOR: 2a (concern: disagg) -- SCHEDULE_0 / RESPOND_7 sweep.
     @nvtx_range("_check_kv_transfer_timeout")
     def _check_kv_transfer_timeout(self):
         if not self.kv_cache_transceiver:
@@ -4945,6 +5235,7 @@ class PyExecutor:
 
         return
 
+    # REFACTOR: 2a (concern: disagg) -- SCHEDULE_0 probe.
     @nvtx_range("_check_disagg_ctx_schedulable_status")
     def _check_disagg_ctx_schedulable_status(self,
                                              new_requests: List[LlmRequest]):
@@ -4965,6 +5256,7 @@ class PyExecutor:
         self.kv_cache_transceiver.prepare_context_requests(
             gen_first_ctx_requests)
 
+    # REFACTOR: 2a (concern: schedule) -- ADP padding helper.
     def _count_schedulable_active_requests(self) -> int:
         """Count active requests that are ready for scheduling.
 
@@ -4987,6 +5279,8 @@ class PyExecutor:
         return sum(1 for req in self.active_requests
                    if not _is_awaiting_kv_transfer(req))
 
+    # REFACTOR: 2a (concern: schedule) -- ADP padding helper used during
+    # benchmark-disagg fill phase.
     def _should_skip_dummy_for_benchmark_disagg(
             self, num_schedulable_requests: int) -> bool:
         """Decide whether to skip ADP dummy insertion during benchmark disagg fill.
@@ -5018,6 +5312,7 @@ class PyExecutor:
                     f"num_schedulable_requests={num_schedulable_requests}")
         return True
 
+    # REFACTOR: 2a (concern: schedule) -- ADP dummy padding at SCHEDULE_0.
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
@@ -5048,6 +5343,34 @@ class PyExecutor:
                 spec_resource_manager.add_dummy_requests([0])
             self.active_requests.append(llm_request)
 
+    # REFACTOR: 1b (multi-concern, inlined+split) -- body sequence
+    # ``disagg -> resource -> disagg``: build a ``ScheduledRequests``
+    # holder (disagg side; could equally be built by schedule), prep
+    # KV resources for it (resource side), submit the async KV recv
+    # (disagg side).
+    #
+    # Refactor direction: pass ``disagg_gen_init_to_prepare`` through
+    # ``BatchStorage``. AT LEAST 2 phases are required because the
+    # happens-before rule on storage views means a write at phase P is
+    # visible only to readers at phases > P -- two concerns at the
+    # SAME phase cannot exchange storage data.
+    #
+    # Minimal 2-phase split:
+    #   * Phase A: schedule writes ``fitting_disagg_gen_init_requests``
+    #     AND disagg packages it into ``disagg_gen_init_to_prepare``
+    #     (both writes at the same phase are fine -- they're written
+    #     by their respective concerns, just both to A's write view).
+    #   * Phase B (> A): resource reads ``disagg_gen_init_to_prepare``
+    #     and runs ``prepare_resources`` for it; disagg reads
+    #     ``fitting_disagg_gen_init_requests`` and runs the async KV
+    #     recv. Both reads + both follow-on actions can co-exist at B.
+    #
+    # Concretely this needs adding one new ``BatchPhase`` between
+    # ``SCHEDULE_0`` (=A) and ``FORWARD_1`` -- e.g. ``RESOURCE_PREP_1``
+    # -- and renumbering the rest. (3 phases would be cleaner -- one
+    # for each step -- but the 2-phase split is sufficient and keeps
+    # the enum smaller; per ``concerns.py``'s ">20 phases is too many"
+    # guidance we should hold the line at 2.)
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
         if fitting_disagg_gen_init_requests:
@@ -5068,6 +5391,8 @@ class PyExecutor:
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 
+    # REFACTOR: 2a (concern: disagg) -- FORWARD_1 step that promotes
+    # transmission-complete gen requests + sets up sampler step.
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
         cache_trans_complete_requests = []
@@ -5098,6 +5423,8 @@ class PyExecutor:
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)
 
+    # REFACTOR: 2a (concern: disagg) -- helper of
+    # ``_prepare_disagg_gen_transmission_complete``.
     def _maybe_prepend_logprobs_and_logits(self, req, beam_width):
         """Prepend logprobs and generation logits for first_gen_tokens
         if transferred from prefill."""
@@ -5127,6 +5454,7 @@ class PyExecutor:
                     req.py_result.append_generation_logits(
                         logits_tensor.to(device))
 
+    # REFACTOR: 2a (concern: response) -- used by ``_handle_first_token_response``.
     def _has_prepended_logits(self, req) -> bool:
         """Check whether the request has first-gen logits prepended from
         prefill that need a snapshot before response creation."""
@@ -5137,6 +5465,8 @@ class PyExecutor:
             return False
         return getattr(disagg_params, 'first_gen_logits', None) is not None
 
+    # REFACTOR: 2a (concern: disagg) -- helper of ``_prepare_disagg_gen_init``
+    # (KV recv submission to ctx worker).
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
 
@@ -5170,6 +5500,10 @@ class PyExecutor:
 
         return
 
+    # REFACTOR: 1b (multi-concern, inlined+split) -- annotated in-line as
+    # RESPOND_7 fan-out across disagg (start ctx KV send + opportunistic
+    # probe) + kv_connector (flag finished requests for async save).
+    # Body splits into the respective concerns' RESPOND_7 blocks.
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
         # ===================================================================
@@ -5246,12 +5580,15 @@ class PyExecutor:
             # Produce: terminated requests (out-of-band)
             self._check_disagg_ctx_cache_transfer_status(0)
 
+    # REFACTOR: 2a (concern: disagg) -- error-state lookup helper.
     def _get_disagg_reqs_in_error_state(self):
         return [
             req for req in self.active_requests
             if req.state == LlmRequestState.DISAGG_TRANS_ERROR
         ]
 
+    # REFACTOR: 2a (concern: disagg) -- common error sweep helper for
+    # ctx / gen cache transfer status checks.
     def _check_cache_transfer_errors(self, error_msg_prefix: str):
         """Common helper to check for and handle cache transfer errors."""
         error_requests = self._get_disagg_reqs_in_error_state()
@@ -5260,6 +5597,7 @@ class PyExecutor:
                 f"Error in kv cache transfer for {error_msg_prefix}",
                 requests=error_requests)
 
+    # REFACTOR: 2a (concern: disagg) -- ctx cache transfer status sweep.
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
         finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
@@ -5299,11 +5637,16 @@ class PyExecutor:
 
         self._check_cache_transfer_errors("context requests")
 
+    # REFACTOR: 2a (concern: disagg) -- gen cache transfer status sweep.
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
         self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
         self._check_cache_transfer_errors("generation requests")
 
+    # REFACTOR: 2a (concern: forward) -- FORWARD_1 main step. Internally
+    # invokes ``_kv_connector_wait_for_save`` (kv_connector deadline
+    # wait) -- in the new design that becomes a kv_connector method
+    # called from forward's body, not folded in here.
     def _forward_step(
             self,
             scheduled_requests: ScheduledRequests,
@@ -5369,6 +5712,8 @@ class PyExecutor:
             self._handle_errors(error_msg)
             return None
 
+    # REFACTOR: 2a (concern: spec_decode) -- late state mark used in
+    # overlap / PP variants.
     def _update_generation_requests_that_will_complete_next_iteration(
             self, generation_requests: list[LlmRequest]):
         """ Update the generation requests that will complete next iteration.
@@ -5382,6 +5727,7 @@ class PyExecutor:
                 request.set_exclude_last_generation_logits(False)
                 request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
+    # REFACTOR: 2a (concern: sample) -- TP variant of state advance.
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy request
         if self.active_requests and self.active_requests[
@@ -5413,6 +5759,7 @@ class PyExecutor:
                 else:
                     request.state = LlmRequestState.GENERATION_IN_PROGRESS
 
+    # REFACTOR: 2a (concern: sample) -- star-attention variant of state advance.
     def _update_request_states_star_attention(
             self, scheduled_requests: ScheduledRequests):
         for request in scheduled_requests.context_requests:
@@ -5423,6 +5770,7 @@ class PyExecutor:
         for request in scheduled_requests.generation_requests:
             request.gen_iters += 1
 
+    # REFACTOR: 2a (concern: sample) -- STATE_UPD_3 dispatch (TP/CP/HELIX).
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
         cp_config = self.dist.cp_config
@@ -5438,6 +5786,7 @@ class PyExecutor:
                     f'Unsupported cp type {cp_type.name}.')
         self._update_request_states_tp(scheduled_requests)
 
+    # REFACTOR: 2a (concern: sample) -- SAMPLE_2 main step.
     @nvtx_range("_sample_async")
     def _sample_async(self, scheduled_batch,
                       batch_outputs) -> SampleState | None:
@@ -5474,6 +5823,11 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
+    # REFACTOR: 2a (concern: disagg) -- thin wrapper around
+    # ``self.sampler.setup_sampler_step``; only caller is
+    # ``_prepare_disagg_gen_transmission_complete`` (disagg). After
+    # refactor disagg's coroutine calls ``sampler.setup_sampler_step``
+    # directly and this wrapper goes away.
     @nvtx_range("_setup_sampler_step")
     def _setup_sampler_step(self, requests: ScheduledRequests):
         try:
@@ -5484,6 +5838,8 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
+    # REFACTOR: 2a (concern: sample) -- APPLY_6 main step (blocks on
+    # sampler_event, applies sampled tokens to requests).
     @nvtx_range("_update_requests")
     def _update_requests(self,
                          sample_state: SampleState,
@@ -5496,6 +5852,49 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
+    # REFACTOR: 1b (legacy helper conflating TWO failure modes; splits
+    # in the new design):
+    #
+    # Mode A -- CATASTROPHIC (callers pass NO ``requests=``; default
+    # is "fail every active request + clear active_requests"). The
+    # concern can't recover and the rest of the batch / loop can't
+    # safely proceed. Today's call sites: hang detector, exceptions
+    # caught inside ``_forward_step`` / ``_sample_async`` /
+    # ``_setup_sampler_step`` / ``_update_requests`` /
+    # ``_prepare_draft_requests``.
+    #
+    # In the new design the concern's coroutine just RAISES (no
+    # special helper, no try/except wrapper around the body). The
+    # exception propagates: concern -> BATCH -> SCHEDULER. The
+    # SCHEDULER catches at the top of its loop, calls
+    # ``fail_requests(active_requests, msg)`` (Mode B's utility) on
+    # the active set, and sets the shutdown latch. The intermediate
+    # ``GeneratorExit`` thrown into still-suspended concerns by the
+    # Driver runs their ``finally:`` for concern-LOCAL cleanup
+    # (CUDA event handles, etc.) -- but NOT for the failing of
+    # requests, which is the SCHEDULER's job.
+    #
+    # Mode B -- PER-REQUEST FAIL-FAST (callers pass an explicit
+    # ``requests=`` arg). A specific subset of requests is bad; the
+    # rest of the batch and the loop continue. Today's call sites:
+    # ``_validate_request`` failure (one bad request), guided
+    # decoder errors (grammar-failed subset), KV transfer timeout
+    # (timed-out subset), cache transfer error (DISAGG_TRANS_ERROR
+    # subset), benchmark gen-only KV exhaustion (the active set,
+    # explicitly named).
+    #
+    # In the new design this becomes a 2b utility: call it
+    # ``fail_requests(reqs, msg)``. Body matches the current
+    # per-request branch of ``_handle_errors``: set
+    # ``GENERATION_COMPLETE`` per req, build + enqueue error
+    # responses, remove from active_requests, terminate each via
+    # ``_terminate_request``. Touches multiple concerns' state but
+    # is a coherent atomic operation -- same trade-off as
+    # ``_terminate_request`` itself.
+    #
+    # Refactor home for ``fail_requests``: method on a small
+    # ``ctx.svc.errors`` service (or co-located on
+    # ``ctx.svc.termination``).
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
                        *,
@@ -5521,6 +5920,27 @@ class PyExecutor:
         for request in failed_requests:
             self._terminate_request(request)
 
+    # REFACTOR: 2b (shared helper, NON-interleaving) -- single-purpose
+    # dispatcher: defers to ``DisaggPPTerminationHandler`` if present
+    # (and the request is not a dummy), otherwise calls the direct
+    # ``_do_terminate_request`` path. Each caller treats it as one
+    # opaque "terminate this request" call.
+    #
+    # In the new design, callers come from THREE sites (normal +
+    # both error modes from ``_handle_errors``):
+    # * Normal path: response concern's RESPOND_7 (handle_responses
+    #   + cancellation), schedule concern's paused-request
+    #   termination, the disagg / kv_connector
+    #   ``_end_transfer_and_maybe_terminate`` replacement.
+    # * Error Mode A (catastrophic) -- SCHEDULER's top-of-loop
+    #   exception handler iterates the active set and calls this on
+    #   each.
+    # * Error Mode B (per-request fail-fast) -- the ``fail_requests``
+    #   2b utility iterates the named subset and calls this on each.
+    #
+    # Refactor home: method on a small ``ctx.svc.termination`` service
+    # so the ``DisaggPPTerminationHandler`` reference lives as
+    # instance state. Free function alternative also viable.
     def _terminate_request(self, request: LlmRequest):
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
@@ -5532,12 +5952,23 @@ class PyExecutor:
         else:
             self._do_terminate_request(request)
 
+    # REFACTOR: 2b (shared helper) -- atomic "really terminate now":
+    # free resources (resource-manager side) + drop from
+    # ``result_wait_queues`` (response-side per-request fan-out).
+    # Called from ``_terminate_request`` and passed as the terminator
+    # callback to ``DisaggPPTerminationHandler``. The body touches two
+    # concerns' state but represents the natural unit of "really
+    # terminate now" -- splitting into resource-side and response-side
+    # halves would force every caller to do both, with no benefit.
+    # Refactor home: co-locate on the ``ctx.svc.termination`` service
+    # alongside ``_terminate_request``.
     def _do_terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
 
+    # REFACTOR: 2a (concern: response) -- helper of ``_try_cancel_request``.
     def _is_request_in_transmission(self, request) -> bool:
         """Check if a request is currently in transmission state."""
         return (request.state
@@ -5545,6 +5976,7 @@ class PyExecutor:
                 or request.state
                 == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
 
+    # REFACTOR: 2a (concern: response) -- cancellation attempt helper.
     def _try_cancel_request(self, request) -> bool:
         """Check if a request can be canceled and attempt cancellation if needed.
 
@@ -5559,6 +5991,7 @@ class PyExecutor:
 
         return self.kv_cache_transceiver.cancel_request(request)
 
+    # REFACTOR: 2a (concern: response) -- RESPOND_7 cancellation handler.
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
         if len(self.canceled_req_ids) == 0:
@@ -5589,6 +6022,8 @@ class PyExecutor:
         self.canceled_req_ids.clear()
         self.canceled_req_ids.extend(still_pending_canceled_ids)
 
+    # REFACTOR: 2a (concern: response) -- response enqueue (TP gather +
+    # cross-thread put on ``MessagePort``-owned queues).
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
@@ -5625,6 +6060,8 @@ class PyExecutor:
                             resp.client_id, resp)
                 self.response_cv.notify_all()
 
+    # REFACTOR: 2a (concern: response) -- SCHEDULE_0 first-token emission
+    # for newly-promoted disagg-gen requests.
     @nvtx_range("_handle_first_token_response")
     def _handle_first_token_response(self, scheduled_batch):
         new_responses = []
@@ -5659,6 +6096,12 @@ class PyExecutor:
 
         self._enqueue_responses(new_responses)
 
+    # REFACTOR: 1b (multi-concern, inlined+split) -- annotated in-line as
+    # RESPOND_7 fan-out across response (build / enqueue / terminate) +
+    # perf_metric (per-step metrics) + spec_decode (rolling acceptance
+    # gate -- cross-iter feedback) + disagg (timeout cleanup +
+    # ctx-complete terminate-policy fork). Body splits into the
+    # respective concerns' RESPOND_7 blocks.
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
         # ===================================================================
@@ -5828,6 +6271,8 @@ class PyExecutor:
             self._terminate_request(request)
         return requests_to_terminate + requests_finished_by_transfer
 
+    # REFACTOR: 1a (public API) -- main-thread blocking wait used by
+    # ``await_responses``.
     def _await_any_response(self,
                             timeout: Optional[float] = None
                             ) -> List[LlmResponse]:
@@ -5844,6 +6289,8 @@ class PyExecutor:
 
         return responses
 
+    # REFACTOR: 1a (public API) -- main-thread blocking wait used by
+    # ``await_responses``.
     def _await_single_response(
             self,
             id: int,
@@ -5858,16 +6305,23 @@ class PyExecutor:
             self.responses.pop(id)
             return response
 
+    # REFACTOR: 2a (concern: schedule) -- terminate paused requests
+    # batch helper at SCHEDULE_0; only caller is the schedule concern's
+    # paused-request lifecycle block.
     def _terminate_requests(self, requests_to_terminate):
         # todo: support work with self.inflight_req_ids.
         #       Currently, self.inflight_req_ids is not updated.
         for req in requests_to_terminate:
             self._terminate_request(req)
 
+    # REFACTOR: 2a (concern: schedule) -- paused requests batch helper
+    # at SCHEDULE_0 (paired with ``_terminate_requests``).
     def _pause_requests(self, requests_to_pause):
         for req in requests_to_pause:
             req.pause(self.max_input_len)
 
+    # REFACTOR: 2a (concern: schedule) -- PP inflight-id tracking add at
+    # SCHEDULE_0 (paired with ``_remove_inflight_ids`` at P_RETIRE).
     def _add_inflight_ids(self, scheduled_requests: ScheduledRequests):
         """Add request IDs of current sampling requests to self.inflight_req_ids.
 
@@ -5888,6 +6342,8 @@ class PyExecutor:
             )
             self.inflight_req_ids.insert(req.request_id)
 
+    # REFACTOR: 2a (concern: schedule) -- PP inflight-id tracking remove
+    # at P_RETIRE inside ``_handle_executed_batch``.
     def _remove_inflight_ids(self, scheduled_requests: ScheduledRequests):
         """Remove request IDs of current sampling requests from self.inflight_req_ids."""
         for req in scheduled_requests.context_requests_last_chunk:
@@ -5901,6 +6357,8 @@ class PyExecutor:
             )
             self.inflight_req_ids.erase(req.request_id)
 
+    # REFACTOR: 2a (concern: spec_decode) -- overlap-mode HC1 in-bridge
+    # body that runs the draft model on prev's sample tensors.
     def _handle_speculative_decoding(
         self, scheduled_batch, previous_tensors, target_inputs
     ) -> Tuple[Optional[SampleStateTensorsSpec], Optional[torch.Tensor]]:
@@ -5923,9 +6381,12 @@ class PyExecutor:
 
         return new_target_inputs, num_accepted_tokens_device
 
+    # REFACTOR: 1a (public API).
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()
 
+    # REFACTOR: 2a (concern: guided_decoder) -- APPLY_6 step (mark
+    # grammar-failed requests as errored).
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,
             failed_requests: Optional[List[Tuple[int, str]]]):
