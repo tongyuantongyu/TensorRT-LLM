@@ -982,7 +982,9 @@ class _RootHandle:
         _close_if_undriven(self)
 
 
-async def step(handle: Batch, *, through: IntEnum) -> Tuple[object, Optional[object]]:
+async def step(
+    handle: Optional[Batch], *, through: IntEnum
+) -> Tuple[object, Optional[object]]:
     """Scheduler-level primitive: drive ``handle`` through phase ``through``.
 
     Activates ``handle``'s storage on the current ``ContextVar``,
@@ -997,10 +999,16 @@ async def step(handle: Batch, *, through: IntEnum) -> Tuple[object, Optional[obj
     - ``(full_read_view, None)`` if the batch completed during
       this step.
 
-    Fast path: if ``handle.done`` (the batch already completed on a
-    previous ``step`` / ``try_step``), this returns
-    ``(_all_read_view, None)`` immediately without entering the
-    Driver — re-stepping a finished batch is idempotent.
+    Fast paths:
+
+    - ``handle is None`` -- returns ``(None, None)`` without entering
+      the Driver. Lets schedulers drop ``if previous is not None:``
+      guards around bookkeeping calls on optional batches (e.g., the
+      first iter has no ``previous`` to drive). Callers passing
+      ``None`` MUST NOT use the returned views.
+    - ``handle.done`` (batch already completed on a previous step /
+      try_step) -- returns ``(_all_read_view, None)`` immediately.
+      Re-stepping a finished batch is idempotent.
 
     Strict on retry: if the batch yields ``await again()``, ``step``
     raises ``RuntimeError`` — the call site declared retry to be a
@@ -1016,6 +1024,8 @@ async def step(handle: Batch, *, through: IntEnum) -> Tuple[object, Optional[obj
     captured into ``handle.saved_phase`` so the next ``step()`` /
     ``try_step()`` can restore it.
     """
+    if handle is None:
+        return None, None
     result = await _do_step(handle, through, allow_retry=False)
     # _do_step never returns None when allow_retry=False (it raises
     # instead). The cast makes the type narrow for callers using the
@@ -1025,7 +1035,7 @@ async def step(handle: Batch, *, through: IntEnum) -> Tuple[object, Optional[obj
 
 
 async def try_step(
-    handle: Batch, *, through: IntEnum
+    handle: Optional[Batch], *, through: IntEnum
 ) -> Optional[Tuple[object, Optional[object]]]:
     """Like :func:`step`, but report retry instead of raising.
 
@@ -1038,12 +1048,18 @@ async def try_step(
     Distinguishing retry from terminal: retry returns a bare ``None``;
     terminal returns ``(read_view, None)``.
 
-    Fast path: if ``handle.done``, returns ``(_all_read_view, None)``
-    immediately — same idempotent behavior as :func:`step` on a
-    finished batch.
+    Fast paths:
+
+    - ``handle is None`` -- returns ``(None, None)`` (NOT bare
+      ``None``, which would be ambiguous with retry). Same rationale
+      as :func:`step`'s ``None`` short-circuit.
+    - ``handle.done`` -- returns ``(_all_read_view, None)``. Same
+      idempotent behavior as :func:`step` on a finished batch.
 
     Same non-nesting semantics as :func:`step`.
     """
+    if handle is None:
+        return None, None
     return await _do_step(handle, through, allow_retry=True)
 
 

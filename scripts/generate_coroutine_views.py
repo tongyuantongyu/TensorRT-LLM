@@ -333,6 +333,45 @@ def _render_step_overload(
     ]
 
 
+def _render_step_none_overload() -> List[str]:
+    """Emit the ``handle is None`` no-op overload for ``step``.
+
+    A single overload covers every phase: passing ``None`` short-
+    circuits to ``(None, None)`` regardless of ``through``. Callers
+    using ``await step(optional_batch, through=...)`` get a
+    well-typed signature without having to inline ``if x is not
+    None:`` guards. The returned views are ``None`` and MUST NOT be
+    accessed -- the contract is "the call did nothing".
+    """
+    return [
+        "@overload",
+        "async def step(",
+        "    handle: None,",
+        "    *,",
+        "    through: BatchPhase,",
+        ") -> Tuple[None, None]: ...",
+    ]
+
+
+def _render_try_step_none_overload() -> List[str]:
+    """Emit the ``handle is None`` no-op overload for ``try_step``.
+
+    Mirrors :func:`_render_step_none_overload`. Distinguishing this
+    return shape from the retry sentinel (bare ``None``): the
+    None-handle path returns ``(None, None)`` -- a tuple, not bare
+    ``None`` -- so callers that distinguish "retry" from "completed /
+    no-op" still get unambiguous results.
+    """
+    return [
+        "@overload",
+        "async def try_step(",
+        "    handle: None,",
+        "    *,",
+        "    through: BatchPhase,",
+        ") -> Tuple[None, None]: ...",
+    ]
+
+
 def _render_try_step_overload(
     phase: BatchPhase,
     next_phase: Optional[BatchPhase],
@@ -360,6 +399,32 @@ def _render_try_step_overload(
         "async def try_step(",
         *params,
         f") -> Optional[Tuple[{read}, {write}]]: ...",
+    ]
+
+
+def _render_enter_phase_overload(
+    phase: BatchPhase,
+    is_first: bool,
+) -> List[str]:
+    """Emit one ``@overload`` signature for ``enter_phase``.
+
+    Mirrors :func:`_render_batch_phase_overload` but without the
+    ``@asynccontextmanager`` wrapper -- ``enter_phase`` is the bare
+    coroutine concerns ``await`` to receive the per-phase
+    ``(read, write)`` views (the BATCH layer wraps the same call in
+    the ``batch_phase`` CM for ``async with`` use).
+
+    For the FIRST phase the read view is ``None`` because no field
+    has been produced yet; concerns that participate at SCHEDULE_0
+    receive ``r=None`` and write through ``w``.
+    """
+    read = "None" if is_first else f"_ReadAt{_phase_pascal(phase)}"
+    write = f"_WriteAt{_phase_pascal(phase)}"
+    return [
+        "@overload",
+        "async def enter_phase(",
+        f"    p: Literal[BatchPhase.{phase.name}],",
+        f") -> Tuple[{read}, {write}]: ...",
     ]
 
 
@@ -439,6 +504,10 @@ def generate_block(target: Path = None) -> str:
         out.append("")
 
     # step overloads.
+    # First the ``handle is None`` no-op overload (single signature
+    # spanning every phase) so callers can pass an Optional[Batch]
+    # without losing type narrowing.
+    out.extend(_render_step_none_overload())
     for i, phase in enumerate(phases):
         next_phase = phases[i + 1] if i < len(phases) - 1 else None
         out.extend(_render_step_overload(phase, next_phase))
@@ -446,9 +515,16 @@ def generate_block(target: Path = None) -> str:
     out.append("")
 
     # try_step overloads (same shape, Optional-wrapped return).
+    out.extend(_render_try_step_none_overload())
     for i, phase in enumerate(phases):
         next_phase = phases[i + 1] if i < len(phases) - 1 else None
         out.extend(_render_try_step_overload(phase, next_phase))
+    out.append("")
+    out.append("")
+
+    # enter_phase overloads (concern-level: no CM wrapping).
+    for i, phase in enumerate(phases):
+        out.extend(_render_enter_phase_overload(phase, is_first=(i == 0)))
     out.append("")
     out.append("")
 

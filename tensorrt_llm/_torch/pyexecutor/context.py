@@ -48,13 +48,23 @@ A clean ``PyExecutorCoro`` skeleton::
             conf = Configuration(...)
             port = MessagePort(...)
             state = PersistentState()
+            ctx = Context(svc=svc, conf=conf, state=state, port=port)
             crn = build_concerns(svc=svc, conf=conf, ...)  # see concerns.py
-            ctx = Context(svc=svc, conf=conf, state=state, port=port, crn=crn)
 
             # Main thread only keeps `port`. Everything else moves to
-            # the loop thread on `ctx`.
+            # the loop thread. ``crn`` is passed AS A SEPARATE ARG --
+            # it intentionally does NOT live on ``ctx`` so concerns
+            # can't reach for peers. Only the orchestrators
+            # ``run_loop`` / ``scheduler_iter`` / ``batch_body``
+            # legitimately need ``crn``. See "Why no ``crn`` field"
+            # on :class:`Context` for the four-homes routing of
+            # cross-concern data (within-batch -> BatchStorage;
+            # batch-to-batch handoff -> SCHEDULER bridge; cross-
+            # batch shared state -> ``ctx.svc.*``; private latch ->
+            # concern instance attribute).
             self._port = port
-            self._loop_thread = threading.Thread(target=run_loop, args=(ctx,))
+            self._loop_thread = threading.Thread(
+                target=run_loop, args=(ctx, crn))
             self._loop_thread.start()
 
         def submit(self, request):
@@ -64,9 +74,10 @@ A clean ``PyExecutorCoro`` skeleton::
 What goes in ``ctx``
 ====================
 
-Five buckets, each with its own membership rule (below). Reach the
+Four buckets, each with its own membership rule (below). Reach the
 right bucket via ``ctx.svc`` / ``ctx.conf`` / ``ctx.state`` /
-``ctx.port`` / ``ctx.crn``.
+``ctx.port``. The bag of concern instances (``Concerns``) does NOT
+live here -- see "Why no ``crn`` field" on :class:`Context` below.
 
 What does NOT go in ``ctx``
 ===========================
@@ -74,27 +85,34 @@ What does NOT go in ``ctx``
 - ``BatchStorage`` -- per-batch data is reached only through the
   runtime's ``enter_phase`` / ``step`` views, never through ``ctx``.
   See "Why no ``batch`` field" on :class:`Context` below.
+- ``Concerns`` -- the bag of concern instances. Lives on
+  ``PyExecutorCoro`` as a side-channel and is passed as a
+  separate argument to the orchestrators. Mechanically prevents
+  concerns from reaching peer concerns; see "Why no ``crn``
+  field" on :class:`Context` for the four-homes routing rule.
 - A concern's owned services -- those go on the concern instance via
   its ``__init__`` kwargs (see ``concerns.py``). Putting them in
   ``ctx`` would make them freely accessible to other concerns,
   defeating the point of "owned".
-- A concern's cross-iter state -- lives as instance attributes on the
-  concern class.
+- A concern's PRIVATE cross-batch state -- lives as an instance
+  attribute on the concern class (no ``ctx`` involvement at
+  all).
 - Per-iter SCHEDULER state -- the SCHEDULER iter holds it as locals
-  (``iter_counter``, slot ring, ``previous_batch``, HC1/HC2/HC3
-  cross-iter bridges).
+  (``iter_counter``, slot ring, ``previous_batch``, HC1 / HC2 /
+  HC3 batch-to-batch bridges). "Iter" is a SCHEDULER concept;
+  concerns and BATCH bodies do not see it.
 """
 
 import dataclasses
+import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed.communicator import Distributed
 
-    from .concerns import Concerns
     from .executor_request_queue import ExecutorRequestQueue
     # Forward refs for service types defined alongside concerns
-    # (likely in ``concerns/_services.py`` once written).
+    # (in ``concerns/services.py``).
     from .concerns import (  # noqa: F401
         ClientChannel,
         RequestPool,
@@ -234,48 +252,49 @@ class Configuration:
 
 @dataclasses.dataclass
 class PersistentState:
-    """Cross-iter mutable state that genuinely belongs to no concern.
+    """Mutable state that survives across batches and genuinely belongs to no concern.
 
-    AIM AT ZERO.
+    AIM AT ZERO. Every legacy ``PyExecutor`` field considered for
+    this bucket has a better home:
 
-    Every legacy ``PyExecutor`` field considered for this bucket has a
-    better home:
-
-    - One-way latches owned by a single concern
-      (``speculation_permanently_disabled``,
-      ``_benchmark_fill_phase_active``, ...) live as an attribute on
-      that concern's class. Cross-concern interactions go through
-      method calls, not shared state. See ``concerns.py``.
-    - SCHEDULER bookkeeping (``iter_counter``, slot ring,
+    - **A concern's PRIVATE latch / counter** -- e.g. a one-way
+      flag that ONLY one concern observes
+      (``_benchmark_fill_phase_active``,
+      ``speculation_permanently_disabled``) -- lives as an
+      instance attribute on that concern's class. No ``ctx``
+      involvement.
+    - **Cross-concern shared state** -- needed by multiple
+      concerns across many batches (e.g. the spec_decode rolling
+      gate) -- lives on a SHARED SERVICE in ``ctx.svc.*``. Both
+      sides go through that one owner-typed surface.
+    - **SCHEDULER bookkeeping** (``iter_counter``, slot ring,
       ``previous_batch``, ``unhandled_batch_counter``,
-      ``has_previous_draft_tokens``, ``micro_batches[]``) lives on the
-      SCHEDULER iter as locals.
-    - Cross-thread signals (``is_shutdown``) live in ``MessagePort``
-      because that's their primary identity.
-    - Per-iter "current values" (``use_spec_decode`` /
-      ``max_total_draft_tokens`` for the iter's batch) live in
-      ``BatchStorage``.
+      ``has_previous_draft_tokens``, ``micro_batches[]``) lives
+      on the SCHEDULER iter as locals. "Iter" is a SCHEDULER
+      concept -- concerns don't see it.
+    - **Cross-thread signals** (``is_shutdown``) live in
+      :class:`MessagePort` because that's their primary
+      identity (touched by both threads).
+    - **Per-batch "current values"** (``use_spec_decode`` /
+      ``max_total_draft_tokens`` for the batch's run) live in
+      :class:`BatchStorage`.
+    - **Batch-to-batch handoffs** (one batch's terminal output is
+      next batch's input, e.g. HC1 in overlap) are mediated by
+      the SCHEDULER iter -- it reads the prior batch's terminal
+      view and stuffs the bridge value into the next batch's
+      SCHEDULE_0 write view. Not a ``PersistentState`` field.
 
-    This bucket is for the residue: cross-iter mutable state with
-    LEGITIMATELY multiple unrelated mutators AND that cannot be
-    modeled as method calls on a single owner.
-
-    Each surviving field MUST document, in a leading ``#`` comment:
-    its single rationale, the concerns / scheduler that mutate it, and
-    why method-call delegation through one of them did not suffice.
-    Anything that grows a second mutator without an updated rationale
-    is a refactor flag.
+    Each surviving field MUST document, in a leading ``#`` comment,
+    why none of the above buckets fits.
     """
 
-    # Empty by default. The example below shows the kind of thing that
-    # MIGHT belong here if a single owner cannot be agreed -- but
-    # usually a concern can claim it and expose a method.
+    # Empty by default. Most candidates fit one of the buckets
+    # above; ``PersistentState`` is the residue. The example below
+    # shows what a residue field would look like.
     #
-    # speculation_permanently_disabled: bool = False
-    # ^ -- this actually belongs on `SpecDecodeConcern.permanently_disabled`,
-    #      with `ResponseConcern` calling
-    #      `ctx.crn.spec_decode.record_acceptance(request)` at runtime.
-    #      Kept here only as a shape example.
+    # Example: a hypothetical legacy flag with multiple unrelated
+    # concern-side mutators that defies single-owner placement
+    # would land here with a comment justifying the routing.
 
 
 @dataclasses.dataclass
@@ -293,47 +312,151 @@ class MessagePort:
     The loop thread reaches the same ``MessagePort`` via ``ctx.port``.
 
     Stays small by construction; only true thread-boundary objects.
-    Examples that belong here as we wire them up:
 
-    - ``executor_request_queue``      -- new requests from API thread
-    - ``response_queue`` + ``response_cv`` -- responses to API thread
-    - ``control_request_queue`` + ``control_request_barrier`` +
-      ``control_action_done``        -- synchronous control actions
-    - ``shutdown_event``              -- shutdown signal
-    - ``canceled_req_ids``            -- request cancellation set
-    - ``waiting_queue``               -- pre-active queue
-    - ``responses`` + ``result_wait_queues`` -- per-request response
-                                                fan-out
-    - ``is_shutdown``                 -- one-way latch (cross-thread)
+    Plain-loop bring-up scope
+    -------------------------
+
+    The fields below are what the plain executor loop needs. PP /
+    disagg / control-action additions land as those features are
+    wired:
+
+    * ``executor_request_queue`` (``ExecutorRequestQueue``) --
+      cross-thread request inbox. Main thread enqueues; loop thread
+      drains via ``ScheduleConcern.handle_batch``. Cancellations
+      and shutdown also flow through this queue (as marker items)
+      so a single thread-safe channel carries every API->loop
+      message; the loop's ``ScheduleConcern`` dispatches each
+      marker to the appropriate per-iter destination
+      (``ctx.port.is_shutdown`` for shutdown; cancel IDs go into
+      the SCHEDULE_0 write view's ``canceled_req_ids`` field, which
+      ``ResponseConcern`` reads at RESPOND_8).
+    * ``shutdown_event`` (``threading.Event``) -- set by the loop
+      thread after the loop exits cleanly. Main thread waits on
+      this in :meth:`PyExecutorCoro.shutdown`.
+    * ``is_shutdown`` (bool) -- set by ``ScheduleConcern`` when it
+      sees the shutdown marker in the request queue. Read by the
+      SCHEDULER iter's drain check. Also drives early-return in
+      ``ClientChannel.await_*`` so main-thread waiters don't block
+      forever past shutdown. NOT a one-shot event because both
+      threads only READ it after the loop sets it -- a plain bool
+      with the publishing happens-before the read covers it.
+
+    What does NOT belong here
+    -------------------------
+
+    Anything LOOP-thread-only -- even if it's a buffer that a few
+    concerns share -- belongs in :class:`BatchStorage` (within-
+    batch concern->concern data), in ``ctx.svc.*`` (cross-batch
+    shared state), in a SCHEDULER iter local (batch-to-batch
+    handoff), or on a concern instance (private latch), NOT on
+    :class:`MessagePort`. Putting it here advertises "cross-thread,
+    may need locking" and misleads readers and future maintainers.
+    Examples that belonged here in earlier drafts but moved out
+    once the threading audit clarified:
+
+    * ``canceled_req_ids`` -- main thread NEVER touches it
+      directly (cancellations cross the boundary as queue
+      markers). Now flows through ``BatchStorage`` --
+      ``ScheduleConcern`` writes ``w0.canceled_req_ids`` at
+      SCHEDULE_0 from the dispatched marker IDs;
+      ``ResponseConcern`` reads ``r8.canceled_req_ids`` at
+      RESPOND_8.
+
+    The response output side of the boundary -- ``responses`` dict +
+    cv + per-request streaming sinks -- is owned by
+    :class:`ClientChannel` (in :mod:`concerns.services`) rather than
+    here, because ClientChannel adds the loop-side write-API
+    (:meth:`enqueue`) that concerns call. ``MessagePort`` would
+    otherwise grow a write-only / read-only split surface that
+    duplicates ClientChannel's role.
+
+    Future fields (PP / disagg / control):
+
+    * ``control_request_queue`` + ``control_request_barrier`` +
+      ``control_action_done`` -- ``control_action`` CM rendezvous.
     """
 
     executor_request_queue: "ExecutorRequestQueue" = None
+    shutdown_event: threading.Event = dataclasses.field(
+        default_factory=threading.Event)
+    is_shutdown: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
 class Context:
     """The single object passed to every coroutine in the loop layer.
 
-    Wraps the five buckets. Threaded as an argument through the loop
-    function, the SCHEDULER iter, the BATCH body, and every concern's
-    ``handle_batch(self, ctx)``. Passing it explicitly (rather than
-    via a ContextVar) keeps the dependency surface visible at every
-    call.
+    Wraps the four buckets. Threaded as an argument through the loop
+    function, the SCHEDULER iter, the BATCH body, and every
+    concern's ``handle_batch(self, ctx)``. Passing it explicitly
+    (rather than via a ContextVar) keeps the dependency surface
+    visible at every call.
 
     The "freely accessible" rule
     ----------------------------
 
     Anything in ``ctx`` is FREELY ACCESSIBLE to any code on the loop
     thread. That is the point: no plumbing for cross-cutting deps,
-    no construction-order constraints for peer-concern access. The
-    flip side: anything you don't want freely accessible MUST NOT live
-    in ``ctx``. Push it onto a concern instance via construction-time
+    no construction-order constraints for service access. The flip
+    side: anything you don't want freely accessible MUST NOT live in
+    ``ctx``. Push it onto a concern instance via construction-time
     kwargs in ``PyExecutorCoro.__init__`` (see ``concerns.py``).
 
-    This is the lever that keeps the design honest. A new "service" in
-    ``ctx.svc`` is now a public dependency that any concern can grab;
-    a kwarg on a single concern's ``__init__`` is private to that
-    concern.
+    This is the lever that keeps the design honest. A new "service"
+    in ``ctx.svc`` is now a public dependency that any concern can
+    grab; a kwarg on a single concern's ``__init__`` is private to
+    that concern.
+
+    Why no ``crn: Concerns`` field
+    ==============================
+
+    Concerns DO NOT receive ``ctx.crn`` -- they MUST NOT reach for
+    peer concerns. The constraint is mechanical, not just
+    convention: the bag of concern instances lives on
+    :class:`PyExecutorCoro` as a side-channel and is passed as a
+    SEPARATE argument to ``run_loop`` / ``scheduler_iter`` /
+    ``batch_body`` (the orchestrators that legitimately need it).
+    Concerns receive only ``ctx``.
+
+    Rationale -- the four homes for cross-concern data, and which
+    one a given case goes to:
+
+    1. **Within-batch concern->concern data** (e.g.,
+       ``ScheduleConcern`` writes ``scheduled_batch`` at
+       SCHEDULE_0; everyone else reads it at later phases) goes
+       through ``BatchStorage`` via the typed read / write views
+       returned by ``enter_phase`` / ``batch_phase``. The
+       happens-before rule and per-phase view narrowing are the
+       design's contract; "secret" peer method calls
+       (``ctx.crn.X.method(...)``) would bypass it.
+
+    2. **Batch-to-batch handoff** (one batch's terminal output is
+       the next batch's input -- the canonical example is HC1 in
+       the overlap loop: batch N-1's ``sample_state`` becomes
+       batch N's ``previous_tensors_device`` at SCHEDULE_0) is
+       the SCHEDULER iter's job. ONLY the SCHEDULER speaks of
+       "iter": it reads the prior batch's terminal read view,
+       computes the bridge value, and stuffs it into the next
+       batch's SCHEDULE_0 write view. No concern-to-concern
+       channel involved.
+
+    3. **Cross-batch shared state** -- cumulative state with
+       multiple writers / multiple readers across many batches,
+       e.g., spec_decode's rolling-acceptance gate written by
+       ``response`` after each finished request and read by
+       ``schedule`` at every batch's SCHEDULE_0 -- lives on a
+       SHARED SERVICE in ``ctx.svc.*``. Both sides go through a
+       single owner-typed surface; neither reaches the other's
+       concern internals.
+
+    4. **A concern's PRIVATE cross-batch state** -- a latch or
+       counter that ONLY one concern reads and writes, observed
+       from each per-batch invocation -- is just an instance
+       attribute on that concern. No mention on ``ctx`` at all.
+
+    Removing ``ctx.crn`` makes (1)-(4) enforceable at
+    compile-by-grep: ``rg "ctx\\.crn" tensorrt_llm/_torch/
+    pyexecutor/concerns/`` should always be empty.
 
     Why no ``batch: BatchStorage`` field
     ====================================
@@ -348,16 +471,16 @@ class Context:
        immutable-identity property.
 
     2. **Bypasses access control.** The runtime gates per-batch
-       access through ``(r, w) = await enter_phase(P)`` views and (in
-       ``TLLM_COROUTINE_TRACK_STORAGE=1`` debug mode) through
+       access through ``(r, w) = await enter_phase(P)`` views and
+       (in ``TLLM_COROUTINE_TRACK_STORAGE=1`` debug mode) through
        ``_TrackedReadView`` / ``_TrackedWriteView`` proxies. Direct
        ``ctx.batch.<field>`` access skips all of this and silently
        re-grants every concern "everything access" -- exactly the
        outcome the freely-accessible rule above warns against.
 
     3. **Wrong source of truth.** The runtime already exposes the
-       active batch via the ``_active_storage`` ContextVar, scoped to
-       the currently-running ``step`` call. ``ctx.batch`` would
+       active batch via the ``_active_storage`` ContextVar, scoped
+       to the currently-running ``step`` call. ``ctx.batch`` would
        either duplicate or contradict it.
 
     Per-batch data goes through ``enter_phase(BatchPhase.X)``. Always.
@@ -367,9 +490,9 @@ class Context:
     conf: Configuration
     state: PersistentState
     port: MessagePort
-    crn: "Concerns"
 
     # NO ``batch`` field -- see "Why no batch" above.
+    # NO ``crn`` field -- see "Why no crn" above.
 
 
 # --------------------------------------------------------------------------- #
@@ -382,8 +505,9 @@ class Context:
 # passing alternative. Both have a place; the rule is:
 #
 # - Use ``ctx`` for everything not needed by the runtime itself
-#   (services, config, state, port, concerns). Explicit > implicit
-#   when the receiver opts in.
+#   (services, config, state, port). Explicit > implicit when the
+#   receiver opts in. The ``Concerns`` bag is NOT on ``ctx``; it's
+#   passed as a separate orchestrator-only argument.
 #
 # - Use ContextVars for runtime-active values that change PER STEP and
 #   would otherwise need every coroutine signature to plumb them

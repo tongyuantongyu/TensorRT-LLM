@@ -51,12 +51,12 @@ from tensorrt_llm._torch.pyexecutor.coroutines import (
     Batch,
     Concern,
     again,
-    enter_phase,
     phased_field,
     resume,
     try_resume,
 )
 from tensorrt_llm._torch.pyexecutor.coroutines import batch_phase as _generic_batch_phase
+from tensorrt_llm._torch.pyexecutor.coroutines import enter_phase as _generic_enter_phase
 from tensorrt_llm._torch.pyexecutor.coroutines import step as _generic_step
 from tensorrt_llm._torch.pyexecutor.coroutines import try_step as _generic_try_step
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -329,6 +329,22 @@ class BatchStorage:
     can_queue: Optional[bool] = phased_field(BatchPhase.SCHEDULE_0)
     """Whether every TP rank has a non-empty scheduled batch this iter."""
 
+    # Producer: ``schedule`` concern at SCHEDULE_0 -- collected
+    # while dispatching ``RequestQueueItem.is_canceled_request``
+    # markers from the cross-thread executor_request_queue.
+    # Consumer: ``response`` at RESPOND_8 -- ``finish_by_reason``
+    # for matching pool entries; the response-build loop then
+    # picks them up as ``is_finished``.
+    #
+    # Per-iter only. The legacy ``self.canceled_req_ids`` list
+    # also re-kept IDs that couldn't be cancelled this iter
+    # (disagg in-progress); the plain loop has no such state, so
+    # the field is fully consumed at RESPOND_8 and not read again.
+    # Cross-iter retention for disagg lands as a service or as a
+    # response-concern attribute when that path is wired.
+    canceled_req_ids: Optional[List[int]] = phased_field(BatchPhase.SCHEDULE_0)
+    """Request IDs cancelled by the API since the last iter."""
+
     # OVERLAP-ONLY. Plain and PP discard the second return value of
     # ``_can_queue`` (no consumer needs it).
     #
@@ -405,8 +421,8 @@ class BatchStorage:
 
     # OVERLAP-ONLY. The half-concern HC1 produce-half on this batch.
     #
-    # Producer: SCHEDULER (HC1 cross-iter bridge code that runs
-    # *between* step calls in the scheduler iter). Reads
+    # Producer: SCHEDULER (HC1 batch-to-batch bridge code that
+    # runs *between* step calls in the scheduler iter). Reads
     # ``prev.sample_state.device`` (or, when the draft model ran
     # in-bridge, ``target_inputs`` from ``_handle_speculative_decoding``)
     # and writes the value into curr's storage at SCHEDULE_0.
@@ -463,11 +479,12 @@ class BatchStorage:
     #     ``previous_batch``). PP: iter ``N+(n-1)`` inside
     #     ``_handle_executed_batch``, after host data has arrived via the
     #     ring.
-    #   - SCHEDULER at next iter's HC1 cross-iter bridge (OVERLAP-ONLY):
-    #     reads ``prev.sample_state.device`` to feed curr's
-    #     ``previous_tensors_device`` (and, when ``has_draft_batch``, feeds
-    #     ``_handle_speculative_decoding`` which produces ``target_inputs``
-    #     and ``num_accepted_tokens_device``).
+    #   - SCHEDULER at next iter's HC1 batch-to-batch bridge
+    #     (OVERLAP-ONLY): reads ``prev.sample_state.device`` to feed
+    #     curr's ``previous_tensors_device`` (and, when
+    #     ``has_draft_batch``, feeds ``_handle_speculative_decoding``
+    #     which produces ``target_inputs`` and
+    #     ``num_accepted_tokens_device``).
     #   - SCHEDULER at SYNC_EVT_5 (PP last rank only): reads
     #     ``sample_state.sampler_event`` and synchronizes -- the explicit
     #     D2H sync that fills ``sample_state.host`` with real tokens before
@@ -532,6 +549,11 @@ class _ReadAtResourcePrep_1(_ReadAtSchedule_0, Protocol):
     @property
     def can_queue(self) -> bool:
         """Whether every TP rank has a non-empty scheduled batch this iter."""
+        ...
+
+    @property
+    def canceled_req_ids(self) -> List[int]:
+        """Request IDs cancelled by the API since the last iter."""
         ...
 
     @property
@@ -638,6 +660,8 @@ class _WriteAtSchedule_0:
     """The scheduled set of requests this batch will run."""
     can_queue: Optional[bool] = None
     """Whether every TP rank has a non-empty scheduled batch this iter."""
+    canceled_req_ids: Optional[List[int]] = None
+    """Request IDs cancelled by the API since the last iter."""
     can_queue_this_rank: Optional[bool] = None
     """Whether THIS specific rank has a non-empty scheduled batch."""
     fitting_disagg_gen_init_requests: Optional[List[LlmRequest]] = None
@@ -710,6 +734,12 @@ class _WriteAtFinalize_9:
 
 @overload
 async def step(
+    handle: None,
+    *,
+    through: BatchPhase,
+) -> Tuple[None, None]: ...
+@overload
+async def step(
     handle: Batch,
     *,
     through: Literal[BatchPhase.SCHEDULE_0],
@@ -772,6 +802,12 @@ async def step(
 
 @overload
 async def try_step(
+    handle: None,
+    *,
+    through: BatchPhase,
+) -> Tuple[None, None]: ...
+@overload
+async def try_step(
     handle: Batch,
     *,
     through: Literal[BatchPhase.SCHEDULE_0],
@@ -830,6 +866,48 @@ async def try_step(
     *,
     through: Literal[BatchPhase.FINALIZE_9],
 ) -> Optional[Tuple[_ReadAtAll, None]]: ...
+
+
+@overload
+async def enter_phase(
+    p: Literal[BatchPhase.SCHEDULE_0],
+) -> Tuple[None, _WriteAtSchedule_0]: ...
+@overload
+async def enter_phase(
+    p: Literal[BatchPhase.RESOURCE_PREP_1],
+) -> Tuple[_ReadAtResourcePrep_1, _WriteAtResourcePrep_1]: ...
+@overload
+async def enter_phase(
+    p: Literal[BatchPhase.FORWARD_2],
+) -> Tuple[_ReadAtForward_2, _WriteAtForward_2]: ...
+@overload
+async def enter_phase(
+    p: Literal[BatchPhase.SAMPLE_3],
+) -> Tuple[_ReadAtSample_3, _WriteAtSample_3]: ...
+@overload
+async def enter_phase(
+    p: Literal[BatchPhase.STATE_UPD_4],
+) -> Tuple[_ReadAtStateUpd_4, _WriteAtStateUpd_4]: ...
+@overload
+async def enter_phase(
+    p: Literal[BatchPhase.SYNC_EVT_5],
+) -> Tuple[_ReadAtSyncEvt_5, _WriteAtSyncEvt_5]: ...
+@overload
+async def enter_phase(
+    p: Literal[BatchPhase.HANDOFF_6],
+) -> Tuple[_ReadAtHandoff_6, _WriteAtHandoff_6]: ...
+@overload
+async def enter_phase(
+    p: Literal[BatchPhase.APPLY_7],
+) -> Tuple[_ReadAtApply_7, _WriteAtApply_7]: ...
+@overload
+async def enter_phase(
+    p: Literal[BatchPhase.RESPOND_8],
+) -> Tuple[_ReadAtRespond_8, _WriteAtRespond_8]: ...
+@overload
+async def enter_phase(
+    p: Literal[BatchPhase.FINALIZE_9],
+) -> Tuple[_ReadAtFinalize_9, _WriteAtFinalize_9]: ...
 
 
 @overload
@@ -902,6 +980,22 @@ async def step(handle, *, through):  # type: ignore[misc]
 async def try_step(handle, *, through):  # type: ignore[misc]
     """``try_step`` narrowed for :class:`BatchStorage` -- see overloads above."""
     return await _generic_try_step(handle, through=through)
+
+
+async def enter_phase(p):  # type: ignore[misc]
+    """``enter_phase`` narrowed for :class:`BatchStorage` -- see overloads above.
+
+    Concern-level primitive. ``r, w = await enter_phase(BatchPhase.X)``
+    yields ``(read_view_at_X, write_view_at_X)`` typed by the
+    overload chain so ``r.<field>`` / ``w.<field>`` resolve to the
+    proper per-phase ``_ReadAt<X>`` / ``_WriteAt<X>`` shapes.
+
+    The BATCH layer wraps the same call in :func:`batch_phase` for
+    ``async with`` use; concerns call this directly (no nesting CM
+    needed -- ``_active_phase`` belongs to the enclosing batch's
+    CM, not the concerns'.).
+    """
+    return await _generic_enter_phase(p)
 
 
 def batch_phase(p):  # type: ignore[misc]
