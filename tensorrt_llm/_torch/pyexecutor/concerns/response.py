@@ -139,6 +139,15 @@ class ResponseConcern:
         for req in finished:
             ctx.svc.termination.terminate(req)
 
+        # PP-only inflight-id release. Pair-half of
+        # ``PpScheduleConcern.handle_batch``'s ``mark_inflight`` --
+        # the scheduler's ``inflight_req_ids`` set keeps these IDs
+        # invisible until tokens land, then this releases them so
+        # the next iter can re-schedule. Single-rank skips (no
+        # inflight tracking outside PP).
+        if ctx.svc.dist.pp_size > 1 and r8.scheduled_batch is not None:
+            ctx.svc.pool.unmark_inflight(r8.scheduled_batch)
+
         # Publish the finished list to the RESPOND_8 write view so
         # FINALIZE_9-phase concerns (iter_stats, ...) can read it.
         w8.finished_requests = finished

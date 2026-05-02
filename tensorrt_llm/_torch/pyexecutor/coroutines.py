@@ -804,7 +804,7 @@ async def disable_hang_detect() -> AsyncIterator[None]:
         await _yield_hang_control(disabled=False)
 
 
-async def resume(child: "Concern") -> None:
+async def resume(child: Optional["Concern"]) -> None:
     """Batch-only primitive: drive ``child`` through the current phase's work.
 
     ``child`` is a :class:`Concern` handle wrapping the concern coroutine.
@@ -816,9 +816,16 @@ async def resume(child: "Concern") -> None:
     ``batch_phase`` CM views at the next phase, not through this
     primitive's return.
 
-    Fast path: if ``child.done`` (the concern coroutine already
-    completed on a previous ``resume`` / ``try_resume``), this is a
-    no-op and returns immediately without entering the Driver.
+    Fast paths:
+
+    - ``child is None`` -- returns immediately without entering the
+      Driver. Lets BATCH bodies drop ``if x is not None:`` guards
+      around optional concerns (e.g. PP-only concerns that aren't
+      wired in single-rank mode). Symmetric with
+      :func:`step` / :func:`try_step` accepting ``None``.
+    - ``child.done`` (the concern coroutine already completed on a
+      previous ``resume`` / ``try_resume``) -- no-op, returns
+      immediately.
 
     Strict on retry: if ``child`` yields ``await again()``, ``resume``
     raises ``RuntimeError`` — the call site declared retry to be a
@@ -828,7 +835,7 @@ async def resume(child: "Concern") -> None:
     Raises if called outside a ``batch_phase`` CM (``_active_phase``
     is ``None``).
     """
-    if child.done:
+    if child is None or child.done:
         return
     p = _active_phase.get()
     if p is None:
@@ -845,7 +852,7 @@ async def resume(child: "Concern") -> None:
         )
 
 
-async def try_resume(child: "Concern") -> bool:
+async def try_resume(child: Optional["Concern"]) -> bool:
     """Like :func:`resume`, but report retry instead of raising.
 
     Returns ``True`` if ``child`` progressed past the current phase
@@ -854,14 +861,19 @@ async def try_resume(child: "Concern") -> bool:
     cascade (``await again()`` itself) or skip the child for this
     pass.
 
-    Fast path: if ``child.done`` (the concern coroutine already
-    completed on a previous call), returns ``True`` immediately
-    without entering the Driver — semantically "the concern made it
-    past every phase by way of finishing".
+    Fast paths:
+
+    - ``child is None`` -- returns ``True`` immediately. Semantically
+      "the absent concern made it past every phase by way of not
+      existing"; lets BATCH bodies drop ``if x is not None:`` guards
+      around optional concerns. Symmetric with
+      :func:`step` / :func:`try_step` accepting ``None``.
+    - ``child.done`` (already completed on a previous call) --
+      returns ``True`` immediately.
 
     Like :func:`resume`, must be called inside a ``batch_phase`` CM.
     """
-    if child.done:
+    if child is None or child.done:
         return True
     p = _active_phase.get()
     if p is None:

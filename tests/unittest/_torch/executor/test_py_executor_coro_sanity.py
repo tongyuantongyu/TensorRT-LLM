@@ -58,25 +58,40 @@ def _patch_in_pyexecutor_coro(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize(
-    "disable_overlap_scheduler",
-    [True, False],
-    ids=["plain", "overlap"],
+    "disable_overlap_scheduler,pipeline_parallel_size",
+    [
+        (True, 1),
+        (False, 1),
+        (True, 2),
+    ],
+    ids=["plain", "overlap", "pp2"],
 )
 def test_py_executor_coro_runs_tinyllama_end_to_end(
     monkeypatch,
     disable_overlap_scheduler,
+    pipeline_parallel_size,
 ):
     """One prompt in, one response out, clean shutdown.
 
-    Parametrized over both scheduler-iter variants:
+    Parametrized over scheduler-iter variants:
 
     * ``plain`` -- ``scheduler_iter_plain``: one batch per iter
-      driven through every phase.
+      driven through every phase. Single rank.
     * ``overlap`` -- ``scheduler_iter_overlap``: two batches alive,
       ``current`` runs through STATE_UPD_4 while ``previous`` runs
       APPLY_7 -> FINALIZE_9 (the legacy overlap pattern -- HC1
-      batch-to-batch bridge of ``previous_tensors_device``).
+      batch-to-batch bridge of ``previous_tensors_device``). Single
+      rank.
+    * ``pp2`` -- ``scheduler_iter_pp`` with ``pp_size=2``. Requires
+      2 GPUs; the LLM API auto-launches the second rank. Skipped
+      automatically if fewer than 2 GPUs are visible.
     """
+    if pipeline_parallel_size > 1:
+        if not _HAS_CUDA or torch.cuda.device_count() < pipeline_parallel_size:
+            pytest.skip(
+                f"PP={pipeline_parallel_size} needs at least "
+                f"{pipeline_parallel_size} GPUs; have "
+                f"{torch.cuda.device_count() if _HAS_CUDA else 0}.")
 
     if monkeypatch is not None:
         _patch_in_pyexecutor_coro(monkeypatch)
@@ -94,7 +109,7 @@ def test_py_executor_coro_runs_tinyllama_end_to_end(
 
     sampling_params = SamplingParams(max_tokens=8)
 
-    with LLM(
+    llm_kwargs = dict(
         model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         kv_cache_config=kv_cache_config,
         max_batch_size=2,
@@ -103,7 +118,11 @@ def test_py_executor_coro_runs_tinyllama_end_to_end(
         # No CUDA graph -- the resource concern doesn't yet wire the
         # graph-capture-friendly attn_metadata path.
         cuda_graph_config=None,
-    ) as llm:
+    )
+    if pipeline_parallel_size > 1:
+        llm_kwargs["pipeline_parallel_size"] = pipeline_parallel_size
+
+    with LLM(**llm_kwargs) as llm:
         outputs = llm.generate(["A B C"], sampling_params=sampling_params)
 
     assert len(outputs) == 1, f"expected one RequestOutput, got {len(outputs)}"
@@ -125,12 +144,12 @@ def test_py_executor_coro_runs_tinyllama_end_to_end(
 if __name__ == '__main__':
     import sys
 
-    # Default: overlap (the new code path). ``legacy-overlap`` runs the
-    # original PyExecutor with overlap, no monkey-patching -- useful as
-    # a reference run for comparing token counts.
+    # Default: overlap (the new code path). ``legacy-*`` modes run
+    # the original PyExecutor with the matching variant, no monkey-
+    # patching -- useful as reference runs.
     mode = sys.argv[1] if len(sys.argv) > 1 else "overlap"
 
-    use_coro = mode not in ("legacy-plain", "legacy-overlap")
+    use_coro = mode not in ("legacy-plain", "legacy-overlap", "legacy-pp2")
     if use_coro:
         from tensorrt_llm._torch.pyexecutor import _util
         from tensorrt_llm._torch.pyexecutor.py_executor_coro import PyExecutorCoro
@@ -139,17 +158,37 @@ if __name__ == '__main__':
     if mode in ("plain", "both"):
         print("=== plain (PyExecutorCoro) ===", flush=True)
         test_py_executor_coro_runs_tinyllama_end_to_end(
-            None, disable_overlap_scheduler=True)
+            None,
+            disable_overlap_scheduler=True,
+            pipeline_parallel_size=1)
     if mode in ("overlap", "both"):
         print("=== overlap (PyExecutorCoro) ===", flush=True)
         test_py_executor_coro_runs_tinyllama_end_to_end(
-            None, disable_overlap_scheduler=False)
+            None,
+            disable_overlap_scheduler=False,
+            pipeline_parallel_size=1)
+    if mode == "pp2":
+        print("=== pp2 (PyExecutorCoro) ===", flush=True)
+        test_py_executor_coro_runs_tinyllama_end_to_end(
+            None,
+            disable_overlap_scheduler=True,
+            pipeline_parallel_size=2)
     if mode == "legacy-plain":
         print("=== plain (legacy PyExecutor) ===", flush=True)
         test_py_executor_coro_runs_tinyllama_end_to_end(
-            None, disable_overlap_scheduler=True)
+            None,
+            disable_overlap_scheduler=True,
+            pipeline_parallel_size=1)
     if mode == "legacy-overlap":
         print("=== overlap (legacy PyExecutor) ===", flush=True)
         test_py_executor_coro_runs_tinyllama_end_to_end(
-            None, disable_overlap_scheduler=False)
+            None,
+            disable_overlap_scheduler=False,
+            pipeline_parallel_size=1)
+    if mode == "legacy-pp2":
+        print("=== pp2 (legacy PyExecutor) ===", flush=True)
+        test_py_executor_coro_runs_tinyllama_end_to_end(
+            None,
+            disable_overlap_scheduler=True,
+            pipeline_parallel_size=2)
     print("=== done ===", flush=True)

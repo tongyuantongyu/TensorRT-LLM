@@ -130,8 +130,9 @@ if TYPE_CHECKING:
     from .forward import ForwardConcern
     from .resource import ResourceConcern
     from .response import ResponseConcern
+    from .ring_broadcast import RingBroadcastSampleConcern
     from .sample import SampleConcern
-    from .schedule import ScheduleConcern
+    from .schedule import PpScheduleConcern, ScheduleConcern
     from .state_advance import StateAdvanceConcern
 
 
@@ -189,24 +190,35 @@ class Concerns:
     # profile: Optional["ProfileConcern"] = None
     # iter_stats: Optional["IterStatsConcern"] = None
     # ...
+    ring_broadcast: Optional["RingBroadcastSampleConcern"] = None
 
+
+import typing as _typing  # noqa: E402
 
 from .forward import ForwardConcern  # noqa: E402
 from .resource import ResourceConcern  # noqa: E402
 from .response import ResponseConcern  # noqa: E402
+from .ring_broadcast import RingBroadcastSampleConcern  # noqa: E402
 from .sample import SampleConcern  # noqa: E402
-from .schedule import ScheduleConcern  # noqa: E402
+from .schedule import PpScheduleConcern, ScheduleConcern  # noqa: E402
 from .services import ClientChannel, RequestPool, TerminationService  # noqa: E402
 from .shared import fail_requests  # noqa: E402
 from .state_advance import StateAdvanceConcern  # noqa: E402
+
+# Re-bind the ``Optional[...]`` field default so dataclasses sees a
+# concrete type at module-load time (the forward-ref string only
+# resolves when ``get_type_hints`` is called, which we don't do).
+_ = _typing  # keep ``typing`` imported for consistency with future fields.
 
 __all__ = [
     "ClientChannel",
     "Concerns",
     "ForwardConcern",
+    "PpScheduleConcern",
     "RequestPool",
     "ResourceConcern",
     "ResponseConcern",
+    "RingBroadcastSampleConcern",
     "SampleConcern",
     "ScheduleConcern",
     "StateAdvanceConcern",

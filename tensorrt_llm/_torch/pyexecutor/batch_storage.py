@@ -402,23 +402,6 @@ class BatchStorage:
 
     # PP-ONLY.
     #
-    # Producer: SCHEDULER (assigned at batch creation -- the SCHEDULER
-    # iterates ``microbatch_id = (microbatch_id + 1) % num_micro_batches``
-    # every iter and stamps the new batch with that index).
-    #
-    # Consumers:
-    #
-    #   - ``ring_broadcast_sample`` distributed concern at HANDOFF_6+:
-    #     uses ``self.send_handles[microbatch_id]`` to slot the per-batch
-    #     isend handle. ``self.send_expected_batch_num_handles`` and
-    #     ``self.send_schedule_handles`` follow the same per-slot pattern
-    #     (HC5 / HC5a / HC5b inside their respective distributed concerns
-    #     / scheduler-direct ``retire_vote``).
-    #   - ``iter_stats.process_iter_stats`` at FINALIZE_9 (passes
-    #     ``microbatch_id % pp_size`` to the stats aggregator).
-    microbatch_id: Optional[int] = phased_field(BatchPhase.SCHEDULE_0)
-    """The PP slot ring index for this batch (``iter_counter mod n``)."""
-
     # OVERLAP-ONLY. The half-concern HC1 produce-half on this batch.
     #
     # Producer: SCHEDULER (HC1 batch-to-batch bridge code that
@@ -577,11 +560,6 @@ class _ReadAtResourcePrep_1(_ReadAtSchedule_0, Protocol):
         ...
 
     @property
-    def microbatch_id(self) -> int:
-        """The PP slot ring index for this batch (``iter_counter mod n``)."""
-        ...
-
-    @property
     def previous_tensors_device(self) -> SampleStateTensors:
         """Forward-input device tensors threaded in from the previous batch."""
         ...
@@ -670,8 +648,6 @@ class _WriteAtSchedule_0:
     """Disagg gen-init requests packaged as a ScheduledRequests holder for resource prep."""
     num_fitting_reqs: Optional[int] = None
     """Number of regular (non-disagg-gen-init) requests that fit."""
-    microbatch_id: Optional[int] = None
-    """The PP slot ring index for this batch (``iter_counter mod n``)."""
     previous_tensors_device: Optional[SampleStateTensors] = None
     """Forward-input device tensors threaded in from the previous batch."""
     num_accepted_tokens_device: Optional[torch.Tensor] = None

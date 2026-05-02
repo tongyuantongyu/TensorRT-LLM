@@ -18,9 +18,9 @@ except Exception:
 
 from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
-                                 mpi_disabled, mpi_isend, mpi_isend_object,
-                                 mpi_recv, mpi_recv_object, mpi_send,
-                                 mpi_send_object, mpi_world_size,
+                                 mpi_disabled, mpi_irecv_object, mpi_isend,
+                                 mpi_isend_object, mpi_recv, mpi_recv_object,
+                                 mpi_send, mpi_send_object, mpi_world_size,
                                  torch_pybind11_abi)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
@@ -664,6 +664,13 @@ class MPIDist(Distributed):
 
     def recv_object(self, src, tag=0):
         return mpi_recv_object(src, tag)
+
+    def irecv_object(self, src, tag=0):
+        # Non-blocking pickle-based recv. Returns an ``MPI.Request``;
+        # caller polls via ``request.test()`` (returns
+        # ``(done, obj_or_None)``) or blocks on ``request.wait()``
+        # (returns the object).
+        return mpi_irecv_object(src, tag)
 
     @property
     def tp_comm(self):

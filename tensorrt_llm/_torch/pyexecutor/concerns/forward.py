@@ -5,11 +5,15 @@ The BATCH body calls :meth:`run` directly inside its
 ``async with batch_phase(BatchPhase.FORWARD_2)`` block and writes
 the returned outputs into the write view.
 
-Scope: single rank, no draft model, no kv_connector
-``wait_for_save`` (no kv_connector wired yet). The distributed
-``forward`` concern (PP NCCL p2p, HC7) lands later as a separate
-``DistributedForwardConcern`` or as additional phases on this
-class.
+Scope: single rank OR multi-PP-rank. PP NCCL p2p (HC7) lives
+inside ``model_engine.forward`` so this concern only needs to
+discriminate "this rank produces useful logits to sample" -- only
+the last PP rank does. On non-last PP ranks, ``forward`` is still
+called (its NCCL sends activations to the next rank) but the
+returned dict carries no usable logits, so this method returns
+``None`` and the SAMPLE_3 phase produces a placeholder
+``sample_state`` for slot-ring shape parity (see
+:class:`SampleConcern`).
 
 ``new_tensors_device`` and ``num_accepted_tokens_device`` are
 overlap-loop inputs (see :func:`scheduler_iter_overlap` --
@@ -103,6 +107,14 @@ class ForwardConcern:
                 num_accepted_tokens_device=num_accepted_tokens_device,
             )
         torch.cuda.current_stream().wait_stream(self._execution_stream)
+        if not ctx.svc.dist.is_last_pp_rank:
+            # Non-last PP rank: ``model_engine.forward`` still ran
+            # (its NCCL p2p sent activations to the next rank), but
+            # the returned dict carries no logits this rank can
+            # sample from. Drop it; SAMPLE_3 will produce a
+            # placeholder ``sample_state`` so the slot ring sees a
+            # uniform shape.
+            return None
         return outputs
 
 

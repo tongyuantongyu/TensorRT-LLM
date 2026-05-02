@@ -27,6 +27,8 @@ ADP, no spec-decode draft seeding, no benchmark-disagg gate):
   - Terminate any ``paused_requests`` from the scheduler output
     (V1 scheduler path; V2 manages KV suspend internally).
 
+PP variant: see :class:`PpScheduleConcern` below.
+
 The other concerns at SCHEDULE_0 in the planned design (``disagg``
 probes, ``spec_decode`` gating, ``iter_stats`` init, ...) are not
 yet implemented; they will land at this phase as separate concerns
@@ -45,6 +47,8 @@ from ..batch_storage import BatchPhase, enter_phase
 from ..coroutines import disable_hang_detect
 from ..executor_request_queue import RequestQueueItem
 from ..llm_request import LlmRequest
+from ..pp_helpers import (pp_broadcast_request_items,
+                           pp_schedule_and_propagate)
 from ..request_utils import merge_requests_to_llm_requests
 from ..scheduler import ScheduledRequests
 from .shared import fail_requests
@@ -275,4 +279,124 @@ class ScheduleConcern:
         w0.canceled_req_ids = canceled_ids
 
 
-__all__ = ["ScheduleConcern"]
+class PpScheduleConcern(ScheduleConcern):
+    """Pipeline-parallel SCHEDULE_0 driver.
+
+    Two-phase coroutine: SCHEDULE_0 does the work (fetch /
+    broadcast / schedule / propagate / mark inflight); FINALIZE_9
+    waits on this batch's outstanding PP isend handles so they
+    complete before the batch is retired.
+
+    Differences vs the plain :class:`ScheduleConcern`:
+
+    1. **rk0 -> all-PP-rank request-item broadcast** -- only rk0's
+       ``MessagePort`` is wired to the cross-thread executor
+       request queue, so non-rk0 ranks would never see new
+       requests / shutdown markers / cancel markers without this
+       broadcast. :func:`pp_broadcast_request_items` ring-
+       propagates the freshly-fetched item list along the PP
+       forward chain so every rank's local classification +
+       admission step sees the same items. Without this step
+       non-rk0 ranks would ``KeyError`` on the very first request
+       in :func:`pp_schedule_and_propagate`'s deserialize path
+       because their pool would be empty.
+    2. **Schedule call uses ``pp_schedule_and_propagate``** -- rk0
+       runs the local scheduler and serializes the decision, the
+       PP forward chain ring-propagates it (rk0 -> rk1 -> ... ->
+       rk(n-1)), and non-rk0 ranks deserialize against their own
+       active-request pool. Identical request set ends up scheduled
+       on every rank -- that is what makes the rest of the
+       per-batch coroutine intra-batch.
+    3. **Inflight ID tracking** -- the legacy PP scheduler reads
+       ``inflight_req_ids`` to skip requests already in-flight
+       through the pipeline (added at SCHEDULE_0, removed at
+       RESPOND_8 inside ``handle_executed_batch``). Ported here
+       as ``ctx.svc.pool.mark_inflight(...)`` after schedule;
+       the pair-half ``unmark_inflight(...)`` lives at
+       :class:`ResponseConcern` RESPOND_8 (PP only).
+    4. **Per-batch isend handles** -- the items-broadcast and
+       schedule-propagate isends are held as locals in this
+       coroutine; the FINALIZE_9 phase waits on them. No
+       per-microbatch slot ring (that was the legacy's
+       ``send_schedule_handles[mid]``).
+
+    NOT yet ported:
+
+    * disagg ``_pp_retry_until_can_schedule`` retry loop (no
+      disagg in the bring-up).
+    * ADP ``enable_attention_dp`` broadcast (no ADP in the
+      bring-up).
+    """
+
+    async def handle_batch(self, ctx: "Context") -> None:
+        # ---- SCHEDULE_0 ----
+        r0, w0 = await enter_phase(BatchPhase.SCHEDULE_0)
+
+        # 1. rk0 fetches; broadcast the item list to every PP rank
+        # so the rest of the rank-local pipeline (classify -> admit
+        # -> deserialize-schedule) sees the same input.
+        if ctx.svc.dist.rank == 0:
+            idle = (len(ctx.svc.pool) == 0 and not self._waiting_queue)
+            if idle:
+                async with disable_hang_detect():
+                    fetched = self._fetch_request_items(ctx)
+            else:
+                fetched = self._fetch_request_items(ctx)
+        else:
+            fetched = []
+        fetched, items_isend = pp_broadcast_request_items(
+            ctx.svc.dist, fetched)
+
+        # 2. Each rank classifies its (broadcast) copy. Shutdown
+        # and cancel markers fire locally on every rank as a
+        # result.
+        normal, canceled_ids = self._classify_special_items(ctx, fetched)
+
+        # 3. Validate + admit + pop into pool.
+        self._admit_new_requests(ctx, normal)
+        self._pop_to_pool(ctx)
+
+        # 4. PP schedule + propagate.
+        (scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs,
+         schedule_isend) = pp_schedule_and_propagate(
+            dist=ctx.svc.dist,
+            scheduler=self._scheduler,
+            active_requests=list(ctx.svc.pool),
+            inflight_req_ids=ctx.svc.pool.inflight_req_ids,
+        )
+
+        # 5. Paused-request lifecycle (V1 scheduler only).
+        if not self._scheduler_manages_kv_suspend:
+            for req in scheduled_batch.paused_requests:
+                ctx.svc.termination.terminate(req)
+            for req in scheduled_batch.paused_requests:
+                req.pause(self._max_input_len)
+
+        # 6. can_queue gate. Single-rank shortcut applies on each
+        # rank independently here -- attention-DP / TP-allgather
+        # variants will need the full ``_can_queue`` body.
+        can_queue = scheduled_batch.batch_size > 0
+
+        # 7. Inflight tracking (PP-only): mark the freshly-scheduled
+        # request set so future iters skip it until tokens land.
+        # Pair-half ``unmark_inflight`` runs at RESPOND_8 in
+        # :class:`ResponseConcern`'s PP path.
+        if can_queue:
+            ctx.svc.pool.mark_inflight(scheduled_batch)
+
+        # 8. Publish.
+        w0.scheduled_batch = scheduled_batch
+        w0.can_queue = can_queue
+        w0.canceled_req_ids = canceled_ids
+
+        # ---- FINALIZE_9 ----
+        # Wait on this batch's outstanding PP isends. Held as locals
+        # on this coroutine -- no slot ring, no cross-batch state.
+        await enter_phase(BatchPhase.FINALIZE_9)
+        if items_isend is not None:
+            items_isend.wait()
+        if schedule_isend is not None:
+            schedule_isend.wait()
+
+
+__all__ = ["ScheduleConcern", "PpScheduleConcern"]

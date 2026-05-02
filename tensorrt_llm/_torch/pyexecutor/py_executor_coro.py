@@ -67,15 +67,17 @@ from typing import (TYPE_CHECKING, Any, List, Optional, Union)
 
 import torch
 
-from .batch_storage import BatchPhase, BatchStorage, batch_phase, step
+from .batch_storage import BatchPhase, BatchStorage, batch_phase, step, try_step
 from .concerns import (ClientChannel, Concerns, ForwardConcern,
-                       RequestPool, ResourceConcern, ResponseConcern,
+                       PpScheduleConcern, RequestPool, ResourceConcern,
+                       ResponseConcern, RingBroadcastSampleConcern,
                        SampleConcern, ScheduleConcern, StateAdvanceConcern,
                        TerminationService, fail_requests)
 from .context import (Configuration, Context, MessagePort, PersistentState,
                       Service)
-from .coroutines import Batch, Concern, Driver, resume
+from .coroutines import Batch, Concern, Driver, again, resume, try_resume
 from .executor_request_queue import ExecutorRequestQueue
+from .pp_helpers import ring_broadcast_executed_batch_num
 from .resource_manager import KVCacheManagerV2, ResourceManagerType
 
 if TYPE_CHECKING:
@@ -95,12 +97,15 @@ if TYPE_CHECKING:
 async def batch_body(ctx: Context, crn: Concerns) -> None:
     """One per-batch coroutine. Drives all participating concerns.
 
-    Loop-agnostic body: the same per-batch lifecycle works for both
-    the plain loop (``scheduler_iter_plain`` drives one batch through
-    every phase per iter) and the overlap loop
-    (``scheduler_iter_overlap`` drives ``current`` through STATE_UPD_4
-    and ``previous`` through FINALIZE_9 each iter -- the body's
-    yield set is the same; only the scheduler's interleave changes).
+    Loop-agnostic body: the same per-batch lifecycle works for all
+    three scheduler-iter variants -- ``scheduler_iter_plain`` (one
+    batch per iter, every phase), ``scheduler_iter_overlap``
+    (``current`` driven through STATE_UPD_4 interleaved with
+    ``previous`` driven through FINALIZE_9 each iter), and
+    ``scheduler_iter_pp`` (``in_flight`` deque of ``pp_size - 1``
+    parked batches, polling pass + retire). The body's yield set
+    is the same across all three; only the scheduler's interleave
+    changes.
 
     Phases yielded:
 
@@ -126,11 +131,18 @@ async def batch_body(ctx: Context, crn: Concerns) -> None:
       apply sampled tokens to the requests).
     * RESPOND_8: response (build + enqueue + terminate) + resource
       (update_resources / free finished)
-    * FINALIZE_9: no concerns yet; iter-stats / perf-metric
-      concerns will land here.
+    * FINALIZE_9: PP-only multi-phase concerns wait on their
+      per-batch isend handles here (``schedule`` waits on the
+      schedule-broadcast / items-broadcast isends;
+      ``ring_broadcast`` waits on its sample-state isend).
+      Becomes the home for ``iter_stats`` / ``perf_metric`` once
+      those land.
 
-    The intermediate phases SYNC_EVT_5 and HANDOFF_6 are PP-only and
-    not entered by the plain / overlap variants.
+    The intermediate phase HANDOFF_6 is PP-only -- the
+    :class:`RingBroadcastSampleConcern` does its hop there.
+    SYNC_EVT_5 is unused in the coroutine model (the per-batch
+    sample coroutine handles its own sampler_event sync inside
+    APPLY_7).
 
     The ``async with batch_phase(P): ...`` blocks let the runtime
     interleave concerns at each phase. ``await resume(handle)`` on
@@ -152,6 +164,8 @@ async def batch_body(ctx: Context, crn: Concerns) -> None:
     resource = Concern(crn.resource.handle_batch(ctx))
     sample = Concern(crn.sample.handle_batch(ctx))
     response = Concern(crn.response.handle_batch(ctx))
+    ring_broadcast = (Concern(crn.ring_broadcast.handle_batch(ctx))
+                      if crn.ring_broadcast is not None else None)
 
     async with batch_phase(BatchPhase.SCHEDULE_0):
         await resume(schedule)
@@ -161,14 +175,6 @@ async def batch_body(ctx: Context, crn: Concerns) -> None:
 
     async with batch_phase(BatchPhase.FORWARD_2) as (r, w):
         if r.can_queue:
-            # ForwardConcern is a single-phase method (per the
-            # planned-concerns table). The BATCH body invokes it
-            # directly and writes the produced ``batch_outputs``
-            # into the FORWARD_2 write view -- so SAMPLE_3
-            # consumers see it through the read view. The
-            # ``previous_tensors_device`` / ``num_accepted_tokens_device``
-            # inputs are SCHEDULE_0 fields (the OVERLAP scheduler's
-            # batch-to-batch bridge writes them; plain leaves None).
             w.batch_outputs = crn.forward.run(
                 ctx,
                 r.scheduled_batch,
@@ -181,23 +187,26 @@ async def batch_body(ctx: Context, crn: Concerns) -> None:
 
     async with batch_phase(BatchPhase.STATE_UPD_4) as (r, _):
         if r.can_queue:
-            # ``advance`` does both ctx state advance (chunk
-            # position, GENERATION_* transitions, optional
-            # TO_COMPLETE jump on ctx->gen) AND gen TO_COMPLETE
-            # marking (overlap only). Both halves flip
-            # ``set_exclude_last_generation_logits(False)`` and so
-            # MUST run after prev's RESPOND -- the OVERLAP scheduler
-            # encodes this by suspending curr between SAMPLE_3 and
-            # STATE_UPD_4 and driving prev through FINALIZE_9 first.
-            # See ``StateAdvanceConcern`` for the full rationale.
             crn.state_advance.advance(ctx, r.scheduled_batch)
 
+    # HANDOFF_6: PP-only HC10 ring-broadcast hop. Mirrors the
+    # bounded polling loop inside ``RingBroadcastSampleConcern``:
+    # ``pp_size - 2`` ``try_resume`` rounds with cascade-``again()``
+    # if the concern asked to retry, then a final ``resume`` (no
+    # retry allowed) which falls into the concern's ``else``-arm
+    # blocking wait. Single-rank / plain / overlap have
+    # ``ring_broadcast=None``; the concern call short-circuits via
+    # the ``resume(None)`` no-op.
+    async with batch_phase(BatchPhase.HANDOFF_6):
+        for _ in range(ctx.svc.dist.pp_size - 2):
+            if await try_resume(ring_broadcast):
+                break
+            else:
+                await again()
+        else:
+            await resume(ring_broadcast)
+
     async with batch_phase(BatchPhase.APPLY_7):
-        # sample.update_requests blocks on THIS batch's
-        # sampler_event then writes sampled tokens onto requests.
-        # In overlap, this runs one iter AFTER the sample_async --
-        # giving the GPU time to complete the sample kernel while
-        # the next batch's forward is queued.
         await resume(sample)
 
     async with batch_phase(BatchPhase.RESPOND_8):
@@ -205,11 +214,8 @@ async def batch_body(ctx: Context, crn: Concerns) -> None:
         await resume(resource)
 
     async with batch_phase(BatchPhase.FINALIZE_9):
-        # No concerns participate at FINALIZE_9 yet. The phase
-        # exists so iter_stats can later read RESPOND_8's
-        # ``finished_requests`` here without colliding with its
-        # producer.
-        pass
+        await resume(schedule)
+        await resume(ring_broadcast)
 
 
 async def scheduler_iter_plain(ctx: Context, crn: Concerns) -> None:
@@ -312,7 +318,14 @@ async def scheduler_iter_overlap(ctx: Context, crn: Concerns) -> None:
        APPLY in step 4 -> prev RESPOND in step 6 sequence.
 
     Shutdown drain: when no more work to admit AND pool is empty AND
-    waiting queue is empty, drain the final ``previous`` and return.
+    waiting queue is empty AND no ``previous`` is parked, return.
+    Until then the loop keeps iterating; once shutdown is signalled
+    but ``previous`` is still parked, ``current`` is built as
+    ``None`` and the per-step ``step(None, ...)`` no-ops carry the
+    body through unchanged so the only useful work that iter is
+    draining ``previous`` to FINALIZE_9. After that iter ``previous``
+    is promoted to ``None`` (= the new ``current``) and the next
+    iter's termination check returns.
 
     Catastrophic-error handler: fails the active pool and re-raises.
     """
@@ -320,73 +333,194 @@ async def scheduler_iter_overlap(ctx: Context, crn: Concerns) -> None:
     # Read view from previous's SAMPLE_3 step -- exposes
     # ``sample_state`` (produced at SAMPLE_3) so step 2's HC1 bridge
     # can read it. Held across iters.
-    previous_view: Optional[object] = None
+    previous_view = None
 
     while True:
-        # Drain check. We can stop only if there's nothing left to
-        # admit, the pool is empty, AND no leftover ``previous``.
+        # Termination: nothing to admit AND nothing parked. The loop
+        # may still take one extra iter past the shutdown signal --
+        # see the docstring's "Shutdown drain" note: when ``previous``
+        # is still parked we run one more iter with ``current=None``
+        # to drain it, after which the next iter's check returns.
         more_to_admit = (not ctx.port.is_shutdown
                          or not ctx.svc.pool.is_drained()
                          or not crn.schedule.waiting_queue_empty())
-        if not more_to_admit:
-            try:
-                # No-op when ``previous is None``; otherwise drain
-                # the final batch (apply tokens, respond, finalize)
-                # so its requests get their last response and its
-                # resources are freed.
-                await step(previous, through=BatchPhase.FINALIZE_9)
-            except Exception as exc:
-                try:
-                    fail_requests(ctx, list(ctx.svc.pool), str(exc))
-                finally:
-                    ctx.port.is_shutdown = True
-                    ctx.port.shutdown_event.set()
-                raise
+        if not more_to_admit and previous is None:
             return
 
-        storage = BatchStorage()
-        current = Batch(batch_body(ctx, crn), storage)
+        # Build ``current`` only if we're still admitting work.
+        # When draining (``current=None``) the step(None, ...) no-op
+        # convention turns every per-step call below into a no-op,
+        # so the only effective work this iter is draining
+        # ``previous`` to FINALIZE_9.
+        current: Optional[Batch] = None
+        if more_to_admit:
+            storage = BatchStorage()
+            current = Batch(batch_body(ctx, crn), storage)
 
+        # Body: 7 phase-driving steps + promote, per the docstring's
+        # "Steps (per iter)". Steps 1, 3, 5, 7 act on ``current``
+        # (no-ops when ``current`` is None during drain); steps 4
+        # and 6 advance ``previous``. Step 2 (HC1 bridge) is the
+        # only place we write into ``current``'s storage directly
+        # rather than via ``step`` -- guard on ``w_sched is not
+        # None`` so the no-op path stays no-op.
         try:
-            # 1. SCHEDULE_0 of current.
             _, w_sched = await step(current, through=BatchPhase.SCHEDULE_0)
-
-            # 2. HC1 bridge: prev's sample_state.device ->
-            #    current's previous_tensors_device. Skip when no
-            #    previous (first iter), or previous had can_queue=
-            #    False (no sample produced).
-            if previous is not None:
-                prev_sample_state = previous_view.sample_state
-                if prev_sample_state is not None:
-                    w_sched.previous_tensors_device = prev_sample_state.device
-
-            # 3. Drive current through FORWARD_2 (RESOURCE_PREP_1
-            #    + FORWARD_2). Suspends at SAMPLE_3.
+            if (w_sched is not None
+                    and previous is not None
+                    and previous_view.sample_state is not None):
+                w_sched.previous_tensors_device = previous_view.sample_state.device
             await step(current, through=BatchPhase.FORWARD_2)
-
-            # 4. Drive previous through APPLY_7 -- before curr's
-            #    SAMPLE_3 so curr's sampler reads fresh num_tokens
-            #    (invariant 1). No-op when previous is None.
             await step(previous, through=BatchPhase.APPLY_7)
-
-            # 5. Drive current through SAMPLE_3 -- queues sampler
-            #    kernel; suspends at STATE_UPD_4.
             r_sample, _ = await step(current, through=BatchPhase.SAMPLE_3)
-
-            # 6. Drive previous through FINALIZE_9 -- RESPOND_8
-            #    + FINALIZE_9. No-op when previous is None.
             await step(previous, through=BatchPhase.FINALIZE_9)
-
-            # 7. Drive current through STATE_UPD_4 -- runs state
-            #    advance (ctx + gen) AFTER prev's RESPOND
-            #    (invariant 2). Current is now suspended at APPLY_7,
-            #    held until next iter's step 4.
             await step(current, through=BatchPhase.STATE_UPD_4)
+            previous, previous_view = current, r_sample
+        except Exception as exc:
+            try:
+                fail_requests(ctx, list(ctx.svc.pool), str(exc))
+            finally:
+                ctx.port.is_shutdown = True
+                ctx.port.shutdown_event.set()
+            raise
 
-            # 8. Promote.
-            previous = current
-            previous_view = r_sample
 
+async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
+    """Top-level loop coroutine -- PIPELINE PARALLEL variant.
+
+    Works for any ``pp_size >= 2``. Each rank runs an identical
+    copy of this scheduler-iter; cross-rank coordination happens
+    inside the per-batch concerns and inside two scheduler-direct
+    calls (HC9 retire-vote, HC10 ring-broadcast hop driven via
+    the per-batch :class:`RingBroadcastSampleConcern`).
+
+    Per-rank in-flight model
+    ------------------------
+
+    The SCHEDULER holds a :class:`collections.deque` of in-flight
+    :class:`Batch` handles, age order **left=oldest, right=newest**:
+
+    * ``deque[-1]``  (= ``k=1`` -- the most-recently-scheduled
+      batch, one iter old).
+    * ``deque[0]``   (= ``k=n-1`` -- the oldest in-flight batch,
+      n-1 iters old). All ranks retire this batch this iter.
+    * Intermediate slots: parked, get one ``test()`` poll per
+      iter via the per-iter ``try_step`` pass below.
+
+    For ``pp_size == 2``: deque max size = 1, so ``deque[-1] ==
+    deque[0]``; the same batch's HANDOFF_6 work and FINALIZE_9
+    work happen in the same iter. Functionally collapses cleanly
+    out of the same code path used for n>2.
+
+    Per-iter steps
+    --------------
+
+    1. **Build current; drive through STATE_UPD_4.** Runs
+       SCHEDULE_0 (PP-propagated), RESOURCE_PREP_1, FORWARD_2
+       (NCCL p2p hands activations to the next PP rank),
+       SAMPLE_3 (real on last rank, placeholder elsewhere),
+       STATE_UPD_4. ``current`` is now suspended at HANDOFF_6.
+    2. **Pick the retire deadline.** If
+       ``len(deque) == n-1`` (steady state) OR ``not more_to_admit``
+       (drain), pop ``deque[0]`` -- the rest of the body knows it
+       as ``retired`` and drives it past HANDOFF_6 in step 4.
+    3. **Polling pass.** ``try_step`` every batch STILL IN
+       ``in_flight`` (i.e. excluding ``retired``) through
+       ``HANDOFF_6``. The :class:`RingBroadcastSampleConcern`
+       posts its ``irecv`` on the first call and polls
+       ``request.test()`` on subsequent calls -- each ``test()``
+       drives MPI's progress engine, so the polling itself is
+       productive even when the message hasn't arrived.
+       ``try_step`` returns ``None`` when the concern yielded
+       ``await again()``; the SCHEDULER moves on to the next
+       batch. On the LAST PP rank, ``deque[-1]``'s HANDOFF_6
+       immediately issues the source-isend (no ``again()``) and
+       ``try_step`` returns the read view in one call.
+    4. **Drive ``retired`` through FINALIZE_9.** This is the
+       deadline drive for ``retired``'s HANDOFF_6: by this iter
+       the polling pass has called ``try_step`` on it
+       ``pp_size - 2`` times across previous iters (one round
+       each); this final drive uses ``step`` (not ``try_step``),
+       so the concern's ``for ... else`` polling loop falls into
+       its ``else`` arm and BLOCKING-waits on the recv -- which
+       is the ``pp_size - 1``-th and last round. After HANDOFF_6
+       completes, ``step(through=FINALIZE_9)`` carries the batch
+       through APPLY_7 + RESPOND_8 + FINALIZE_9 (which waits on
+       this batch's own isend handle). No-op when ``retired`` is
+       ``None``.
+    5. **HC9 retire-vote.** rk0 sends ``executed_batch_num``
+       (1 if step 4 retired something, 0 otherwise) along the PP
+       forward chain via blocking ``send_object``.
+    6. **Push ``current`` to deque right** (now k=0 this iter,
+       becomes k=1 next iter). Skip when draining.
+
+    Shutdown drain
+    --------------
+
+    When ``more_to_admit`` flips False, the loop keeps running
+    iters with ``current=None`` (the per-step ``step(None, ...)``
+    no-ops carry the body through unchanged) until ``in_flight``
+    drains. Each drain iter still does steps 2-5 so the PP
+    forward chain stays in lockstep across ranks. Step (2)'s
+    ``retiring`` condition includes ``not more_to_admit``, so the
+    deque is drained one batch per iter -- ``pp_size - 1`` iters
+    total in the worst case. After the deque is empty AND no new
+    batch is admitted, the next iter's termination check returns.
+    """
+    if ctx.svc.dist.pp_size < 2:
+        raise NotImplementedError(
+            "scheduler_iter_pp: requires pp_size >= 2; "
+            f"got pp_size={ctx.svc.dist.pp_size}.")
+    if crn.ring_broadcast is None:
+        raise RuntimeError(
+            "scheduler_iter_pp: requires Concerns.ring_broadcast to be "
+            "set (PyExecutorCoro.__init__ wires this when pp_size > 1).")
+
+    pp_size = ctx.svc.dist.pp_size
+    # Per-rank in-flight batch ring. Left=oldest (k=n-1, retiring
+    # this iter when full), right=newest (k=1, last-rank source-
+    # isend this iter). Max size = n-1.
+    in_flight: collections.deque = collections.deque()
+    in_flight_max = pp_size - 1
+
+    while True:
+        # Termination: nothing to admit AND nothing parked.
+        # During shutdown drain we keep iterating until the deque
+        # empties; see "Shutdown drain" in the docstring.
+        more_to_admit = (not ctx.port.is_shutdown
+                         or not ctx.svc.pool.is_drained()
+                         or not crn.schedule.waiting_queue_empty())
+        if not more_to_admit and not in_flight:
+            return
+
+        # Build ``current`` only if we're still admitting work.
+        # When draining (``current=None``) the step(None, ...)
+        # no-op convention turns the curr-side calls below into
+        # no-ops, leaving the polling pass + retire as the only
+        # effective work this iter.
+        current: Optional[Batch] = None
+        if more_to_admit:
+            storage = BatchStorage()
+            current = Batch(batch_body(ctx, crn), storage)
+
+        # Body: 6 steps from the docstring's "Per-iter steps".
+        # ``current=None`` (drain) makes step (1) a no-op via the
+        # ``step(None)`` convention and step (6) is gated explicitly;
+        # steps (2)-(5) are unchanged from the steady state.
+        try:
+            await step(current, through=BatchPhase.STATE_UPD_4)
+            retired = None
+            if len(in_flight) >= in_flight_max or not more_to_admit:
+                retired = in_flight.popleft()
+            for parked in in_flight:
+                await try_step(parked, through=BatchPhase.HANDOFF_6)
+            await step(retired, through=BatchPhase.FINALIZE_9)
+            ring_broadcast_executed_batch_num(
+                dist=ctx.svc.dist,
+                executed_batch_num=1 if retired is not None else 0,
+            )
+            if current is not None:
+                in_flight.append(current)
         except Exception as exc:
             try:
                 fail_requests(ctx, list(ctx.svc.pool), str(exc))
@@ -559,10 +693,16 @@ class PyExecutorCoro:
                 f"PyExecutorCoro: only beam_width=1 is supported in the "
                 f"plain-loop bring-up (got max_beam_width={max_beam_width})."
             )
-        if dist.pp_size > 1:
+        if dist.pp_size > 1 and not disable_overlap_scheduler:
+            # Bring-up: PP loop only with non-overlap mode (the
+            # SCHEDULER's HC10 hop already gives the ring its
+            # cross-iter overlap; combining with the in-rank
+            # overlap path needs the spec_decode HC1 in-bridge,
+            # which isn't wired yet).
             raise NotImplementedError(
-                "PyExecutorCoro: pipeline parallelism is not yet "
-                "implemented; the plain-loop bring-up is single-rank.")
+                "PyExecutorCoro: PP + overlap_scheduler is not yet "
+                "implemented; use disable_overlap_scheduler=True with "
+                "pp_size>1.")
 
         # Signature-only kwargs (parity but not used by the plain-
         # loop bring-up): max_draft_len, max_total_draft_tokens
@@ -640,16 +780,32 @@ class PyExecutorCoro:
         exclude_last_generation_logits = (not disable_overlap_scheduler
                                           and dist.pp_size == 1)
 
+        # Schedule concern: PP variant when pp_size>1 (does
+        # rk0-side schedule + ring propagate + inflight tracking),
+        # plain otherwise. Same constructor surface (the PP variant
+        # subclasses the plain one and adds no ctor args -- per-
+        # batch isend handles live as locals on the per-batch
+        # coroutine).
+        schedule_cls = PpScheduleConcern if dist.pp_size > 1 else ScheduleConcern
+        schedule_concern = schedule_cls(
+            scheduler=scheduler,
+            sampler=sampler,
+            waiting_queue=waiting_queue,
+            max_num_active_requests=model_engine.get_max_num_sequences(),
+            exclude_last_generation_logits=exclude_last_generation_logits,
+            scheduler_manages_kv_suspend=scheduler_manages_kv_suspend,
+            max_input_len=max_input_len,
+        )
+        # Per-batch HC10 ring-broadcast concern. Single instance,
+        # invoked once per :class:`Batch` via
+        # :meth:`RingBroadcastSampleConcern.handle_batch`. No ctor
+        # state -- each per-batch coroutine holds its own isend
+        # handle as a local and waits at FINALIZE_9.
+        ring_broadcast_concern = (
+            RingBroadcastSampleConcern() if dist.pp_size > 1 else None)
+
         crn = Concerns(
-            schedule=ScheduleConcern(
-                scheduler=scheduler,
-                sampler=sampler,
-                waiting_queue=waiting_queue,
-                max_num_active_requests=model_engine.get_max_num_sequences(),
-                exclude_last_generation_logits=exclude_last_generation_logits,
-                scheduler_manages_kv_suspend=scheduler_manages_kv_suspend,
-                max_input_len=max_input_len,
-            ),
+            schedule=schedule_concern,
             resource=ResourceConcern(
                 resource_manager=resource_manager,
             ),
@@ -671,6 +827,7 @@ class PyExecutorCoro:
                 stream_interval=getattr(model_engine.llm_args,
                                          "stream_interval", 1),
             ),
+            ring_broadcast=ring_broadcast_concern,
         )
 
         # ----- Configuration + PersistentState. -----
@@ -693,10 +850,13 @@ class PyExecutorCoro:
         # ``start_worker`` can hand it to ``run_loop`` as a
         # separate arg.
         self._loop_crn = crn
-        # SCHEDULER iter variant -- plain or overlap.
-        self._scheduler_iter_fn = (
-            scheduler_iter_plain
-            if disable_overlap_scheduler else scheduler_iter_overlap)
+        # SCHEDULER iter variant -- plain / overlap / PP.
+        if dist.pp_size > 1:
+            self._scheduler_iter_fn = scheduler_iter_pp
+        elif disable_overlap_scheduler:
+            self._scheduler_iter_fn = scheduler_iter_plain
+        else:
+            self._scheduler_iter_fn = scheduler_iter_overlap
 
         # ----- Legacy-API surface stash. -----
         # The LLM-API layer (in ``executor.base_worker`` and

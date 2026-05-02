@@ -66,15 +66,39 @@ class RequestPool:
     """Single owner of the executor-wide ``active_requests`` list.
 
     Plain-loop scope: just a thin wrapper around a Python list with
-    add / remove / iterate / count. PP / ADP additions
-    (``inflight_req_ids``, attention-DP dummy padding, ADP routing
-    bookkeeping) will land as those features are wired up; the
-    method surface below is the contract concerns / utilities call
-    against, so growing it is local to this class.
+    add / remove / iterate / count.
+
+    PP additions:
+
+    * ``inflight_req_ids`` -- a ``ReqIdsSet`` (C++ binding) the
+      ``MicroBatchScheduler`` consults to skip requests already in
+      flight through the pipeline. Mutated via :meth:`mark_inflight`
+      / :meth:`unmark_inflight`. Initialized lazily so single-rank
+      paths don't pay the binding cost.
+
+    Future ADP additions (attention-DP dummy padding, ADP routing
+    bookkeeping) will land as those features are wired up.
     """
 
     def __init__(self) -> None:
         self._active: List[LlmRequest] = []
+        self._inflight_req_ids = None  # lazy ``ReqIdsSet``
+
+    @property
+    def inflight_req_ids(self):
+        """Bound C++ ``ReqIdsSet`` of in-flight request IDs.
+
+        Lazily initialised on first access so single-rank paths
+        avoid the binding import. Read by ``schedule_request`` to
+        skip requests that are mid-pipeline; written by
+        :meth:`mark_inflight` (PP SCHEDULE_0) /
+        :meth:`unmark_inflight` (PP RESPOND_8).
+        """
+        if self._inflight_req_ids is None:
+            from tensorrt_llm.bindings.internal.batch_manager import \
+                ReqIdsSet
+            self._inflight_req_ids = ReqIdsSet()
+        return self._inflight_req_ids
 
     # -- mutation -------------------------------------------------------- #
 
@@ -103,6 +127,29 @@ class RequestPool:
         if not gone:
             return
         self._active = [req for req in self._active if req not in gone]
+
+    def mark_inflight(self, scheduled_batch) -> None:
+        """Mark every request in ``scheduled_batch`` as in-flight.
+
+        Mirrors the legacy ``_add_inflight_ids``. Only context
+        requests on their LAST chunk + generation requests are
+        added: non-final context chunks should stay schedulable so
+        the scheduler can keep feeding chunks of the same prefill
+        through the pipeline without starving.
+        """
+        ids = self.inflight_req_ids
+        for req in scheduled_batch.context_requests_last_chunk:
+            ids.insert(req.request_id)
+        for req in scheduled_batch.generation_requests:
+            ids.insert(req.request_id)
+
+    def unmark_inflight(self, scheduled_batch) -> None:
+        """Inverse of :meth:`mark_inflight`. Pair-half at PP RESPOND_8."""
+        ids = self.inflight_req_ids
+        for req in scheduled_batch.context_requests_last_chunk:
+            ids.erase(req.request_id)
+        for req in scheduled_batch.generation_requests:
+            ids.erase(req.request_id)
 
     # -- query ----------------------------------------------------------- #
 

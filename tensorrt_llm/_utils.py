@@ -679,6 +679,16 @@ def mpi_recv_object(source, tag):
     return None
 
 
+def mpi_irecv_object(source, tag):
+    # Non-blocking pickle-based recv. Returns an ``MPI.Request`` that
+    # the caller polls via ``request.test()`` (returns
+    # ``(done: bool, obj_or_None)``) or blocks on via
+    # ``request.wait()`` (returns the deserialized object).
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().irecv(source=source, tag=tag)
+    return None
+
+
 def pad_vocab_size(vocab_size, tp_size):
     return int(math.ceil(vocab_size / tp_size) * tp_size)
 
