@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     # (in ``concerns/services.py``).
     from .concerns import (  # noqa: F401
         ClientChannel,
+        RecvOffload,
         RequestPool,
         TerminationService,
     )
@@ -158,10 +159,19 @@ class Service:
          resource-free + ``result_wait_queues`` cleanup. Methods:
          ``terminate(req)`` (replaces ``_terminate_request`` +
          ``_do_terminate_request``).
+       * ``recv_offload: RecvOffload`` (PP only; ``None`` on
+         single-rank executors) -- single-worker thread pool that
+         runs blocking ``recv_object`` calls so coroutines can
+         poll the resulting :class:`concurrent.futures.Future`
+         instead of an MPI Request. Required because
+         ``mpi4py.util.pkl5`` does not implement non-blocking
+         ``irecv`` for pickled objects; the legacy executor's
+         dedicated ``broadcast_sample_state_handler`` thread
+         played the same role.
 
     The ``fail_requests(ctx, reqs, msg)`` utility (free function
-    in ``concerns/_shared.py``) composes all three: marks state,
-    removes from pool, enqueues error responses, terminates.
+    in ``concerns/_shared.py``) composes ``pool``, ``client``,
+    and ``termination``.
 
     Almost every other "service" in the legacy
     ``PyExecutor.__init__`` belongs to a single concern and should
@@ -198,10 +208,10 @@ class Service:
     | handler``                 | (svc.termination)          |
     +---------------------------+----------------------------+
 
-    Member count discipline: HIGH BAR for adding a fourth service
-    beyond the four above (``dist``, ``pool``, ``client``,
-    ``termination``). Anything new must be used by multiple
-    concerns AND have no natural single-owner concern.
+    Member count discipline: HIGH BAR for adding to this list
+    beyond the five above (``dist``, ``pool``, ``client``,
+    ``termination``, ``recv_offload``). Anything new must be used
+    by multiple concerns AND have no natural single-owner concern.
     """
 
     # --- Always available ---
@@ -211,9 +221,11 @@ class Service:
     pool: "RequestPool" = None
     client: "ClientChannel" = None
     termination: "TerminationService" = None
+    # PP-only; ``None`` on single-rank executors.
+    recv_offload: "RecvOffload" = None
 
     # Add more ONLY if a candidate fails the "single owner concern"
-    # test above. If you find yourself adding a 5th field, audit the
+    # test above. If you find yourself adding a 6th field, audit the
     # candidates first.
 
 

@@ -7,11 +7,15 @@ Per-batch coroutine. The legacy implementation runs the ring on a
 dedicated bcast thread that uses BLOCKING ``recv_object`` calls --
 the thread parallelism hides the recv latency behind the main
 thread's other work. The coroutine implementation has only the
-loop thread, so a blocking ``recv_object`` everywhere would block
-the SCHEDULER. The replacement pattern shifts the polling work
-to rk0 ONLY (matching legacy's "rk0 is the queue authority"
-pattern) and lets the other ranks do a single blocking wait at
-deadline:
+loop thread, but mpi4py's pkl5 communicator (used by TRT-LLM)
+explicitly does NOT support non-blocking ``irecv`` for pickled
+objects. So we offload the blocking recv to a single-worker
+thread pool (:class:`RecvOffload`, exposed as
+``ctx.svc.recv_offload``) and the coroutine polls the resulting
+:class:`concurrent.futures.Future`. Polling work is shifted to
+rk0 ONLY (matching legacy's "rk0 is the queue authority"
+pattern); the other ranks do a single blocking ``future.result()``
+wait at deadline:
 
 * HANDOFF_6 entry: sync ``sampler_event`` (correctness on the
   source -- host data must be valid before it is isend'd; backpressure
@@ -25,26 +29,28 @@ deadline:
     no polling, no wait. The batch is trivially past HANDOFF_6 the
     moment the isend returns -- the SCHEDULER's force-finalize on
     this rank is therefore always a no-op pass-through.
-  - **rk0 (the polling rank)**: post a non-blocking ``irecv``,
-    then ``for _ in range(pp_size - 2): test() | again()``
-    followed by ``for ... else: wait()`` -- ``pp_size - 1`` rounds
-    total. The first ``pp_size - 2`` come from the SCHEDULER's
-    per-iter polling pass (``try_step(parked, HANDOFF_6)`` lets the
-    ``await again()`` cascade back to the SCHEDULER so other batches
-    in the deque get their polling rounds too). The last round (the
-    ``else`` arm) runs when the SCHEDULER drives the batch with
-    ``step`` instead of ``try_step`` -- only happens for the deadline
-    batch when rk0 didn't manage to opportunistically retire it
-    earlier.
-  - **Other intermediate ranks (rk1 .. rk(N-2))**: post a non-blocking
-    ``irecv``, then a single direct blocking ``wait()``. NO polling
-    loop, NO ``await again()``. These ranks don't independently
-    decide retirement; they follow rk0's HC9 vote (see
+  - **rk0 (the polling rank)**: submit the recv to
+    ``ctx.svc.recv_offload`` (returns a future), then
+    ``for _ in range(pp_size - 2): future.done() | again()``
+    followed by a final ``future.result()`` -- ``pp_size - 1``
+    rounds total. The first ``pp_size - 2`` come from the
+    SCHEDULER's per-iter polling pass (``try_step(parked,
+    HANDOFF_6)`` lets the ``await again()`` cascade back to the
+    SCHEDULER so other batches in the deque get their polling
+    rounds too). The last round is the ``future.result()`` call
+    AFTER the for loop, which blocks if the future isn't already
+    done -- only happens for the deadline batch when rk0 didn't
+    manage to opportunistically retire it earlier.
+  - **Other intermediate ranks (rk1 .. rk(N-2))**: submit the
+    recv, then a single direct ``future.result()`` (blocks until
+    the worker thread's recv completes). NO polling loop, NO
+    ``await again()``. These ranks don't independently decide
+    retirement; they follow rk0's HC9 vote (see
     ``scheduler_iter_pp``) and force-finalize K batches per iter.
-    Each force-finalize blocks on this single ``wait()`` -- which
-    completes promptly because rk0 wouldn't have voted K unless its
-    K isends to rk1 had already been posted, and the chain
-    propagates.
+    Each force-finalize blocks on this single ``result()`` --
+    which completes promptly because rk0 wouldn't have voted K
+    unless its K isends to rk1 had already been posted, and the
+    chain propagates.
 
   After ``recv``, intermediate ranks ``pp_intermediate_isend`` to
   the next ring neighbor (returns ``None`` for the second-to-last
@@ -245,43 +251,33 @@ class RingBroadcastSampleConcern:
             # is a no-op pass-through.
             send_handle = pp_source_isend(dist, sample_state)
         else:
-            # Non-source: post irecv. The recv-strategy splits on
+            # Non-source: submit a blocking recv to the offload
+            # pool (returns a future). The recv-strategy splits on
             # whether this rank is the polling authority (rk0) or
             # a follower.
-            recv_handle = pp_post_recv_sample_state(dist)
-            recv_payload: Optional[tuple] = None
+            recv_future = pp_post_recv_sample_state(
+                dist, ctx.svc.recv_offload)
 
             if dist.rank == 0:
                 # POLLING (rk0 only). The SCHEDULER's per-iter
                 # polling pass calls ``try_step(.., HANDOFF_6)``
                 # on each parked batch; the i-th call advances the
-                # for-loop body by one round (``test`` + ``await
-                # again`` if not done). Up to ``pp_size - 2``
-                # opportunistic rounds; the ``else`` arm is the
-                # deadline blocking wait, fired when the SCHEDULER
-                # drives this batch with ``step`` (no retry) at
-                # the deadline iter -- happens only if rk0 didn't
-                # opportunistically retire the batch earlier.
+                # for-loop body by one round (``future.done()`` +
+                # ``await again()`` if not done). Up to
+                # ``pp_size - 2`` opportunistic rounds. The final
+                # ``future.result()`` below is the deadline -- it
+                # blocks if the future isn't already done, fired
+                # when the SCHEDULER drives this batch with
+                # ``step`` (no retry) and rk0 didn't manage to
+                # opportunistically retire it earlier.
                 for _ in range(dist.pp_size - 2):
-                    done, recv_payload = recv_handle.test()
-                    if done:
+                    if recv_future.done():
                         break
                     await again()
-                else:
-                    recv_payload = recv_handle.wait()
-            else:
-                # FOLLOWING (rk1 .. rk(n-2)). No polling, no
-                # ``await again()``: the SCHEDULER doesn't poll
-                # these ranks. Each force-finalize per rk0's HC9
-                # vote enters this branch and blocks once on the
-                # recv. Brief block -- rk0 wouldn't have voted K
-                # unless its K isends to rk1 had been posted, and
-                # the chain propagates iter-by-iter through the
-                # other intermediates as their own scheduler
-                # iterations execute their own force-finalize +
-                # forward isend.
-                recv_payload = recv_handle.wait()
-
+            # Non-rk0 intermediates skip the polling loop entirely
+            # (no ``await again()``); they fall through to the
+            # blocking ``result()`` below directly.
+            recv_payload = recv_future.result()
             pp_apply_recv_sample_state(sample_state, recv_payload)
             # Forward isend (returns None on second-to-last).
             send_handle = pp_intermediate_isend(dist, sample_state)

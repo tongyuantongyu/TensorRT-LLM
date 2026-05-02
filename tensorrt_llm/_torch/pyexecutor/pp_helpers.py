@@ -63,6 +63,7 @@ What lives here:
 
 from __future__ import annotations
 
+import concurrent.futures  # noqa: F401  (used in type annotation strings)
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -72,6 +73,7 @@ from .scheduler.scheduler import SerializableSchedulerOutput
 
 if TYPE_CHECKING:
     from ..distributed import Distributed
+    from .concerns.services import RecvOffload
     from .executor_request_queue import RequestQueueItem
     from .model_engine import ModelEngine
     from .resource_manager import ResourceManager
@@ -367,24 +369,26 @@ def forward_step_inter_pp(
 
 
 # --------------------------------------------------------------------------- #
-# Ring broadcast (split into post-irecv, process-and-forward, source-isend)
+# Ring broadcast (split into post-recv, process-and-forward, source-isend)
 # --------------------------------------------------------------------------- #
 #
 # The legacy implementation does the recv as a BLOCKING ``recv_object``
-# call inside the bcast thread; the recv blocks the bcast thread, the
-# main thread keeps doing other work, and by the time the main thread
-# needs the data the bcast thread has produced it. The coroutine
-# implementation has only one (loop) thread, so a blocking ``recv_object``
+# call inside a dedicated bcast thread; the recv blocks that thread,
+# the main thread keeps doing other work, and by the time the main
+# thread needs the data the bcast thread has produced it. The coroutine
+# runtime has only one (loop) thread, so a blocking ``recv_object``
 # would block the SCHEDULER -- not just the per-batch coroutine that
-# owns the recv. The fix is to use a non-blocking ``irecv_object``:
-# post the request as soon as the per-batch coroutine reaches HANDOFF_6
-# the first time, then poll via ``request.test()`` on subsequent
-# scheduler iters (each call to ``test()`` also drives the underlying
-# MPI progress engine), yielding ``await again()`` between polls so the
-# scheduler can interleave other work. At the batch's deadline iter
-# (= the iter the SCHEDULER pops it for retire) the polling loop
-# either has already completed or the SCHEDULER's force-completion
-# busy-loop drives MPI to completion.
+# owns the recv. mpi4py's ``pkl5.Intracomm`` (used by TRT-LLM)
+# explicitly does NOT support non-blocking ``irecv`` for pickled
+# objects (it raises "unsupported"), so we can't get a true MPI Request
+# either. Instead, we offload the blocking ``recv`` to a single-worker
+# thread pool (:class:`RecvOffload`, exposed as ``ctx.svc.recv_offload``)
+# and the coroutine polls the resulting :class:`concurrent.futures.Future`:
+# post the recv on first entry to HANDOFF_6, poll ``future.done()`` on
+# subsequent scheduler iters with ``await again()`` between polls so
+# the scheduler can interleave other work, then call ``future.result()``
+# at the batch's deadline iter to block until the worker has finished
+# (immediate if the future is already done from earlier polling).
 #
 # Three split functions because each rank-role uses a different
 # subset:
@@ -392,11 +396,11 @@ def forward_step_inter_pp(
 # * Source rank (last PP rank): :func:`pp_source_isend` -- isend the
 #   freshly-sampled host tokens out (no recv side, no forward).
 # * Intermediate rank (rk0 .. rk(n-3)): :func:`pp_post_recv_sample_state`
-#   posts irecv from prev ring neighbor; once the recv completes the
+#   submits the recv to the offload pool; once the future completes the
 #   caller invokes :func:`pp_intermediate_isend` to forward to the
 #   next ring neighbor.
 # * Second-to-last rank (rk(n-2)): :func:`pp_post_recv_sample_state`
-#   posts irecv; no forward isend (terminus).
+#   submits the recv; no forward isend (terminus).
 #
 # All ``isend`` functions return the new MPI Request handle which the
 # caller MUST hold alive and ``.wait()`` on before the batch's
@@ -428,21 +432,30 @@ def pp_source_isend(
     )
 
 
-def pp_post_recv_sample_state(dist: "Distributed") -> object:
-    """Post the non-blocking recv for this rank's HC10 hop.
+def pp_post_recv_sample_state(
+    dist: "Distributed",
+    recv_offload: "RecvOffload",
+) -> "concurrent.futures.Future":
+    """Submit the (offloaded blocking) recv for this rank's HC10 hop.
 
-    Returns an ``MPI.Request``; caller polls via
-    ``request.test()`` -- the ``(done, payload)`` return -- until
-    done, then hands ``payload`` to
-    :func:`pp_apply_recv_sample_state` to install host tokens onto
-    ``sample_state``.
+    Returns a :class:`concurrent.futures.Future`; the caller polls
+    via ``future.done()`` (cheap thread-state check; the worker
+    thread's blocking ``recv`` drives MPI progress on its side) and
+    fetches the payload with ``future.result()``. Hand the payload
+    to :func:`pp_apply_recv_sample_state` to install host tokens
+    onto ``sample_state``.
 
     Tag uses :data:`PPCommTag.SAMPLE_STATE`; the matching ``isend``
     is issued by the previous ring neighbor (the last rank for
     rk0; rk(i-1) for intermediate ranks).
+
+    Why a future instead of an MPI Request: mpi4py's pkl5
+    communicator doesn't implement non-blocking ``irecv`` for
+    pickled objects. See the :class:`RecvOffload` docstring and
+    the module-level comment block above.
     """
-    return dist.irecv_object(
-        src=dist.prev_pp_rank,
+    return recv_offload.submit(
+        source=dist.prev_pp_rank,
         tag=PPCommTag.SAMPLE_STATE,
     )
 

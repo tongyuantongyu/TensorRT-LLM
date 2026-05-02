@@ -72,9 +72,10 @@ import torch
 
 from .batch_storage import BatchPhase, BatchStorage, batch_phase, step, try_step
 from .concerns import (ClientChannel, Concerns, ForwardConcern,
-                       PpScheduleConcern, RequestPool, ResourceConcern,
-                       ResponseConcern, RingBroadcastSampleConcern,
-                       SampleConcern, ScheduleConcern, StateAdvanceConcern,
+                       PpScheduleConcern, RecvOffload, RequestPool,
+                       ResourceConcern, ResponseConcern,
+                       RingBroadcastSampleConcern, SampleConcern,
+                       ScheduleConcern, StateAdvanceConcern,
                        TerminationService, fail_requests)
 from .context import (Configuration, Context, MessagePort, PersistentState,
                       Service)
@@ -890,11 +891,19 @@ class PyExecutorCoro:
             rank=dist.rank,
             gather_all_responses=False,
         )
+        # Single-worker thread pool that runs blocking ``recv_object``
+        # so coroutines on the loop thread can poll the resulting
+        # future. PP-only; on single-rank executors no concern needs
+        # async recv. Shut down explicitly in ``_run_loop``'s
+        # teardown ``finally`` -- see "Lifecycle" on
+        # :class:`RecvOffload`.
+        recv_offload = RecvOffload() if dist.pp_size > 1 else None
         svc = Service(
             dist=dist,
             pool=pool,
             client=client,
             termination=termination,
+            recv_offload=recv_offload,
         )
 
         # ----- Concerns. -----
@@ -1054,17 +1063,30 @@ class PyExecutorCoro:
           blocked waiters get woken up after the final drain.
         * Always set ``ctx.port.shutdown_event`` so the main thread
           ``shutdown()`` join can return.
-        * **Null ``self._loop_crn``** so the executor's ref to
-          the :class:`Concerns` bag drops. Together with the
-          local ``driver`` going out of scope when this function
-          returns, that releases every ref to every concern,
-          which fires their ``__del__`` synchronously on the
-          loop thread -- before the thread terminates and well
-          before mpi4py's atexit finalizer runs. This is what
-          lets concerns hold MPI handles past their last
-          ``handle_batch`` call (e.g.
-          :class:`RingBroadcastSampleConcern`'s lingering isend
-          deque) and still drain them safely on shutdown.
+        * **Null ``self._loop_ctx`` and ``self._loop_crn``** so
+          the executor's refs to the :class:`Context` and
+          :class:`Concerns` bags drop. Together with the local
+          ``ctx`` / ``driver`` going out of scope when this
+          function returns, that releases the last ref to every
+          loop-thread-only object reachable through them --
+          ``ctx.svc.pool`` / ``ctx.svc.termination`` /
+          ``ctx.svc.recv_offload`` (PP) and every concern. The
+          executor keeps direct refs to the cross-thread
+          surfaces (``self._port``, ``self._client``,
+          ``self._dist``) so the main thread retains its public
+          API. Refcount GC then fires each loop-thread-only
+          object's ``__del__`` synchronously here -- before the
+          thread terminates and well before mpi4py's atexit
+          finalizer runs. This is what lets:
+
+          * concerns hold MPI handles past their last
+            ``handle_batch`` call (e.g.
+            :class:`RingBroadcastSampleConcern`'s lingering
+            isend deque, drained in its ``__del__``);
+          * :class:`RecvOffload` (PP) shut down its worker
+            thread pool in its ``__del__`` rather than the
+            scheduler having to remember an explicit
+            ``shutdown()`` call.
         """
         ctx = self._loop_ctx
         torch.cuda.set_device(ctx.conf.device_id)
@@ -1079,14 +1101,11 @@ class PyExecutorCoro:
             # producing spurious responses.
             ctx.svc.client.enqueue([])
             ctx.port.shutdown_event.set()
-            # Drop the executor-side ref to the concern bag. The
-            # only remaining refs (this frame's local-via-driver-
-            # closure on ``self._loop_crn``) drop when the frame
-            # is popped on return; refcount GC then fires every
-            # concern's ``__del__`` on this (loop) thread. See
-            # the docstring above and
-            # :class:`RingBroadcastSampleConcern.__del__` for the
-            # MPI-handle teardown that piggybacks on this.
+            # Drop the executor-side refs to the loop-thread bags.
+            # See the docstring above for the GC-driven teardown
+            # chain (RecvOffload + RingBroadcastSampleConcern
+            # ``__del__`` both ride on this).
+            self._loop_ctx = None
             self._loop_crn = None
 
     def __enter__(self) -> "PyExecutorCoro":

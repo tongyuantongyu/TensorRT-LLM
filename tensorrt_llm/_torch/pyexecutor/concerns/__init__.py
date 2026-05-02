@@ -201,7 +201,7 @@ from .response import ResponseConcern  # noqa: E402
 from .ring_broadcast import RingBroadcastSampleConcern  # noqa: E402
 from .sample import SampleConcern  # noqa: E402
 from .schedule import PpScheduleConcern, ScheduleConcern  # noqa: E402
-from .services import ClientChannel, RequestPool, TerminationService  # noqa: E402
+from .services import ClientChannel, RecvOffload, RequestPool, TerminationService  # noqa: E402
 from .shared import fail_requests  # noqa: E402
 from .state_advance import StateAdvanceConcern  # noqa: E402
 
@@ -215,6 +215,7 @@ __all__ = [
     "Concerns",
     "ForwardConcern",
     "PpScheduleConcern",
+    "RecvOffload",
     "RequestPool",
     "ResourceConcern",
     "ResponseConcern",

@@ -1,7 +1,8 @@
 """Loop-thread services exposed via ``ctx.svc.*``.
 
-Three objects own state previously smeared across many ``PyExecutor``
-methods:
+Four objects own state previously smeared across many ``PyExecutor``
+methods OR work that the legacy executor offloaded to its own
+dedicated thread:
 
 * :class:`RequestPool` -- ``active_requests`` and (on PP)
   ``inflight_req_ids``. Replaces direct
@@ -16,11 +17,17 @@ methods:
   ``_terminate_request`` + ``_do_terminate_request`` (resource free
   + ``result_wait_queues`` cleanup; PP-aware dispatch via
   ``DisaggPPTerminationHandler`` injected by the constructor).
+* :class:`RecvOffload` -- single-worker thread pool that runs
+  blocking ``recv_object`` calls so coroutines on the loop thread
+  can poll the returned futures without blocking the SCHEDULER.
+  Required because mpi4py's ``pkl5`` communicator (used by TRT-
+  LLM) does not implement non-blocking ``irecv`` for pickled
+  objects.
 
 Every concern reaches them via ``ctx.svc.pool`` /
-``ctx.svc.client`` / ``ctx.svc.termination``. The
-``fail_requests(ctx, reqs, msg)`` utility in :mod:`shared` composes
-all three.
+``ctx.svc.client`` / ``ctx.svc.termination`` /
+``ctx.svc.recv_offload``. The ``fail_requests(ctx, reqs, msg)``
+utility in :mod:`shared` composes the first three.
 
 Plain-loop scope notes
 ======================
@@ -47,6 +54,7 @@ obvious local edit.
 
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import threading
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -394,3 +402,114 @@ class TerminationService:
         self._resource_manager.free_resources(request)
         if self._gather_all_responses or self._rank == 0:
             self._client.unregister_wait_queue(request.py_request_id)
+
+
+# --------------------------------------------------------------------------- #
+# RecvOffload
+# --------------------------------------------------------------------------- #
+
+
+class RecvOffload:
+    """Single-worker offload for blocking MPI ``recv_object``.
+
+    Why this exists
+    ---------------
+
+    TRT-LLM uses ``mpi4py.util.pkl5.Intracomm`` so large pickled
+    objects can be exchanged without blowing the default MPI buffer
+    limits. The pkl5 communicator implements blocking ``recv`` /
+    ``send`` but explicitly **NOT** ``irecv`` (it raises
+    ``RuntimeError("unsupported")``). Concerns that need a
+    non-blocking interface to pickle-recv -- e.g.
+    :class:`RingBroadcastSampleConcern`'s HC10 polling loop -- can't
+    use ``irecv`` and would block the SCHEDULER if they called
+    ``recv`` directly.
+
+    The legacy :class:`PyExecutor` works around this by running the
+    blocking ``recv`` on a dedicated bcast thread. The coroutine
+    runtime has only the loop thread, so we offload to a tiny
+    thread pool here and expose the result as
+    :class:`concurrent.futures.Future`. Coroutines poll
+    ``future.done()`` (cheap, thread-state check; the worker
+    thread's blocked ``recv`` drives MPI progress on its side)
+    between ``await again()`` yields, then call ``future.result()``
+    once the future is ready (or to block as the deadline if the
+    polling budget is exhausted).
+
+    Single worker = FIFO ordering
+    -----------------------------
+
+    The pool has ``max_workers=1``. Tasks run in submission order,
+    one at a time. This matches MPI's in-order delivery for the
+    same source-tag pair, so the futures resolve in the same
+    order callers submit them. HC10 (single source rank, single
+    ``PPCommTag.SAMPLE_STATE`` tag) relies on this.
+
+    If a future use case multiplexes recvs across different
+    source-tag pairs and wants concurrent worker progress, raise
+    ``max_workers`` -- but be careful about MPI's thread-support
+    level (TRT-LLM relies on at least ``MPI_THREAD_SERIALIZED``,
+    which the legacy ``broadcast_sample_state_handler`` thread
+    already exercises).
+
+    Lifecycle
+    ---------
+
+    Instantiated by :meth:`PyExecutorCoro.__init__` only when
+    ``pp_size > 1`` (single-rank executors don't need offloaded
+    recvs). Shut down via :meth:`__del__` -- the executor's
+    ``self._loop_ctx = None`` in :meth:`PyExecutorCoro._run_loop`'s
+    teardown ``finally`` block drops the last reference, refcount
+    GC fires :meth:`__del__` synchronously on the loop thread.
+    Same teardown protocol as
+    :class:`RingBroadcastSampleConcern.__del__`'s lingering-isend
+    drain (loop-thread-side, MPI-finalize-safe).
+
+    Shutdown semantics
+    ------------------
+
+    :meth:`__del__` calls
+    ``ThreadPoolExecutor.shutdown(wait=False, cancel_futures=True)``:
+
+    * Queued (not-yet-started) futures are cancelled --
+      callers' ``result()`` gets ``CancelledError``.
+    * The currently-running future (a blocked ``recv``) is **not**
+      cancelled: Python can't interrupt a blocked C call. The
+      worker is a daemon thread (the ``ThreadPoolExecutor``
+      default), so it dies on process exit.
+
+    For a clean shutdown the SCHEDULER drains all in-flight
+    batches before exiting, which resolves every outstanding
+    HC10 future. The cancel-pending behavior is the safety net
+    for catastrophic exits.
+    """
+
+    def __init__(self) -> None:
+        # Local import: ``mpi_recv_object`` is a no-op stub when
+        # ``ENABLE_MULTI_DEVICE`` is False. The caller (PP path)
+        # guarantees ENABLE_MULTI_DEVICE here.
+        from tensorrt_llm._utils import mpi_recv_object
+        self._mpi_recv_object = mpi_recv_object
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="trtllm-mpi-recv",
+        )
+
+    def __del__(self) -> None:
+        # Refcount GC fires this on the loop thread when the
+        # executor's ``self._loop_ctx = None`` drops the last ref.
+        # See "Lifecycle" / "Shutdown semantics" in the class
+        # docstring. Exceptions go through ``sys.unraisablehook``
+        # -- acceptable, the executor is already winding down.
+        self._pool.shutdown(wait=False, cancel_futures=True)
+
+    def submit(self, source: int,
+               tag: int) -> "concurrent.futures.Future":
+        """Submit a blocking ``recv_object(source, tag)`` to the worker.
+
+        Returns a future that the caller polls via
+        :meth:`concurrent.futures.Future.done` (non-blocking) or
+        :meth:`concurrent.futures.Future.result` (blocking until done,
+        immediate if already done).
+        """
+        return self._pool.submit(self._mpi_recv_object, source, tag)
