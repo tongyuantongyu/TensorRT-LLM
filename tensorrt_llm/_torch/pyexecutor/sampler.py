@@ -163,6 +163,18 @@ class SamplerEvent:
             futures.wait(self.worker_futures)
         self.cuda_event.synchronize()
 
+    def query(self) -> bool:
+        """Non-blocking readiness check.
+
+        Returns ``True`` iff every worker future (if any) has
+        completed AND the CUDA event has finished. Mirrors
+        :meth:`synchronize`'s shape but without blocking.
+        """
+        if self.worker_futures and not all(
+                f.done() for f in self.worker_futures):
+            return False
+        return self.cuda_event.query()
+
 
 GenericSampleStateTensorsHost = TypeVar("GenericSampleStateTensorsHost", bound=SampleStateTensors)
 GenericSampleStateTensorsDevice = TypeVar(

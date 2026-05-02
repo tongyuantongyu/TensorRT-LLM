@@ -147,10 +147,28 @@ class BatchPhase(IntEnum):
         Plain folds it into ``APPLY_7`` (no separate yield needed
         because there's no other batch interleaving in plain).
     SYNC_EVT_5
-        Explicit ``sampler_event.synchronize()``. PP only -- last
-        rank waits at iter ``N+1`` so the ring-broadcast can read
-        host tokens. Plain + overlap fold into ``APPLY_7`` because
-        ``sampler.update_requests`` blocks on the event implicitly.
+        "Post the async HC10 op" -- decoupled from HANDOFF_6's
+        "wait for completion + cross-rank forward send". One-shot
+        per rank, no polling, no ``await again()``:
+
+        * **Source**: ``sampler_event.synchronize()`` (typically
+          no-op since the SCHEDULER drives this phase at iter
+          ``T+1`` step 1b for a batch admitted at iter ``T`` --
+          the GPU has had a full iter of runway) +
+          ``pp_source_isend`` (non-blocking).
+        * **Non-source**: ``pp_post_recv_sample_state`` (submits
+          the blocking ``recv_object`` to the offload thread
+          pool; returns immediately with a future).
+
+        Frees source's HC10 isend / non-source's recv submission
+        to fire at iter ``T+1`` instead of the legacy
+        force-retire deadline at iter ``T+pp_size-1``. The
+        wall-clock between SYNC_EVT_5 (step 1b) and HANDOFF_6's
+        wait (step 3 on rk0; step 2/5 on intermediates) is the
+        window in which the recv worker thread / MPI delivery
+        runs. PP only. Plain + overlap fold into ``APPLY_7``
+        (``sampler.update_requests`` blocks on the event
+        implicitly).
     HANDOFF_6
         Hand off the batch to the long-running
         ``ring_broadcast_sample`` distributed concern (HC10). PP only.

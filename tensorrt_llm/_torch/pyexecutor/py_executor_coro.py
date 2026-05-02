@@ -142,11 +142,22 @@ async def batch_body(ctx: Context, crn: Concerns) -> None:
       Becomes the home for ``iter_stats`` / ``perf_metric`` once
       those land.
 
-    The intermediate phase HANDOFF_6 is PP-only -- the
-    :class:`RingBroadcastSampleConcern` does its hop there.
-    SYNC_EVT_5 is unused in the coroutine model (the per-batch
-    sample coroutine handles its own sampler_event sync inside
-    APPLY_7).
+    The intermediate phases SYNC_EVT_5 and HANDOFF_6 are PP-only.
+    :class:`RingBroadcastSampleConcern` runs its body across
+    both, with a clean "post" / "wait + send" split:
+
+    * SYNC_EVT_5 -- "post the async HC10 op", one-shot per rank.
+      Source: ``synchronize()`` (typically no-op since the GPU
+      has had a full iter of runway since admission) +
+      ``pp_source_isend`` (non-blocking). Non-source: submit
+      the recv future via the offload pool. Driven uniformly
+      by the SCHEDULER at step 1b.
+    * HANDOFF_6 -- "wait for completion + cross-rank forward
+      send". Source: skipped (its full HC10 work was done at
+      SYNC_EVT_5). rk0: bounded polling on ``recv_future.done()``
+      via SCHEDULER's step 3. Other intermediate ranks: blocking
+      ``recv_future.result()`` driven by SCHEDULER's step 2/5
+      force-retire / extras-retire.
 
     The ``async with batch_phase(P): ...`` blocks let the runtime
     interleave concerns at each phase. ``await resume(handle)`` on
@@ -192,6 +203,15 @@ async def batch_body(ctx: Context, crn: Concerns) -> None:
     async with batch_phase(BatchPhase.STATE_UPD_4) as (r, _):
         if r.can_queue:
             crn.state_advance.advance(ctx, r.scheduled_batch)
+
+    # SYNC_EVT_5: PP-only "post the async HC10 op" phase.
+    # Source: sync + isend. Non-source: submit recv future. Single
+    # ``await resume(ring_broadcast)`` -- the concern body is
+    # one-shot per rank, no polling loop here. Single-rank /
+    # plain / overlap have ``ring_broadcast=None``; the
+    # ``resume(None)`` no-op covers them.
+    async with batch_phase(BatchPhase.SYNC_EVT_5):
+        await resume(ring_broadcast)
 
     # HANDOFF_6: PP-only HC10 ring-broadcast hop. Mirrors the
     # bounded polling loop inside ``RingBroadcastSampleConcern``:
@@ -475,56 +495,116 @@ async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
     Per-iter steps
     --------------
 
-    1. **Build current; drive through STATE_UPD_4.** Runs
-       SCHEDULE_0 (PP-broadcast + propagated schedule),
-       RESOURCE_PREP_1, FORWARD_2 (NCCL p2p hands activations to
-       the next PP rank), SAMPLE_3 (real on last rank,
-       placeholder elsewhere), STATE_UPD_4. ``current`` is now
-       suspended at HANDOFF_6.
-    2. **Forced retire (deadline; symmetric across ranks).** If
-       the deque is full or we're draining, pop the oldest and
-       ``step(.., FINALIZE_9)`` it -- naturally first since the
-       deadline batch is the oldest. On rk0 this is the
-       polling concern's last polling round (the for-loop's
-       ``else`` arm blocking ``wait()``); on non-rk0 ranks it's
-       the concern's direct blocking-wait branch. Sets
-       ``forced = 1``; ``forced = 0`` when no force fires (warmup
-       or after-opportunistic-drain).
-    3. **rk0 polling pass.** Walk the now-post-deadline
-       ``in_flight`` from head and call ``try_step(parked,
-       through=HANDOFF_6)`` on each. Count contiguous head
-       successes as ``opp``: at the first ``try_step`` that
-       returns ``None`` (await again() cascaded back -- recv not
-       landed) stop counting; remaining batches still get one
-       ``try_step`` round each so their polling-loop counters
-       advance toward future deadlines. Non-rk0 ranks skip this
-       pass entirely (no polling, no round consumption -- their
-       concern's HC10 branch is the direct blocking-wait variant;
-       see :class:`RingBroadcastSampleConcern`).
-    4. **HC9 vote.** Send ``opp`` -- only rk0's opportunistic
-       count is on the wire; ``forced`` is recomputed locally on
-       every rank (lockstep). Sent along the PP forward chain
-       (rk0 -> rk1 -> ... -> rk(N-1)) via non-blocking
-       ``isend_object`` with synchronous ``recv_object`` on every
-       non-rk0 rank. Each rank assigns the received value back
-       to ``opp`` -- on rk0 this is identity (its own value), on
-       non-rk0 it's rk0's authoritative count. The forward isend
-       handle is parked in a 1-element :class:`PendingIsend`;
-       next iter's ``vote.set`` waits the previous handle and
-       stores the new one (one iter of slack -> non-blocking).
-    5. **Retire ``opp`` more.** Pop ``opp`` more batches from
-       deque head, ``step(.., FINALIZE_9)`` each. On rk0 these
-       are the opportunistic ones (already past HANDOFF_6 from
-       step 3, so ``step`` just runs APPLY_7 + RESPOND_8 +
-       FINALIZE_9 -- releases KV resources, sends responses,
-       hands isend handle to lingering queue). On non-rk0 ranks
-       each ``step`` enters the concern's ``recv_handle.wait()``
-       blocking branch -- which completes promptly because rk0
-       wouldn't have voted ``opp`` unless its matching ``opp``
-       isends had been posted. Total retired this iter on every
-       rank: ``forced + opp``.
-    6. **Push ``current`` to deque right** (now k=0 this iter,
-       becomes k=1 next iter). Skip when draining.
+    Step 1 is split into three sub-steps (1a/1b/1c) so source's
+    HC10 isend and rk0's recv submission both happen between
+    curr's FORWARD and SAMPLE. This puts wall-clock between
+    each rank's SYNC_EVT_5 "post" (1b) and HANDOFF_6's wait
+    (step 3 polling on rk0; step 2/5 force-finalize on
+    intermediates), giving the recv worker thread time to
+    actually run before we check ``future.done()`` -- which is
+    what converts source's HC10-send-earlier into actual iter
+    savings.
+
+    1a. **Build current; drive through FORWARD_2.** Runs
+        SCHEDULE_0 (PP-broadcast + propagated schedule),
+        RESOURCE_PREP_1, FORWARD_2 (NCCL p2p hands activations
+        to the next PP rank). ``current`` is now suspended at
+        SAMPLE_3 entry; the forward kernel is queued on the
+        execution stream.
+    1b. **Post async ops (uniform across all ranks).** A single
+        ``await step(in_flight[-1], through=SYNC_EVT_5)`` drives
+        the newest parked batch's SYNC_EVT_5 phase. The phase
+        body is rank-specific:
+
+        * **Source**: ``synchronize()`` (typically no-op since
+          the GPU has had a full iter of runway) +
+          ``pp_source_isend`` (non-blocking).
+        * **Non-source**: ``pp_post_recv_sample_state`` (submits
+          the blocking ``recv_object`` to the offload thread
+          pool; returns immediately with a future).
+
+        Older parked batches were driven at their own
+        admit_iter+1's step 1b -- inductive invariant: each
+        batch's SYNC_EVT_5 post happens exactly once at the iter
+        after admission. ``step`` is idempotent past ``through``
+        so calls on already-past-SYNC_EVT_5 batches are no-ops.
+    1c. **Drive ``current`` through STATE_UPD_4.** Runs SAMPLE_3
+        (real on last rank -- ``sample_async`` queues kernel +
+        D2H, records ``sampler_event``; placeholder elsewhere)
+        and STATE_UPD_4. The CPU wall-clock here (sample_async
+        is multi-ms in production) is the window in which rk0's
+        recv worker thread runs and marks the future done, so
+        the polling at step 3 can detect completion at iter T+1
+        instead of iter T+2.
+    2.  **Forced retire (deadline; symmetric across ranks).** If
+        the deque is full or we're draining, pop the oldest and
+        ``step(.., FINALIZE_9)`` it. On rk0 this is the polling
+        concern's deadline ``else``-arm blocking ``result()``; on
+        non-rk0 intermediate ranks it's the concern's direct
+        blocking-wait branch; on the source rank it's a fast
+        pass-through (concern already past HANDOFF_6 from step
+        1b's SYNC_EVT_5 sync+isend). ``in_flight`` non-empty is
+        implied: ``in_flight_max >= 1`` rules out the ``len() >=
+        in_flight_max`` arm, and the early ``return`` above rules
+        out the ``not more_to_admit`` arm with empty deque.
+    3.  **Polling pass (rk0 only).** rk0 calls
+        ``opportunistic_polling``, which iterates parked batches
+        and ``try_step``s each through HANDOFF_6. Each parked's
+        first ``try_step`` here runs the polling concern body's
+        ``for`` loop iter 0: check ``recv_future.done()``; if
+        True, break + apply + intermediate isend, past HANDOFF_6.
+        Count contiguous head successes as ``opp``; stop counting
+        at the first ``try_step`` retry but keep iterating so
+        later batches' polling counters advance toward future
+        deadlines. Source doesn't poll here -- its full HC10
+        work (sync + isend) is done at step 1b. Other
+        intermediate ranks (rk1..rk(N-3)) skip this pass too --
+        their HC10 branch is the direct blocking-wait variant
+        and would stall the SCHEDULER if try_step'd.
+    4.  **HC9 vote.** Send ``opp`` -- only rk0's opportunistic
+        count is on the wire; ``forced`` is recomputed locally
+        on every rank (lockstep). Sent along the PP forward chain
+        (rk0 -> rk1 -> ... -> rk(N-1)) via non-blocking
+        ``isend_object`` with synchronous ``recv_object`` on every
+        non-rk0 rank. Each rank assigns the received value back
+        to ``opp`` -- on rk0 this is identity (its own value), on
+        non-rk0 it's rk0's authoritative count. The forward isend
+        handle is parked in a 1-element :class:`PendingIsend`;
+        next iter's ``vote.set`` waits the previous handle and
+        stores the new one (one iter of slack -> non-blocking).
+    5.  **Retire ``opp`` more.** Pop ``opp`` more batches from
+        deque head, ``step(.., FINALIZE_9)`` each. On rk0 these
+        are the opportunistic ones (already past HANDOFF_6 from
+        step 3, so ``step`` just runs APPLY_7 + RESPOND_8 +
+        FINALIZE_9 -- releases KV resources, sends responses,
+        hands isend handle to lingering queue). On non-rk0
+        intermediate ranks each ``step`` enters the concern's
+        ``recv_future.result()`` blocking branch -- which
+        completes promptly because rk0 wouldn't have voted
+        ``opp`` unless its matching ``opp`` isends had been
+        posted. On the source rank each ``step`` is a fast
+        pass-through. Total retired this iter on every rank:
+        ``forced + opp``.
+    6.  **Push ``current`` to deque right** (now k=0 this iter,
+        becomes k=1 next iter). Skip when draining.
+
+    Polling deadline (rk0)
+    ----------------------
+
+    rk0's polling concern body has a ``for _ in range(pp_size -
+    2): if recv_future.done(): break; await again()`` loop with a
+    post-loop ``recv_future.result()`` deadline (or the batch_body
+    HANDOFF_6 ``else`` arm at force-retire). One pass per iter
+    (step 3 only): the deadline lands at iter ``T + (pp_size - 1)``
+    -- the legacy worst case. For fast-MPI cases (sub-iter
+    latency, the typical case in production) the ``break`` fires
+    at iter T+1, retiring 1 iter after admission. The semantic
+    cleanup here -- SYNC_EVT_5 "post" decoupled from HANDOFF_6
+    "wait + send" -- prioritizes uniformity over the previous
+    2-passes/iter design's halved worst-case deadline; if perf
+    data ever shows the worst case matters for slow-MPI on high
+    pp_size, a second polling pass (e.g. at step 5) can be
+    re-introduced.
 
     Last-rank fast path (special behavior)
     --------------------------------------
@@ -594,13 +674,24 @@ async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
     # to the max).
     in_flight: collections.deque = collections.deque()
     in_flight_max = pp_size - 1
-    is_rk0 = ctx.svc.dist.rank == 0
     # HC9 vote isend slot: ``vote.set(new_handle)`` waits the
     # previous iter's handle (one iter of slack matches the
     # next-PP-rank's recv latency, so non-blocking) and stores
     # the new one. Trailing handle is waited by ``__del__`` when
     # this function returns and the local goes out of scope.
     vote = PendingIsend()
+
+    async def opportunistic_polling():
+        finished_count = 0
+        counting = True
+        for parked in in_flight:
+            result = await try_step(parked,
+                                    through=BatchPhase.HANDOFF_6)
+            if result is None:
+                counting = False
+            elif counting:
+                finished_count += 1
+        return finished_count
 
     while True:
         more_to_admit = (not ctx.port.is_shutdown
@@ -620,46 +711,67 @@ async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
             current = Batch(batch_body(ctx, crn), storage)
 
         # Per-iter steps (numbered to match the docstring's
-        # "Per-iter steps" section):
+        # "Per-iter steps" section). Step 1 is split into
+        # 1a/1b/1c so each rank's SYNC_EVT_5 "post async op"
+        # happens between curr's FORWARD and SAMPLE; HANDOFF_6's
+        # "wait + forward send" happens later (step 3 polling on
+        # rk0; step 2/5 force-finalize on intermediates):
         #
-        # (1) Drive ``current`` through STATE_UPD_4.
-        # (2) Forced retire of the deadline batch. Each rank
-        #     evaluates the same forced-predicate locally; the
-        #     predicate is in lockstep across ranks because
-        #     ``len(in_flight)`` and ``more_to_admit`` are both
-        #     lockstep (see "Lockstep invariant" in the docstring).
-        #     Naturally first since the deadline batch is the
-        #     oldest. On rk0 this drives the polling concern's
-        #     ``else`` arm blocking ``wait()`` (the last polling
-        #     round); on non-rk0 ranks it drives the concern's
-        #     direct blocking-wait branch. ``in_flight`` non-empty
-        #     is implied: ``in_flight_max >= 1`` rules out the
-        #     ``len() >= in_flight_max`` arm, and the early
-        #     ``return`` above rules out the ``not more_to_admit``
-        #     arm with empty deque.
-        # (3) Polling pass on rk0 only over the (now post-deadline)
-        #     in-flight deque. Count contiguous head successes as
-        #     ``opp``; later batches still get one round each so
-        #     their polling loops advance even if the head isn't
-        #     yet ready. ``try_step`` returning ``None`` means
-        #     ``await again()`` cascaded back (recv not landed);
-        #     stop counting (in-order MPI delivery means later
-        #     batches aren't ready either) but continue the loop
-        #     to consume their polling rounds.
-        # (4) HC9 vote. rk0 broadcasts only ``opp`` -- ``forced``
-        #     is computed identically on every rank from the
-        #     lockstep state, so it doesn't need to be on the
-        #     wire. Non-rk0 ranks' local ``opp`` (which is 0,
-        #     since they don't poll) is overwritten by the recv.
-        # (5) Retire ``opp`` more batches. On rk0 these are the
-        #     opportunistic ones already past HANDOFF_6 from
-        #     step 3 (``step`` just runs FINALIZE_9). On non-rk0
-        #     ranks ``step`` drives the concern's blocking-wait
-        #     branch for each. Total retired this iter on every
-        #     rank: ``forced + opp``.
-        # (6) Push current to deque right (skip when draining).
+        # (1a) Drive ``current`` through FORWARD_2 (queue forward
+        #      kernel; no GPU sync).
+        # (1b) Drive newest parked through SYNC_EVT_5 (uniform
+        #      across ranks). Source: sync + isend. Non-source:
+        #      submit recv future. No polling, no count -- just
+        #      one-shot "post the async op". Older parked were
+        #      driven at their own admit_iter+1's step 1b
+        #      (idempotent past ``through``).
+        # (1c) Drive ``current`` through STATE_UPD_4 (sample_async
+        #      + state advance). Wall-clock here gives rk0's recv
+        #      worker thread time to run so step 3's polling sees
+        #      ``future.done() == True`` for recvs that landed.
+        # (2)  Forced retire of the deadline batch. Each rank
+        #      evaluates the same forced-predicate locally; the
+        #      predicate is in lockstep across ranks because
+        #      ``len(in_flight)`` and ``more_to_admit`` are both
+        #      lockstep (see "Lockstep invariant" in the docstring).
+        #      ``in_flight`` non-empty is implied:
+        #      ``in_flight_max >= 1`` rules out the ``len() >=
+        #      in_flight_max`` arm, and the early ``return`` above
+        #      rules out the ``not more_to_admit`` arm with empty
+        #      deque.
+        # (3)  Polling pass on rk0 only. Each parked batch's
+        #      ``try_step(parked, HANDOFF_6)`` runs the polling
+        #      concern body's ``for`` loop iter 0: check
+        #      ``recv_future.done()``; if True, break + apply +
+        #      intermediate isend. Count contiguous head successes
+        #      as ``opp``; stop counting at first retry but keep
+        #      iterating so later batches' for-loop counters
+        #      advance. Source doesn't poll here -- its full HC10
+        #      work was done at step 1b. Other intermediates
+        #      (rk1..rk(N-3)) skip too -- direct blocking-wait
+        #      branch would stall the SCHEDULER if try_step'd.
+        # (4)  HC9 vote. rk0 broadcasts only ``opp`` -- ``forced``
+        #      is computed identically on every rank from the
+        #      lockstep state, so it doesn't need to be on the
+        #      wire. Non-rk0 ranks' local ``opp`` (always 0 since
+        #      they didn't poll for opp) is overwritten by the recv.
+        # (5)  Retire ``opp`` more batches. On rk0 these are the
+        #      opportunistic ones already past HANDOFF_6 from
+        #      step 3 (``step`` just runs FINALIZE_9). On non-rk0
+        #      intermediate ranks ``step`` drives the concern's
+        #      blocking-wait branch for each. On source ``step``
+        #      is a fast pass-through. Total retired this iter on
+        #      every rank: ``forced + opp``.
+        # (6)  Push current to deque right (skip when draining).
         try:
-            # (1)
+            # (1a)
+            await step(current, through=BatchPhase.FORWARD_2)
+
+            # (1b)
+            if in_flight:
+                await step(in_flight[-1], through=BatchPhase.SYNC_EVT_5)
+
+            # (1c)
             await step(current, through=BatchPhase.STATE_UPD_4)
 
             # (2)
@@ -669,15 +781,8 @@ async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
 
             # (3)
             opp = 0
-            counting = True
-            if is_rk0:
-                for parked in in_flight:
-                    result = await try_step(parked,
-                                            through=BatchPhase.HANDOFF_6)
-                    if result is None:
-                        counting = False
-                    elif counting:
-                        opp += 1
+            if ctx.svc.dist.is_first_pp_rank:
+                opp = await opportunistic_polling()
 
             # (4)
             opp, vote_handle = ring_broadcast_executed_batch_num(
