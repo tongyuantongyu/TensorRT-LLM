@@ -1,14 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""HC10 sample-state reverse ring broadcast (PP only).
+"""HC10 sample-state ring broadcast (PP only).
 
 Per-batch coroutine. The legacy implementation runs the ring on a
 dedicated bcast thread that uses BLOCKING ``recv_object`` calls --
 the thread parallelism hides the recv latency behind the main
 thread's other work. The coroutine implementation has only the
-loop thread, so a blocking ``recv_object`` would block the
-SCHEDULER. The replacement pattern:
+loop thread, so a blocking ``recv_object`` everywhere would block
+the SCHEDULER. The replacement pattern shifts the polling work
+to rk0 ONLY (matching legacy's "rk0 is the queue authority"
+pattern) and lets the other ranks do a single blocking wait at
+deadline:
 
 * HANDOFF_6 entry: sync ``sampler_event`` (correctness on the
   source -- host data must be valid before it is isend'd; backpressure
@@ -16,80 +19,154 @@ SCHEDULER. The replacement pattern:
   batch's forward complete on this rank", so syncing on it gives the
   same depth-2 1F1B backpressure the legacy STEP 2 did via
   ``previous_batch.sample_state.sampler_event.synchronize()``).
-* HANDOFF_6 body:
+* HANDOFF_6 body splits three ways:
 
-  - **Source rank (last PP rank)**: issue the isend immediately. No
-    polling -- isend is non-blocking so the call returns at once.
-  - **Non-source ranks**: post a non-blocking ``irecv``, then
-    ``for _ in range(pp_size - 2): test() | again()`` followed by a
-    ``for ... else: wait()`` -- ``pp_size - 1`` rounds total,
-    each round one ``request.test()`` (which itself drives MPI's
-    progress engine). The first ``pp_size - 2`` rounds yield
-    ``await again()`` if not yet done so the SCHEDULER can
-    interleave other in-flight batches' polling. The ``else`` arm
-    (= the ``pp_size - 1``-th and last round, run when the
-    SCHEDULER drives the batch with ``step`` instead of
-    ``try_step`` -- see "How the SCHEDULER drives the polling"
-    below) does a BLOCKING ``request.wait()`` so HANDOFF_6 always
-    completes by the deadline without the SCHEDULER having to
-    busy-loop.
-* FINALIZE_9: ``request.wait()`` on this batch's own isend handle
-  (or skip on second-to-last / source-only paths). Held as a
-  coroutine local -- no per-microbatch slot ring, no cross-batch
-  shared state.
+  - **Source rank (last PP rank)**: ``pp_source_isend``. No recv,
+    no polling, no wait. The batch is trivially past HANDOFF_6 the
+    moment the isend returns -- the SCHEDULER's force-finalize on
+    this rank is therefore always a no-op pass-through.
+  - **rk0 (the polling rank)**: post a non-blocking ``irecv``,
+    then ``for _ in range(pp_size - 2): test() | again()``
+    followed by ``for ... else: wait()`` -- ``pp_size - 1`` rounds
+    total. The first ``pp_size - 2`` come from the SCHEDULER's
+    per-iter polling pass (``try_step(parked, HANDOFF_6)`` lets the
+    ``await again()`` cascade back to the SCHEDULER so other batches
+    in the deque get their polling rounds too). The last round (the
+    ``else`` arm) runs when the SCHEDULER drives the batch with
+    ``step`` instead of ``try_step`` -- only happens for the deadline
+    batch when rk0 didn't manage to opportunistically retire it
+    earlier.
+  - **Other intermediate ranks (rk1 .. rk(N-2))**: post a non-blocking
+    ``irecv``, then a single direct blocking ``wait()``. NO polling
+    loop, NO ``await again()``. These ranks don't independently
+    decide retirement; they follow rk0's HC9 vote (see
+    ``scheduler_iter_pp``) and force-finalize K batches per iter.
+    Each force-finalize blocks on this single ``wait()`` -- which
+    completes promptly because rk0 wouldn't have voted K unless its
+    K isends to rk1 had already been posted, and the chain
+    propagates.
 
-How the SCHEDULER drives the polling
-------------------------------------
+  After ``recv``, intermediate ranks ``pp_intermediate_isend`` to
+  the next ring neighbor (returns ``None`` for the second-to-last
+  rank, which is the ring terminus).
 
-A batch enters HANDOFF_6 the first time when the
-:func:`scheduler_iter_pp` polling pass first reaches it (one iter
-after creation), and gets retired ``pp_size - 1`` iters later.
-The SCHEDULER hands the batch ``pp_size - 1`` round-drives
-exactly:
+* FINALIZE_9: hand off this batch's own isend handle (or skip on
+  second-to-last / source-only paths) to the lingering queue
+  documented in "Lingering isend queue" below.
 
-* The first ``pp_size - 2`` come from the per-iter polling pass,
-  which calls ``try_step(parked, through=HANDOFF_6)`` on every
-  batch *currently parked* in the in-flight deque (= every
-  in-flight batch EXCEPT the one being retired this iter).
-  ``try_step`` allows the concern's ``await again()`` to cascade
-  back to the SCHEDULER so the next iter's polling pass picks
-  up where this one left off.
-* The last round comes from the SCHEDULER's
-  ``step(retired, through=FINALIZE_9)`` at the retire iter,
-  which drives the deadline batch through HANDOFF_6 with
-  ``step`` (not ``try_step``) -- forbidding ``again()``. The
-  concern's ``for ... else`` falls into its blocking ``wait()``
-  arm, completing HANDOFF_6 in one final round.
+Lingering isend queue
+---------------------
 
-The deadline batch is therefore the only batch ``step``-ped past
-HANDOFF_6 (everyone else has already exited it via the polling
-pass). No SCHEDULER-side busy-loop, no concern-side counter --
-the round-bound and the deadline iter line up by construction.
+Naive design: the per-batch coroutine ``request.wait()``s on its
+own isend handle at FINALIZE_9 before retiring. That works but
+violates the rule "don't block where the legacy doesn't" in two
+cases:
+
+1. **HC10 source isend at pp_size=2**: the wait is in the same
+   ``step(retired, FINALIZE_9)`` call as the isend itself, with
+   only APPLY_7 + RESPOND_8 host work in between (sub-iter
+   budget). The matching recv on rk0 might not have completed
+   yet (rk0 posts its irecv in its own concurrent ``step(retired,
+   FINALIZE_9)`` call), so the wait could briefly block.
+2. **HC10 intermediate isend on the deadline iter**: same shape
+   -- the intermediate isend is issued during the deadline drive
+   (``step(retired, FINALIZE_9)`` -> concern's blocking ``else``
+   arm -> recv done -> intermediate isend), and the wait happens
+   in the same ``step()`` call moments later. The matching peer
+   rk_{i+1}'s recv completion needs at least one MPI round-trip.
+
+Legacy avoids both by parking each isend handle in a slot ring
+of size ``pp_size`` and waiting on it only when the slot is
+reused -- ``pp_size`` iters later, by which time the recv has
+long since completed. We replicate the same "park for ``pp_size``
+batches, then wait" semantics via a single instance-level deque
+on this concern (one queue per rank). The bound is enforced
+*on push* (i.e., at the per-batch coroutine's FINALIZE_9): if
+the deque already holds ``pp_size`` handles, the oldest is
+waited + popped before the new one goes in. The trailing
+``pp_size`` handles left over when the SCHEDULER stops pushing
+are drained by :meth:`__del__` -- safe because
+``PyExecutorCoro._run_loop`` nulls its ``self._loop_crn`` ref
+after ``driver.run()`` returns, and CPython's refcount GC
+fires the destructor synchronously on the loop thread, before
+the loop thread exits and well before ``mpi4py``'s atexit
+finalizer runs.
+
+How the SCHEDULER drives retirement (and therefore the polling)
+---------------------------------------------------------------
+
+The SCHEDULER (``scheduler_iter_pp``) collaborates with this
+concern via three channels (per-iter, in body order):
+
+1. **Forced-retire of the deadline batch (symmetric across
+   ranks)**: at the top of the iter, after driving ``current``
+   through STATE_UPD_4, the SCHEDULER pops the oldest in-flight
+   batch (when the deque is full or we're draining) and calls
+   ``step(deadline, FINALIZE_9)``. On rk0 this drives the polling
+   for-loop's ``else`` arm blocking ``wait()`` -- the last
+   polling round, only reached when prior iters' rk0 polling
+   passes burned all ``range(pp_size - 2)`` body iterations
+   without breaking early. On non-rk0 intermediate ranks the
+   same ``step`` enters the concern's direct blocking-wait
+   branch. On the last rank it's a no-op pass-through (source
+   isend already issued at HANDOFF_6 entry).
+2. **rk0 opportunistic polling pass**: after the deadline retire,
+   rk0 walks the remaining in-flight deque from head and calls
+   ``try_step(parked, through=HANDOFF_6)`` on each. Counts
+   contiguous head successes as ``opp``: each succeeds when the
+   batch's recv landed early enough that ``recv_handle.test()``
+   returned done and the body's ``break`` short-circuited the
+   for loop without consuming the deadline ``else`` arm.
+3. **HC9 vote chain**: rk0 sends ``opp``; every non-rk0 rank
+   receives it (``forced`` is computed locally on every rank
+   from lockstep state, so it doesn't need to be on the wire --
+   see ``scheduler_iter_pp``'s "Lockstep invariant" section).
+   Then every rank pops and ``step(.., FINALIZE_9)`` ``opp``
+   more batches. On rk0 these are exactly the batches polled past
+   HANDOFF_6 in step (2) above. On non-rk0 intermediate ranks
+   each ``step`` enters this concern's ``recv_handle.wait()``
+   blocking branch. On the last rank it's again a no-op
+   pass-through.
+
+The number of polling rounds rk0 hands a batch is therefore not a
+fixed ``pp_size - 1`` — it can be anywhere from 1 (rk0 retires
+opportunistically the very first iter the batch is parked) up to
+``pp_size - 1`` (rk0 never opportunistically retires; the deadline
+``step(deadline, FINALIZE_9)`` triggers the ``else`` arm's
+blocking ``wait()``). The ``range(pp_size - 2)`` polling cap +
+``else`` arm guarantees the deadline iter always has a budget
+of one final round, which the ``else`` arm consumes via
+blocking wait.
 
 Ring topology summary
 ---------------------
 
-Reverse ring rk(n-1) -> rk0 -> rk1 -> ... -> rk(n-2):
+Forward ring rk(n-1) -> rk0 -> rk1 -> ... -> rk(n-2):
 
-* **Last rank (rk(n-1))**: source. ``pp_source_isend``. No recv.
-* **Intermediate ranks** (rk0 .. rk(n-3)): receive from prev ring
-  neighbor (= ``prev_pp_rank`` in PP forward direction, wrapping to
-  the last rank for rk0), then ``pp_intermediate_isend`` to next
-  ring neighbor.
-* **Second-to-last rank (rk(n-2))**: terminus. Receive only.
+* **Last rank (rk(n-1))**: source. ``pp_source_isend`` (to rk0
+  via PP wrap). No recv. No polling. No wait. Trivially past
+  HANDOFF_6 the moment the isend call returns.
+* **rk0**: receive from rk(n-1) (= ``prev_pp_rank`` since PP
+  wraps), poll loop with ``await again()`` (lets SCHEDULER
+  interleave other batches). Forward isend to rk1 via
+  ``pp_intermediate_isend``.
+* **Intermediate ranks rk1 .. rk(n-3)**: receive from prev,
+  blocking wait, forward isend to next via
+  ``pp_intermediate_isend``.
+* **Second-to-last rank (rk(n-2))**: receive from prev, blocking
+  wait. Terminus -- ``pp_intermediate_isend`` returns ``None``.
 
 For ``pp_size == 2`` the ring degenerates to one hop rk1 -> rk0:
-rk1 source-isends, rk0 (which is also second-to-last for n=2)
-receives only. Note that the polling-pass loop is empty (the
-deadline batch IS the only in-flight batch, and it's popped
-before the polling pass), so all of rk0's HANDOFF_6 work happens
-inside ``step(retired, FINALIZE_9)`` -- the concern's ``for``
-loop body is never entered (``range(0)``) and the ``else`` arm
-runs immediately to do the blocking ``wait()``.
+rk1 source-isends, rk0 receives only (rk0 is also second-to-last
+for n=2). rk0 is also the polling rank, so all of rk0's HANDOFF_6
+work happens via the polling loop / deadline blocking wait. The
+``range(pp_size - 2) = range(0)`` polling body never runs and the
+``else`` arm fires the blocking wait directly.
 """
 
 from __future__ import annotations
 
+import collections
 from typing import TYPE_CHECKING, Optional
 
 from ..batch_storage import BatchPhase, enter_phase
@@ -104,8 +181,36 @@ if TYPE_CHECKING:
 class RingBroadcastSampleConcern:
     """Per-batch HC10 ring-broadcast hop driver."""
 
+    def __init__(self) -> None:
+        # Lingering isend handle queue. See "Lingering isend queue"
+        # in the module docstring. ``handle_batch`` appends each
+        # batch's outgoing isend handle at FINALIZE_9 with auto-
+        # bound = ``pp_size`` (waits + pops the oldest when the
+        # deque is full). The trailing ``pp_size`` handles after
+        # the loop ends are drained by :meth:`__del__` -- the
+        # SCHEDULER nukes ``self._loop_crn`` on the loop thread
+        # before ``run_loop`` returns, so refcount-based GC
+        # fires this destructor synchronously on the loop
+        # thread, before MPI is finalized. See
+        # ``PyExecutorCoro._run_loop`` for the teardown protocol.
+        self._pending_isends: "collections.deque[object]" = (
+            collections.deque())
+
+    def __del__(self) -> None:
+        # Drain trailing pending isends on the loop thread before
+        # MPI is finalized. Safe because the SCHEDULER's
+        # ``_run_loop`` teardown nulls ``self._loop_crn`` after
+        # ``driver.run()`` returns -- this drops the last refs,
+        # CPython's refcount GC fires this synchronously on the
+        # loop thread, well before any module-level / mpi4py
+        # atexit teardown. Exceptions here go through
+        # ``sys.unraisablehook`` -- acceptable, since by this
+        # point the loop is already winding down.
+        while self._pending_isends:
+            self._pending_isends.popleft().wait()
+
     async def handle_batch(self, ctx: "Context") -> None:
-        # ---- HANDOFF_6: sync + (source-isend OR irecv + poll loop) ----
+        # ---- HANDOFF_6: sync + (source-isend OR irecv + recv) ----
         r6, _ = await enter_phase(BatchPhase.HANDOFF_6)
         sample_state = r6.sample_state
         send_handle: Optional[object] = None
@@ -129,47 +234,71 @@ class RingBroadcastSampleConcern:
         if sample_state.sampler_event is not None:
             sample_state.sampler_event.synchronize()
 
-        if ctx.svc.dist.is_last_pp_rank:
+        dist = ctx.svc.dist
+
+        if dist.is_last_pp_rank:
             # Source: isend immediately. Non-blocking so we return
-            # right away; FINALIZE_9 below waits on the handle.
-            send_handle = pp_source_isend(ctx.svc.dist, sample_state)
+            # right away; FINALIZE_9 below hands the handle off to
+            # the lingering queue. No recv, no polling, no wait --
+            # the batch is trivially past HANDOFF_6 from this
+            # point. The SCHEDULER's force-finalize on this rank
+            # is a no-op pass-through.
+            send_handle = pp_source_isend(dist, sample_state)
         else:
-            # Non-source: post irecv, then poll up to ``pp_size - 1``
-            # rounds. The SCHEDULER's per-iter polling pass calls
-            # ``try_step(.., HANDOFF_6)`` once per iter on this batch;
-            # the i-th call advances this loop by one round. Round
-            # bound = ``pp_size - 1`` matches the number of iters
-            # this batch sits in the in-flight deque before the
-            # SCHEDULER pops it for retire, so the last round
-            # coincides with the deadline iter -- on which we BLOCK
-            # rather than yield ``await again()`` so HANDOFF_6 always
-            # completes before retire.
-            recv_handle = pp_post_recv_sample_state(ctx.svc.dist)
+            # Non-source: post irecv. The recv-strategy splits on
+            # whether this rank is the polling authority (rk0) or
+            # a follower.
+            recv_handle = pp_post_recv_sample_state(dist)
             recv_payload: Optional[tuple] = None
-            for _ in range(ctx.svc.dist.pp_size - 2):
-                done, recv_payload = recv_handle.test()
-                if done:
-                    break
-                await again()
+
+            if dist.rank == 0:
+                # POLLING (rk0 only). The SCHEDULER's per-iter
+                # polling pass calls ``try_step(.., HANDOFF_6)``
+                # on each parked batch; the i-th call advances the
+                # for-loop body by one round (``test`` + ``await
+                # again`` if not done). Up to ``pp_size - 2``
+                # opportunistic rounds; the ``else`` arm is the
+                # deadline blocking wait, fired when the SCHEDULER
+                # drives this batch with ``step`` (no retry) at
+                # the deadline iter -- happens only if rk0 didn't
+                # opportunistically retire the batch earlier.
+                for _ in range(dist.pp_size - 2):
+                    done, recv_payload = recv_handle.test()
+                    if done:
+                        break
+                    await again()
+                else:
+                    recv_payload = recv_handle.wait()
             else:
-                # Last round = deadline iter. Block until done;
-                # ``request.wait()`` returns immediately if MPI
-                # already received the message during the
-                # previous polls + other batches' polls.
+                # FOLLOWING (rk1 .. rk(n-2)). No polling, no
+                # ``await again()``: the SCHEDULER doesn't poll
+                # these ranks. Each force-finalize per rk0's HC9
+                # vote enters this branch and blocks once on the
+                # recv. Brief block -- rk0 wouldn't have voted K
+                # unless its K isends to rk1 had been posted, and
+                # the chain propagates iter-by-iter through the
+                # other intermediates as their own scheduler
+                # iterations execute their own force-finalize +
+                # forward isend.
                 recv_payload = recv_handle.wait()
+
             pp_apply_recv_sample_state(sample_state, recv_payload)
             # Forward isend (returns None on second-to-last).
-            send_handle = pp_intermediate_isend(ctx.svc.dist, sample_state)
+            send_handle = pp_intermediate_isend(dist, sample_state)
 
-        # ---- FINALIZE_9: wait on our own isend ----
-        # Held as a coroutine local -- no per-microbatch slot ring,
-        # no cross-batch shared state. The wait must happen before
-        # the batch's ``sample_state.host`` storage is freed (the
-        # outer scheduler retires this batch immediately after this
-        # phase returns).
+        # ---- FINALIZE_9: hand off isend handle to lingering queue ----
+        # We deliberately DO NOT ``send_handle.wait()`` here -- see
+        # "Lingering isend queue" in the module docstring. Auto-
+        # bound: if the queue already holds ``pp_size`` handles,
+        # wait + pop the oldest before pushing the new one. The
+        # ``pp_size`` cap matches the legacy slot-ring's
+        # wait-deadline; by the time we wait on the oldest its
+        # matching recv has long since completed (=> non-blocking).
         await enter_phase(BatchPhase.FINALIZE_9)
         if send_handle is not None:
-            send_handle.wait()
+            while len(self._pending_isends) >= dist.pp_size:
+                self._pending_isends.popleft().wait()
+            self._pending_isends.append(send_handle)
 
 
 __all__ = ["RingBroadcastSampleConcern"]

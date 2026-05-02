@@ -103,6 +103,55 @@ class PPCommTag(IntEnum):
 
 
 # --------------------------------------------------------------------------- #
+# Pending-isend slot
+# --------------------------------------------------------------------------- #
+
+
+class PendingIsend:
+    """1-slot pending isend-handle holder.
+
+    Replaces the boilerplate ``if pending is not None: pending.wait();
+    pending = None`` pattern at SCHEDULER / concern call sites with
+    a single ``slot.set(new_handle)``: any old handle is waited on
+    first, then the new one (which may be ``None``) is stored.
+
+    On destruction (refcount GC), waits the still-held handle if
+    any -- so a holder that goes out of scope at loop-thread exit
+    flushes its trailing isend without the call site needing an
+    explicit final ``wait()``. Same teardown protocol as
+    :class:`RingBroadcastSampleConcern`'s lingering deque: the
+    SCHEDULER's ``_run_loop`` nulls its concern bag on the loop
+    thread before MPI is finalized, so this destructor fires
+    safely on the loop thread.
+
+    Use the slot as the SCHEDULER's per-iter park-and-reap
+    discipline -- e.g. for the HC9 vote isend in
+    ``scheduler_iter_pp``::
+
+        vote = PendingIsend()
+        while True:
+            ...
+            _, handle = ring_broadcast_executed_batch_num(...)
+            vote.set(handle)  # waits previous iter's handle if any
+    """
+
+    __slots__ = ("_handle", )
+
+    def __init__(self) -> None:
+        self._handle: Optional[object] = None
+
+    def set(self, handle: Optional[object]) -> None:
+        """Wait the previously-held handle (if any), then store ``handle``."""
+        if self._handle is not None:
+            self._handle.wait()
+        self._handle = handle
+
+    def __del__(self) -> None:
+        if self._handle is not None:
+            self._handle.wait()
+
+
+# --------------------------------------------------------------------------- #
 # Request-item broadcast (rk0 -> all PP ranks)
 # --------------------------------------------------------------------------- #
 
@@ -451,17 +500,26 @@ def ring_broadcast_executed_batch_num(
     executed_batch_num: int,
     *,
     enable_attention_dp: bool = False,
-) -> int:
+) -> Tuple[int, Optional[object]]:
     """rk0 votes; the count propagates rk0 -> rk(n-1) along the PP forward chain.
 
-    Uses BLOCKING ``send_object`` (rather than the legacy's
-    isend + per-microbatch slot ring) because the payload is a
-    single int and the chain has no bidirectional dependency that
-    could deadlock. The simpler primitive lets the SCHEDULER iter
-    avoid threading a vote-handle list across iters.
+    Returns ``(executed_batch_num, isend_handle)``. The handle is
+    ``None`` on the last PP rank (terminus -- no forward send) and
+    on single-rank jobs; otherwise it's the new ``isend_object``
+    handle the caller MUST hold and ``.wait()`` on later. The
+    SCHEDULER parks the handle in a 1-element pending slot and
+    waits on it at the start of the next iter (before issuing
+    the next vote) -- one iter of slack matches the legacy
+    isend + slot-ring behavior and stays non-blocking because the
+    matching recv on the next PP rank completes within ~one iter
+    of wall-clock (its own SCHEDULER iter top).
+
+    The blocking ``recv_object`` on non-first-PP ranks is left as
+    is: the recv has to actually have a value to forward; there's
+    no useful work to interleave with it inside the vote chain.
     """
     if dist.pp_size == 1:
-        return executed_batch_num
+        return executed_batch_num, None
 
     # First-PP-rank intra-DP-group broadcast.
     if dist.is_first_pp_rank and dist.tp_size * dist.cp_size > 1:
@@ -473,17 +531,19 @@ def ring_broadcast_executed_batch_num(
             tag=PPCommTag.EXECUTED_BATCH_NUM,
         )
 
+    handle: Optional[object] = None
     if not dist.is_last_pp_rank:
-        dist.send_object(
+        handle = dist.isend_object(
             executed_batch_num,
             dest=dist.next_pp_rank,
             tag=PPCommTag.EXECUTED_BATCH_NUM,
         )
-    return executed_batch_num
+    return executed_batch_num, handle
 
 
 __all__ = [
     "PPCommTag",
+    "PendingIsend",
     "forward_step_inter_pp",
     "pp_apply_recv_sample_state",
     "pp_broadcast_request_items",

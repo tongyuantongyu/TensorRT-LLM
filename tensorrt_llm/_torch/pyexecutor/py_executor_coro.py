@@ -12,11 +12,14 @@ Layout
 ======
 
 * :class:`PyExecutorCoro` -- main-thread surface (constructor,
-  public API, lifecycle). Spawns the loop thread.
-* :func:`run_loop` -- loop-thread entry point. Builds the
-  :class:`Driver` + scheduler coroutine, runs it.
-* :func:`scheduler_iter` -- the SCHEDULER iter (top-level coroutine).
-  Decides when to stop and constructs each batch.
+  public API, lifecycle). Spawns the loop thread; its
+  :meth:`PyExecutorCoro._run_loop` is the loop-thread entry
+  point that builds the :class:`Driver` + scheduler coroutine,
+  runs it, and tears down concern refs (so concern ``__del__``
+  hooks get to drain MPI handles on the loop thread before
+  shutdown).
+* :func:`scheduler_iter*` -- the SCHEDULER iter (top-level
+  coroutine). Decides when to stop and constructs each batch.
 * :func:`batch_body` -- per-batch coroutine. Drives concerns through
   every active phase via ``await resume(handle)``.
 
@@ -77,7 +80,7 @@ from .context import (Configuration, Context, MessagePort, PersistentState,
                       Service)
 from .coroutines import Batch, Concern, Driver, again, resume, try_resume
 from .executor_request_queue import ExecutorRequestQueue
-from .pp_helpers import ring_broadcast_executed_batch_num
+from .pp_helpers import PendingIsend, ring_broadcast_executed_batch_num
 from .resource_manager import KVCacheManagerV2, ResourceManagerType
 
 if TYPE_CHECKING:
@@ -391,8 +394,63 @@ async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
     Works for any ``pp_size >= 2``. Each rank runs an identical
     copy of this scheduler-iter; cross-rank coordination happens
     inside the per-batch concerns and inside two scheduler-direct
-    calls (HC9 retire-vote, HC10 ring-broadcast hop driven via
-    the per-batch :class:`RingBroadcastSampleConcern`).
+    calls -- HC9 (retire-count vote rk0 -> rk(N-1)) and HC10
+    (sample-state ring rk(N-1) -> rk0 -> rk1 -> ... -> rk(N-2),
+    driven by the per-batch :class:`RingBroadcastSampleConcern`).
+
+    Authority model: rk0 votes opportunism, forced is local
+    -------------------------------------------------------
+
+    Per-iter retirement on each rank is split into two parts:
+
+    * **``forced``** -- whether the iter must retire the deadline
+      (oldest) batch. Each rank evaluates the SAME predicate
+      ``len(in_flight) >= in_flight_max or not more_to_admit``
+      locally, NO cross-rank communication. The predicate is in
+      lockstep across ranks (see "Lockstep invariant" below), so
+      every rank reaches the same answer.
+    * **``opp``** -- the opportunistic count, i.e. how many
+      additional oldest deque entries (after the deadline) have
+      already completed HANDOFF_6 this iter. ONLY rk0 polls
+      (counts contiguous head ``try_step`` successes) -- it sees
+      HC10 receives FIRST in the ring (rk(N-1) -> rk0 is the
+      only ring hop with the source on one side), so rk0 is the
+      natural "queue authority" for retire eligibility.
+      Downstream ranks always lag in wall-clock for the same
+      batch's HC10 progress, so polling them locally would never
+      opportunistically retire ahead of rk0. rk0 broadcasts
+      ``opp`` via HC9; every non-rk0 rank receives it.
+
+    Total retired this iter on every rank = ``forced + opp``.
+    All ranks retire the same set of batches in the same iter,
+    keeping the per-rank active-request pool in sync (request
+    admission feeds it from the same broadcast items, request
+    retirement removes the same ones via this combined drive).
+
+    Lockstep invariant
+    ------------------
+
+    The forced-predicate ``len(in_flight) >= in_flight_max or
+    not more_to_admit`` is computed locally on every rank and
+    must agree across ranks. It does, by induction:
+
+    * ``in_flight_max = pp_size - 1`` is constant.
+    * ``len(in_flight)`` mutates by ``+1`` on admit (gated by
+      ``more_to_admit``) and ``-K`` on retire (``K = forced +
+      opp`` -- ``forced`` lockstep by IH; ``opp`` from broadcast).
+      Starting from an empty deque (lockstep base case), each
+      iter preserves lockstep.
+    * ``more_to_admit = not is_shutdown or not pool.is_drained()
+      or not waiting_queue_empty()`` -- each clause is lockstep:
+      shutdown markers and request items reach every rank via the
+      :func:`pp_broadcast_request_items` chain at SCHEDULE_0;
+      pool mutations (admit / retire / unmark_inflight) take
+      lockstep inputs; waiting queue is fed by the same broadcast.
+
+    Future code changes that introduce a per-rank source of state
+    (e.g. asymmetric request admission, async retirement) would
+    break this invariant and require revisiting the vote payload
+    to include ``forced`` as well.
 
     Per-rank in-flight model
     ------------------------
@@ -400,12 +458,13 @@ async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
     The SCHEDULER holds a :class:`collections.deque` of in-flight
     :class:`Batch` handles, age order **left=oldest, right=newest**:
 
-    * ``deque[-1]``  (= ``k=1`` -- the most-recently-scheduled
+    * ``deque[-1]``  (= ``k=1`` -- the most-recently-admitted
       batch, one iter old).
-    * ``deque[0]``   (= ``k=n-1`` -- the oldest in-flight batch,
-      n-1 iters old). All ranks retire this batch this iter.
-    * Intermediate slots: parked, get one ``test()`` poll per
-      iter via the per-iter ``try_step`` pass below.
+    * ``deque[0]``   (= ``k_max``, the oldest in-flight batch).
+      Steady-state ``k_max <= n-1``, equal to n-1 only when no
+      opportunistic retirement happened this iter.
+    * Intermediate slots: parked. Get rk0-side polling rounds
+      via the per-iter ``try_step`` pass below.
 
     For ``pp_size == 2``: deque max size = 1, so ``deque[-1] ==
     deque[0]``; the same batch's HANDOFF_6 work and FINALIZE_9
@@ -416,43 +475,91 @@ async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
     --------------
 
     1. **Build current; drive through STATE_UPD_4.** Runs
-       SCHEDULE_0 (PP-propagated), RESOURCE_PREP_1, FORWARD_2
-       (NCCL p2p hands activations to the next PP rank),
-       SAMPLE_3 (real on last rank, placeholder elsewhere),
-       STATE_UPD_4. ``current`` is now suspended at HANDOFF_6.
-    2. **Pick the retire deadline.** If
-       ``len(deque) == n-1`` (steady state) OR ``not more_to_admit``
-       (drain), pop ``deque[0]`` -- the rest of the body knows it
-       as ``retired`` and drives it past HANDOFF_6 in step 4.
-    3. **Polling pass.** ``try_step`` every batch STILL IN
-       ``in_flight`` (i.e. excluding ``retired``) through
-       ``HANDOFF_6``. The :class:`RingBroadcastSampleConcern`
-       posts its ``irecv`` on the first call and polls
-       ``request.test()`` on subsequent calls -- each ``test()``
-       drives MPI's progress engine, so the polling itself is
-       productive even when the message hasn't arrived.
-       ``try_step`` returns ``None`` when the concern yielded
-       ``await again()``; the SCHEDULER moves on to the next
-       batch. On the LAST PP rank, ``deque[-1]``'s HANDOFF_6
-       immediately issues the source-isend (no ``again()``) and
-       ``try_step`` returns the read view in one call.
-    4. **Drive ``retired`` through FINALIZE_9.** This is the
-       deadline drive for ``retired``'s HANDOFF_6: by this iter
-       the polling pass has called ``try_step`` on it
-       ``pp_size - 2`` times across previous iters (one round
-       each); this final drive uses ``step`` (not ``try_step``),
-       so the concern's ``for ... else`` polling loop falls into
-       its ``else`` arm and BLOCKING-waits on the recv -- which
-       is the ``pp_size - 1``-th and last round. After HANDOFF_6
-       completes, ``step(through=FINALIZE_9)`` carries the batch
-       through APPLY_7 + RESPOND_8 + FINALIZE_9 (which waits on
-       this batch's own isend handle). No-op when ``retired`` is
-       ``None``.
-    5. **HC9 retire-vote.** rk0 sends ``executed_batch_num``
-       (1 if step 4 retired something, 0 otherwise) along the PP
-       forward chain via blocking ``send_object``.
+       SCHEDULE_0 (PP-broadcast + propagated schedule),
+       RESOURCE_PREP_1, FORWARD_2 (NCCL p2p hands activations to
+       the next PP rank), SAMPLE_3 (real on last rank,
+       placeholder elsewhere), STATE_UPD_4. ``current`` is now
+       suspended at HANDOFF_6.
+    2. **Forced retire (deadline; symmetric across ranks).** If
+       the deque is full or we're draining, pop the oldest and
+       ``step(.., FINALIZE_9)`` it -- naturally first since the
+       deadline batch is the oldest. On rk0 this is the
+       polling concern's last polling round (the for-loop's
+       ``else`` arm blocking ``wait()``); on non-rk0 ranks it's
+       the concern's direct blocking-wait branch. Sets
+       ``forced = 1``; ``forced = 0`` when no force fires (warmup
+       or after-opportunistic-drain).
+    3. **rk0 polling pass.** Walk the now-post-deadline
+       ``in_flight`` from head and call ``try_step(parked,
+       through=HANDOFF_6)`` on each. Count contiguous head
+       successes as ``opp``: at the first ``try_step`` that
+       returns ``None`` (await again() cascaded back -- recv not
+       landed) stop counting; remaining batches still get one
+       ``try_step`` round each so their polling-loop counters
+       advance toward future deadlines. Non-rk0 ranks skip this
+       pass entirely (no polling, no round consumption -- their
+       concern's HC10 branch is the direct blocking-wait variant;
+       see :class:`RingBroadcastSampleConcern`).
+    4. **HC9 vote.** Send ``opp`` -- only rk0's opportunistic
+       count is on the wire; ``forced`` is recomputed locally on
+       every rank (lockstep). Sent along the PP forward chain
+       (rk0 -> rk1 -> ... -> rk(N-1)) via non-blocking
+       ``isend_object`` with synchronous ``recv_object`` on every
+       non-rk0 rank. Each rank assigns the received value back
+       to ``opp`` -- on rk0 this is identity (its own value), on
+       non-rk0 it's rk0's authoritative count. The forward isend
+       handle is parked in a 1-element :class:`PendingIsend`;
+       next iter's ``vote.set`` waits the previous handle and
+       stores the new one (one iter of slack -> non-blocking).
+    5. **Retire ``opp`` more.** Pop ``opp`` more batches from
+       deque head, ``step(.., FINALIZE_9)`` each. On rk0 these
+       are the opportunistic ones (already past HANDOFF_6 from
+       step 3, so ``step`` just runs APPLY_7 + RESPOND_8 +
+       FINALIZE_9 -- releases KV resources, sends responses,
+       hands isend handle to lingering queue). On non-rk0 ranks
+       each ``step`` enters the concern's ``recv_handle.wait()``
+       blocking branch -- which completes promptly because rk0
+       wouldn't have voted ``opp`` unless its matching ``opp``
+       isends had been posted. Total retired this iter on every
+       rank: ``forced + opp``.
     6. **Push ``current`` to deque right** (now k=0 this iter,
        becomes k=1 next iter). Skip when draining.
+
+    Last-rank fast path (special behavior)
+    --------------------------------------
+
+    The last PP rank is the HC10 source -- its ``handle_batch``
+    HANDOFF_6 body just issues a non-blocking ``pp_source_isend``
+    and returns. So every batch on the last rank is trivially
+    past HANDOFF_6 the moment its STATE_UPD_4 completes; both
+    the deadline step (2) and the extra-retire step (5) are
+    fast pass-throughs through the concern body, never blocking
+    on a recv (since there isn't one). The HC9 vote chain still
+    propagates through the last rank as a follower (it receives
+    K and uses it to drive its own deque), to keep the active
+    pool in lockstep with rk0's retirement decisions.
+
+    Pending-isend reap
+    ------------------
+
+    Two pending-isend reservoirs ride along with the loop:
+
+    * **HC9 vote** -- one ``PendingIsend`` slot. ``vote.set(new)``
+      at step (4) waits the previous iter's handle (one iter of
+      slack matches the next-PP-rank's recv latency, so
+      non-blocking) and stores the new one. The trailing handle
+      is waited by ``PendingIsend.__del__`` when this function
+      returns and the local goes out of scope.
+    * **HC10 ring-broadcast isends** -- a per-rank deque on
+      :class:`RingBroadcastSampleConcern`, self-bounded to
+      ``pp_size`` handles on push (waits + pops the oldest when
+      a new push arrives on a full deque). Trailing handles are
+      waited by :meth:`RingBroadcastSampleConcern.__del__`.
+
+    Both destructors fire on the loop thread before it exits,
+    courtesy of the ref-nulling in
+    :meth:`PyExecutorCoro._run_loop`. The SCHEDULER body itself
+    therefore needs no explicit final-drain calls.
 
     Shutdown drain
     --------------
@@ -462,10 +569,13 @@ async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
     no-ops carry the body through unchanged) until ``in_flight``
     drains. Each drain iter still does steps 2-5 so the PP
     forward chain stays in lockstep across ranks. Step (2)'s
-    ``retiring`` condition includes ``not more_to_admit``, so the
-    deque is drained one batch per iter -- ``pp_size - 1`` iters
-    total in the worst case. After the deque is empty AND no new
-    batch is admitted, the next iter's termination check returns.
+    forced-retire condition includes ``not more_to_admit``, so
+    the deque is drained at least one batch per iter --
+    ``pp_size - 1`` iters total in the worst case (less if
+    opportunistic retirement kicks in during drain too). After
+    the deque is empty AND no new batch is admitted, the loop
+    returns; pending-isend cleanup rides on the GC chain
+    documented above.
     """
     if ctx.svc.dist.pp_size < 2:
         raise NotImplementedError(
@@ -477,16 +587,21 @@ async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
             "set (PyExecutorCoro.__init__ wires this when pp_size > 1).")
 
     pp_size = ctx.svc.dist.pp_size
-    # Per-rank in-flight batch ring. Left=oldest (k=n-1, retiring
-    # this iter when full), right=newest (k=1, last-rank source-
-    # isend this iter). Max size = n-1.
+    # Per-rank in-flight batch ring. Left=oldest, right=newest.
+    # Max size = n-1; current iter's opportunistic retirement may
+    # leave it smaller (the next iter's admit refills it back up
+    # to the max).
     in_flight: collections.deque = collections.deque()
     in_flight_max = pp_size - 1
+    is_rk0 = ctx.svc.dist.rank == 0
+    # HC9 vote isend slot: ``vote.set(new_handle)`` waits the
+    # previous iter's handle (one iter of slack matches the
+    # next-PP-rank's recv latency, so non-blocking) and stores
+    # the new one. Trailing handle is waited by ``__del__`` when
+    # this function returns and the local goes out of scope.
+    vote = PendingIsend()
 
     while True:
-        # Termination: nothing to admit AND nothing parked.
-        # During shutdown drain we keep iterating until the deque
-        # empties; see "Shutdown drain" in the docstring.
         more_to_admit = (not ctx.port.is_shutdown
                          or not ctx.svc.pool.is_drained()
                          or not crn.schedule.waiting_queue_empty())
@@ -503,22 +618,79 @@ async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
             storage = BatchStorage()
             current = Batch(batch_body(ctx, crn), storage)
 
-        # Body: 6 steps from the docstring's "Per-iter steps".
-        # ``current=None`` (drain) makes step (1) a no-op via the
-        # ``step(None)`` convention and step (6) is gated explicitly;
-        # steps (2)-(5) are unchanged from the steady state.
+        # Per-iter steps (numbered to match the docstring's
+        # "Per-iter steps" section):
+        #
+        # (1) Drive ``current`` through STATE_UPD_4.
+        # (2) Forced retire of the deadline batch. Each rank
+        #     evaluates the same forced-predicate locally; the
+        #     predicate is in lockstep across ranks because
+        #     ``len(in_flight)`` and ``more_to_admit`` are both
+        #     lockstep (see "Lockstep invariant" in the docstring).
+        #     Naturally first since the deadline batch is the
+        #     oldest. On rk0 this drives the polling concern's
+        #     ``else`` arm blocking ``wait()`` (the last polling
+        #     round); on non-rk0 ranks it drives the concern's
+        #     direct blocking-wait branch. ``in_flight`` non-empty
+        #     is implied: ``in_flight_max >= 1`` rules out the
+        #     ``len() >= in_flight_max`` arm, and the early
+        #     ``return`` above rules out the ``not more_to_admit``
+        #     arm with empty deque.
+        # (3) Polling pass on rk0 only over the (now post-deadline)
+        #     in-flight deque. Count contiguous head successes as
+        #     ``opp``; later batches still get one round each so
+        #     their polling loops advance even if the head isn't
+        #     yet ready. ``try_step`` returning ``None`` means
+        #     ``await again()`` cascaded back (recv not landed);
+        #     stop counting (in-order MPI delivery means later
+        #     batches aren't ready either) but continue the loop
+        #     to consume their polling rounds.
+        # (4) HC9 vote. rk0 broadcasts only ``opp`` -- ``forced``
+        #     is computed identically on every rank from the
+        #     lockstep state, so it doesn't need to be on the
+        #     wire. Non-rk0 ranks' local ``opp`` (which is 0,
+        #     since they don't poll) is overwritten by the recv.
+        # (5) Retire ``opp`` more batches. On rk0 these are the
+        #     opportunistic ones already past HANDOFF_6 from
+        #     step 3 (``step`` just runs FINALIZE_9). On non-rk0
+        #     ranks ``step`` drives the concern's blocking-wait
+        #     branch for each. Total retired this iter on every
+        #     rank: ``forced + opp``.
+        # (6) Push current to deque right (skip when draining).
         try:
+            # (1)
             await step(current, through=BatchPhase.STATE_UPD_4)
-            retired = None
+
+            # (2)
             if len(in_flight) >= in_flight_max or not more_to_admit:
-                retired = in_flight.popleft()
-            for parked in in_flight:
-                await try_step(parked, through=BatchPhase.HANDOFF_6)
-            await step(retired, through=BatchPhase.FINALIZE_9)
-            ring_broadcast_executed_batch_num(
+                deadline = in_flight.popleft()
+                await step(deadline, through=BatchPhase.FINALIZE_9)
+
+            # (3)
+            opp = 0
+            counting = True
+            if is_rk0:
+                for parked in in_flight:
+                    result = await try_step(parked,
+                                            through=BatchPhase.HANDOFF_6)
+                    if result is None:
+                        counting = False
+                    elif counting:
+                        opp += 1
+
+            # (4)
+            opp, vote_handle = ring_broadcast_executed_batch_num(
                 dist=ctx.svc.dist,
-                executed_batch_num=1 if retired is not None else 0,
+                executed_batch_num=opp,
             )
+            vote.set(vote_handle)
+
+            # (5)
+            for _ in range(opp):
+                batch = in_flight.popleft()
+                await step(batch, through=BatchPhase.FINALIZE_9)
+
+            # (6)
             if current is not None:
                 in_flight.append(current)
         except Exception as exc:
@@ -531,46 +703,9 @@ async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
 
 
 # Type alias for the scheduler-iter shape: ``async def fn(ctx, crn) -> None``.
-# Used by ``run_loop`` / ``PyExecutorCoro`` to pick the variant.
+# Used by ``PyExecutorCoro`` to pick the variant.
 SchedulerIterFn = Any  # Callable[[Context, Concerns], Coroutine] but kept
 # loose so we don't have to import Coroutine here.
-
-
-def run_loop(
-    ctx: Context,
-    crn: Concerns,
-    *,
-    scheduler_iter_fn: SchedulerIterFn = scheduler_iter_plain,
-) -> None:
-    """Loop-thread entry point.
-
-    Sets the device, runs :class:`Driver` against the chosen
-    SCHEDULER iter (plain or overlap) until it completes (clean
-    shutdown) OR raises (catastrophic). On the way out:
-
-    * Always set ``ctx.port.is_shutdown = True`` so any blocked
-      ``ClientChannel.await_*`` waiters return.
-    * Always notify the response cv (via a no-op enqueue) so
-      blocked waiters get woken up after the final drain.
-    * Always set ``ctx.port.shutdown_event`` so the main thread
-      ``shutdown()`` join can return.
-
-    ``crn`` is forwarded into the scheduler iter -- the bag of
-    concern instances is loop-thread state stashed on
-    :class:`PyExecutorCoro` and passed in here, NOT on ``ctx``.
-    """
-    torch.cuda.set_device(ctx.conf.device_id)
-    driver = Driver(scheduler_iter_fn(ctx, crn))
-    try:
-        driver.run()
-    finally:
-        ctx.port.is_shutdown = True
-        # Wake any blocked ``await_responses`` callers. The cv
-        # lives on ``ctx.svc.client``; calling enqueue with an empty
-        # list does the notify_all under the lock without producing
-        # spurious responses.
-        ctx.svc.client.enqueue([])
-        ctx.port.shutdown_event.set()
 
 
 # --------------------------------------------------------------------------- #
@@ -900,13 +1035,59 @@ class PyExecutorCoro:
         if self._loop_thread is not None and self._loop_thread.is_alive():
             return
         self._loop_thread = threading.Thread(
-            target=run_loop,
-            args=(self._loop_ctx, self._loop_crn),
-            kwargs={"scheduler_iter_fn": self._scheduler_iter_fn},
+            target=self._run_loop,
             name="trtllm-executor-loop",
             daemon=True,
         )
         self._loop_thread.start()
+
+    def _run_loop(self) -> None:
+        """Loop-thread entry point.
+
+        Sets the device, runs :class:`Driver` against the chosen
+        SCHEDULER iter until it completes (clean shutdown) OR
+        raises (catastrophic). On the way out:
+
+        * Always set ``ctx.port.is_shutdown = True`` so any blocked
+          ``ClientChannel.await_*`` waiters return.
+        * Always notify the response cv (via a no-op enqueue) so
+          blocked waiters get woken up after the final drain.
+        * Always set ``ctx.port.shutdown_event`` so the main thread
+          ``shutdown()`` join can return.
+        * **Null ``self._loop_crn``** so the executor's ref to
+          the :class:`Concerns` bag drops. Together with the
+          local ``driver`` going out of scope when this function
+          returns, that releases every ref to every concern,
+          which fires their ``__del__`` synchronously on the
+          loop thread -- before the thread terminates and well
+          before mpi4py's atexit finalizer runs. This is what
+          lets concerns hold MPI handles past their last
+          ``handle_batch`` call (e.g.
+          :class:`RingBroadcastSampleConcern`'s lingering isend
+          deque) and still drain them safely on shutdown.
+        """
+        ctx = self._loop_ctx
+        torch.cuda.set_device(ctx.conf.device_id)
+        driver = Driver(self._scheduler_iter_fn(ctx, self._loop_crn))
+        try:
+            driver.run()
+        finally:
+            ctx.port.is_shutdown = True
+            # Wake any blocked ``await_responses`` callers. The cv
+            # lives on ``ctx.svc.client``; calling enqueue with an
+            # empty list does the notify_all under the lock without
+            # producing spurious responses.
+            ctx.svc.client.enqueue([])
+            ctx.port.shutdown_event.set()
+            # Drop the executor-side ref to the concern bag. The
+            # only remaining refs (this frame's local-via-driver-
+            # closure on ``self._loop_crn``) drop when the frame
+            # is popped on return; refcount GC then fires every
+            # concern's ``__del__`` on this (loop) thread. See
+            # the docstring above and
+            # :class:`RingBroadcastSampleConcern.__del__` for the
+            # MPI-handle teardown that piggybacks on this.
+            self._loop_crn = None
 
     def __enter__(self) -> "PyExecutorCoro":
         return self
