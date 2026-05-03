@@ -136,7 +136,16 @@ def get_pp_layers(
             f"must match the number of layers ({num_layers}) "
             f"in KV cache manager, but got layer_mask: {layer_mask}")
         total_num_layers = len(layer_mask)
-    pp_layers = mapping.pp_layers(total_num_layers)
+    # When layer_mask extends beyond pp_partition coverage (e.g., MTP draft
+    # layers appended after target hidden layers), compute pp_layers for the
+    # base layers, then assign extra layers to the last PP rank.
+    base_num_layers = total_num_layers
+    if (layer_mask is not None and mapping.pp_partition is not None
+            and total_num_layers > sum(mapping.pp_partition)):
+        base_num_layers = sum(mapping.pp_partition)
+    pp_layers = mapping.pp_layers(base_num_layers)
+    if base_num_layers < total_num_layers and mapping.is_last_pp_rank():
+        pp_layers.extend(range(base_num_layers, total_num_layers))
     if layer_mask is not None:
         pp_layers = [i for i in pp_layers if layer_mask[i]]
     # Only add speculative layers when layer_mask is not provided.
@@ -207,6 +216,39 @@ def _locate_accepted_draft_tokens(requests: List[LlmRequest]):
         dtype=torch.int32,
         device='cuda')
     return num_accepted_draft_tokens_offset, accepted_draft_tokens_indices, rewind_draft_token_separate_adjustments
+
+
+# M-RoPE (Qwen2-VL/Qwen3-VL) splits positions across 3 axes: temporal/height/width.
+_MROPE_NUM_AXES = 3
+
+
+def _make_warmup_mrope_position_ids(token_num: int) -> torch.Tensor:
+    """Build (_MROPE_NUM_AXES, 1, token_num) mrope_position_ids for warmup."""
+    return (torch.arange(0, token_num,
+                         dtype=torch.int32).expand(_MROPE_NUM_AXES, 1,
+                                                   -1).clone())
+
+
+def _populate_dummy_mrope_config(req: LlmRequest, token_num: int,
+                                 is_gen: bool) -> None:
+    """Attach a dummy mrope_config to a warmup request's py_multimodal_data.
+
+    Used by the dummy-request paths in both KVCacheManager and KVCacheManagerV2
+    to satisfy models that consume mrope_config (e.g. Qwen2-VL) during warmup.
+
+    TODO(TRTLLM-12045): each model should provide its own warmup dummy_data
+    via an input-processor hook — this ad-hoc helper is the interim
+    workaround.
+    """
+    mrope_config: Dict[str, torch.Tensor] = {
+        "mrope_position_ids": _make_warmup_mrope_position_ids(token_num),
+    }
+    if is_gen:
+        mrope_config["mrope_position_deltas"] = torch.zeros(
+            1, dtype=torch.int32).unsqueeze(0)
+    if req.py_multimodal_data is None:
+        req.py_multimodal_data = {}
+    req.py_multimodal_data["mrope_config"] = mrope_config
 
 
 def _update_kv_cache_draft_token_location(cache_manager,
@@ -661,7 +703,7 @@ class KVCacheManager(BaseResourceManager):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
-            # Collect first-chunk requests eligible for batch add_sequence.
+            # Collect first-chunk requests eligible for add_sequence_batch.
             # When block reuse is enabled, addSequenceBatch uses a two-phase
             # claim-then-onboard strategy that prevents host offloading from
             # evicting reusable blocks in the radix tree.
@@ -709,7 +751,8 @@ class KVCacheManager(BaseResourceManager):
                         self.kv_connector_manager.update_state_after_alloc(
                             req, block_ids)
 
-            # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
+            # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in
+            # `add_sequence_batch` due to KV cache reuse, so we rebuild the context request lists here.
             scheduled_batch.reset_context_requests()
 
             for req in scheduled_batch.generation_requests:
@@ -811,23 +854,11 @@ class KVCacheManager(BaseResourceManager):
                         (req_id, token_num, beam_width))
                     draft_batch_llm_requests.append(req)
 
-            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrope_config to the request here.
             if use_mrope:
-                dummy_mrope_position_ids = torch.arange(
-                    0, token_num, dtype=torch.int32).expand(3, 1, -1).clone()
-                req.py_multimodal_data = {
-                    "mrope_config": {
-                        "mrope_position_ids": dummy_mrope_position_ids
-                    }
-                }
-                if is_gen:
-                    dummy_mrope_position_deltas = torch.zeros(
-                        1, dtype=torch.int32).unsqueeze(0)
-                    req.py_multimodal_data["mrope_config"][
-                        "mrope_position_deltas"] = dummy_mrope_position_deltas
+                _populate_dummy_mrope_config(req, token_num, is_gen)
             requests.append(req)
 
-        # Batch add_sequence for all dummy requests, then add extra tokens.
+        # Use add_sequence_batch for all dummy requests, then add extra tokens.
         # This must happen before is_gen state modifications below, which may
         # set prompt_len to 0 and trigger assertion in setPrepopulatedPromptLen.
         if batch_request_infos:
@@ -846,7 +877,7 @@ class KVCacheManager(BaseResourceManager):
                 for _ in range(self.num_extra_kv_tokens):
                     draft_kv_cache_manager.impl.add_token(req_id)
 
-        # Set is_gen state after batch add_sequence to avoid modifying
+        # Set is_gen state after add_sequence_batch to avoid modifying
         # prompt_len before the C++ side reads it.
         if is_gen:
             for i, req in enumerate(requests):
@@ -937,7 +968,7 @@ class KVCacheManager(BaseResourceManager):
         HF config layer count differs from runtime), it is used directly
         without PP distribution.  Otherwise the layer count is derived from
         the model config and distributed evenly across PP ranks via
-        ``mapping.pp_layers``.
+        `mapping.pp_layers`.
         """
         if num_layers is not None:
             return max(num_layers, 1)
@@ -2154,7 +2185,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Token num upper bound is the maximum number of tokens that can be allocated in the kv cache manager.
         # We need to add extra tokens to the token num upper bound to account for the extra tokens.
         clamped = self.impl.clamp_max_seq_len_for_mem(
-            batch_size, token_num_upper_bound) - extra_tokens
+            batch_size, token_num_upper_bound + extra_tokens) - extra_tokens
         # clamp_max_seq_len_for_mem considers all tiers (GPU + host).  When
         # max_tokens is explicitly set, cap by GPU-only capacity so callers
         # (e.g. CUDA graph warmup) don't exceed the GPU pool.
@@ -2606,20 +2637,8 @@ class KVCacheManagerV2(BaseResourceManager):
                             release_resources(req, free_draft_resources=True)
                             return None
 
-            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrope_config to the request here.
             if use_mrope:
-                dummy_mrope_position_ids = torch.arange(
-                    0, token_num, dtype=torch.int32).expand(3, 1, -1).clone()
-                req.py_multimodal_data = {
-                    "mrope_config": {
-                        "mrope_position_ids": dummy_mrope_position_ids
-                    }
-                }
-                if is_gen:
-                    dummy_mrope_position_deltas = torch.zeros(
-                        1, dtype=torch.int32).unsqueeze(0)
-                    req.py_multimodal_data["mrope_config"][
-                        "mrope_position_deltas"] = dummy_mrope_position_deltas
+                _populate_dummy_mrope_config(req, token_num, is_gen)
             requests.append(req)
 
         return requests

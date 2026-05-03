@@ -69,6 +69,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from .scheduler import ScheduledRequests
 from .scheduler.scheduler import SerializableSchedulerOutput
 
 if TYPE_CHECKING:
@@ -78,7 +79,7 @@ if TYPE_CHECKING:
     from .model_engine import ModelEngine
     from .resource_manager import ResourceManager
     from .sampler import Sampler, SampleState
-    from .scheduler import RequestList, RequestScheduler, ScheduledRequests
+    from .scheduler import RequestList, RequestScheduler
 
 
 # --------------------------------------------------------------------------- #
@@ -270,11 +271,17 @@ def pp_schedule_and_propagate(
     # first PP rank when DP broadcast is active (DP needs each DP
     # group's first-PP rank to schedule its own slice).
     if dist.rank == 0 or (dist.is_first_pp_rank and is_dp_broadcast):
-        scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = \
-            scheduler.schedule_request(active_requests, inflight_req_ids)
+        scheduler_output = scheduler.schedule_request(active_requests, inflight_req_ids)
+        scheduled_requests = ScheduledRequests()
+        # ``SchedulerOutput.context_requests`` is a flat list; distribute
+        # it into ``context_requests_chunking`` / ``context_requests_last_chunk``
+        # via ``LlmRequest.is_last_context_chunk`` so the serialization
+        # below captures it.
+        scheduled_requests.reset_context_requests(scheduler_output.context_requests)
+        scheduled_requests.generation_requests = scheduler_output.generation_requests
+        scheduled_requests.paused_requests = scheduler_output.paused_requests
         serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
-            scheduled_batch, fitting_disagg_gen_init_requests,
-            num_fitting_reqs)
+            scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests)
 
     # First-PP-rank intra-DP-group broadcast (TP / CP fanout).
     if dist.is_first_pp_rank:
