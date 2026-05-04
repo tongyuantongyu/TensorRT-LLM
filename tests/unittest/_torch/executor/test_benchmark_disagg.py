@@ -12,22 +12,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for benchmark disaggregated serving gating in PyExecutor.
+"""Tests for benchmark disaggregated serving gating.
 
 In benchmark disagg mode the GEN executor must defer the forward pass
 until all benchmark requests have completed KV transfer.  These tests
 cover:
-- ``is_benchmark_disagg`` attribute initialisation
-- ``_is_benchmark_disagg_fill_complete`` (non-ADP and ADP paths)
+- ``is_benchmark_disagg`` initialisation (on :class:`Configuration`)
+- ``Ops.is_benchmark_disagg_fill_complete`` (non-ADP and ADP paths)
 - ``can_forward`` gating initialisation and transitions
 - Incremental fill convergence when CTX has limited KV cache capacity
-- Non-blocking behaviour of ``_prepare_and_schedule_batch``
+
+Post-refactor notes
+-------------------
+``_is_benchmark_disagg_fill_complete`` and ``_check_benchmark_disagg_gate``
+used to be private methods on :class:`PyExecutor`. They've been migrated
+to :class:`tensorrt_llm._torch.pyexecutor.executor_loop_ops.Ops` and now
+read from ``self._ctx.{service, config, state, port}`` instead of
+``self``. The tests build a lightweight :class:`MockOpsCtx` that
+populates just enough of the bucket tree for these two methods.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.executor_loop_context import (
+    Configuration,
+    PersistentState,
+    Service,
+)
+from tensorrt_llm._torch.pyexecutor.executor_loop_tasks import BenchmarkGateTask, IngestionTask
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 # ---------------------------------------------------------------------------
@@ -56,43 +71,72 @@ def _make_scheduled_batch(num_gen_requests: int, num_dummy_requests: int = 0) ->
     return batch
 
 
-class MockBenchmarkExecutor:
-    """Minimal stub mirroring the PyExecutor attributes used by
-    ``_is_benchmark_disagg_fill_complete``, ``_check_benchmark_disagg_gate``,
-    and the ``can_forward`` gate.
+class _BenchmarkTaskMock(BenchmarkGateTask):
+    """BenchmarkGateTask subclass that exposes legacy ``ex.X`` attribute
+    names as read-write proxy properties over the ``_ctx.{state,config}``
+    bucket tree.
 
-    Binds the real production methods so tests exercise actual logic
-    without needing a fully-initialised executor.
+    The old tests treated PyExecutor as a flat object with direct
+    ``ex.num_fetch_requests = ...`` writes; after the refactor those
+    fields live on ``_ctx.state`` / ``_ctx.config``. These properties
+    let the existing test bodies remain untouched.
     """
 
-    def __init__(
-        self,
-        benchmark_req_queues_size: int = 0,
-        kv_cache_transceiver=None,
-        enable_attention_dp: bool = False,
-        tp_size: int = 1,
-        rank: int = 0,
-        num_fetch_requests: int = 0,
-        is_warmup: bool = False,
-    ):
-        self.benchmark_req_queues_size = benchmark_req_queues_size
-        self.kv_cache_transceiver = kv_cache_transceiver
-        self.is_benchmark_disagg = (
-            benchmark_req_queues_size > 0 and kv_cache_transceiver is not None
-        )
-        self._benchmark_fill_phase_active = self.is_benchmark_disagg
-        self.enable_attention_dp = enable_attention_dp
-        self.num_fetch_requests = num_fetch_requests
-        self.is_warmup = is_warmup
+    # Read/write proxies to state.
+    _benchmark_fill_phase_active = property(
+        lambda self: self._ctx.state.benchmark_fill_phase_active,
+        lambda self, v: setattr(self._ctx.state, "benchmark_fill_phase_active", v),
+    )
+    num_fetch_requests = property(
+        lambda self: self._ctx.state.num_fetch_requests,
+        lambda self, v: setattr(self._ctx.state, "num_fetch_requests", v),
+    )
 
-        self.dist = Mock()
-        self.dist.rank = rank
-        self.dist.tp_size = tp_size
+    # Aliases for the method names the old tests call through.
+    @property
+    def _is_benchmark_disagg_fill_complete(self):
+        return self.is_benchmark_disagg_fill_complete
 
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    @property
+    def _check_benchmark_disagg_gate(self):
+        return self.check_benchmark_disagg_gate
 
-    _is_benchmark_disagg_fill_complete = PyExecutor._is_benchmark_disagg_fill_complete
-    _check_benchmark_disagg_gate = PyExecutor._check_benchmark_disagg_gate
+
+def MockBenchmarkExecutor(
+    benchmark_req_queues_size: int = 0,
+    kv_cache_transceiver=None,
+    enable_attention_dp: bool = False,
+    tp_size: int = 1,
+    rank: int = 0,
+    num_fetch_requests: int = 0,
+    is_warmup: bool = False,
+):
+    """Build a ``_BenchmarkOpsMock`` wired to a minimal Ctx that
+    populates just the buckets / fields the benchmark-disagg helpers
+    touch.
+    """
+    dist = Mock()
+    dist.rank = rank
+    dist.tp_size = tp_size
+
+    svc = Service(dist=dist)
+    svc.kv_cache_transceiver = kv_cache_transceiver
+    state = PersistentState()
+    state.is_warmup = is_warmup
+    state.num_fetch_requests = num_fetch_requests
+    state.benchmark_fill_phase_active = (
+        benchmark_req_queues_size > 0 and kv_cache_transceiver is not None
+    )
+    cfg = Configuration()
+    cfg.enable_attention_dp = enable_attention_dp
+    cfg.benchmark_req_queues_size = benchmark_req_queues_size
+    cfg.is_benchmark_disagg = benchmark_req_queues_size > 0 and kv_cache_transceiver is not None
+
+    ctx = SimpleNamespace(service=svc, config=cfg, state=state)
+    task = _BenchmarkTaskMock(ctx)
+    task.dist = dist
+    task.is_benchmark_disagg = cfg.is_benchmark_disagg
+    return task
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +427,7 @@ class TestCanForwardGating:
 class TestCheckBenchmarkDisaggGate:
     """Verify the consolidated gate helper used by both executor loops."""
 
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
+    @patch("tensorrt_llm._torch.pyexecutor.executor_loop_tasks.time")
     def test_gate_opens_when_fill_complete(self, mock_time):
         ex = MockBenchmarkExecutor(benchmark_req_queues_size=4, kv_cache_transceiver=Mock())
         batch = _make_scheduled_batch(num_gen_requests=4)
@@ -395,7 +439,7 @@ class TestCheckBenchmarkDisaggGate:
         assert ex._benchmark_fill_phase_active is False
         mock_time.sleep.assert_not_called()
 
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
+    @patch("tensorrt_llm._torch.pyexecutor.executor_loop_tasks.time")
     def test_gate_retries_with_short_sleep_when_incomplete(self, mock_time):
         ex = MockBenchmarkExecutor(benchmark_req_queues_size=4, kv_cache_transceiver=Mock())
         batch = _make_scheduled_batch(num_gen_requests=1)
@@ -405,7 +449,7 @@ class TestCheckBenchmarkDisaggGate:
         assert should_retry is True
         mock_time.sleep.assert_called_once_with(0.1)
 
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
+    @patch("tensorrt_llm._torch.pyexecutor.executor_loop_tasks.time")
     def test_warmup_bypasses_gate(self, mock_time):
         """During warmup, the gate must not block even in benchmark disagg mode."""
         ex = MockBenchmarkExecutor(
@@ -420,7 +464,7 @@ class TestCheckBenchmarkDisaggGate:
         assert should_retry is False
         mock_time.sleep.assert_not_called()
 
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
+    @patch("tensorrt_llm._torch.pyexecutor.executor_loop_tasks.time")
     def test_already_forwarding_skips_check(self, mock_time):
         """Once can_forward is True, the gate is a no-op."""
         ex = MockBenchmarkExecutor(benchmark_req_queues_size=4, kv_cache_transceiver=Mock())
@@ -445,59 +489,82 @@ def _make_active_request(in_init: bool = False, in_transfer: bool = False) -> Mo
     return req
 
 
-class MockPadDummyExecutor:
-    """Stub mirroring the PyExecutor attributes used by
-    ``_pad_attention_dp_dummy_request``.
-
-    Only the benchmark disagg early-return guard and the dummy-addition
-    branch are exercised; the rest is mocked out.
+class _PadDummyTaskMock(IngestionTask):
+    """IngestionTask subclass exposing the legacy
+    ``ex._pad_attention_dp_dummy_request()`` names as properties that
+    forward to the task-method counterparts.
     """
 
-    def __init__(
-        self,
-        *,
-        is_benchmark_disagg: bool = False,
-        benchmark_fill_phase_active: bool | None = None,
-        is_warmup: bool = False,
-        enable_attention_dp: bool = True,
-        kv_cache_transceiver=None,
-        active_requests=None,
-        expected_num_active_requests: int = 1,
-        num_fetch_requests: int = 0,
-        benchmark_req_queues_size: int = 8,
-        tp_size: int = 1,
-    ):
-        self.is_benchmark_disagg = is_benchmark_disagg
-        self._benchmark_fill_phase_active = (
-            benchmark_fill_phase_active
-            if benchmark_fill_phase_active is not None
-            else is_benchmark_disagg
-        )
-        self.is_warmup = is_warmup
-        self.enable_attention_dp = enable_attention_dp
-        self.kv_cache_transceiver = kv_cache_transceiver
-        self.active_requests = active_requests if active_requests is not None else []
-        self.expected_num_active_requests = expected_num_active_requests
-        self.num_fetch_requests = num_fetch_requests
-        self.benchmark_req_queues_size = benchmark_req_queues_size
-        self.max_total_draft_tokens = 0
+    @property
+    def _pad_attention_dp_dummy_request(self):
+        return self.pad_attention_dp_dummy_request
 
-        self.dist = Mock()
-        self.dist.tp_size = tp_size
+    @property
+    def _count_schedulable_active_requests(self):
+        return self.count_schedulable_active_requests
 
-        self.kv_cache_manager = Mock()
-        dummy_req = Mock()
-        dummy_req.is_attention_dp_dummy = True
-        self.kv_cache_manager.add_dummy_requests.return_value = [dummy_req]
+    @property
+    def _should_skip_dummy_for_benchmark_disagg(self):
+        return self.should_skip_dummy_for_benchmark_disagg
 
-        self.resource_manager = Mock()
-        self.resource_manager.get_resource_manager.return_value = None
 
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+def MockPadDummyExecutor(
+    *,
+    is_benchmark_disagg: bool = False,
+    benchmark_fill_phase_active: bool | None = None,
+    is_warmup: bool = False,
+    enable_attention_dp: bool = True,
+    kv_cache_transceiver=None,
+    active_requests=None,
+    expected_num_active_requests: int = 1,
+    num_fetch_requests: int = 0,
+    benchmark_req_queues_size: int = 8,
+    tp_size: int = 1,
+):
+    """Build a ``_PadDummyOpsMock`` wired to a lightweight Ctx that
+    populates just the buckets / fields
+    ``pad_attention_dp_dummy_request`` /
+    ``count_schedulable_active_requests`` /
+    ``should_skip_dummy_for_benchmark_disagg`` touch.
+    """
+    dist = Mock()
+    dist.tp_size = tp_size
 
-    _pad_attention_dp_dummy_request = PyExecutor._pad_attention_dp_dummy_request
-    _count_schedulable_active_requests = PyExecutor._count_schedulable_active_requests
-    _should_skip_dummy_for_benchmark_disagg = PyExecutor._should_skip_dummy_for_benchmark_disagg
+    kv_cache_manager = Mock()
+    dummy_req = Mock()
+    dummy_req.is_attention_dp_dummy = True
+    kv_cache_manager.add_dummy_requests.return_value = [dummy_req]
+
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.return_value = None
+
+    svc = Service(dist=dist, resource_manager=resource_manager)
+    svc.kv_cache_transceiver = kv_cache_transceiver
+    svc.kv_cache_manager = kv_cache_manager
+
+    state = PersistentState()
+    state.is_warmup = is_warmup
+    state.num_fetch_requests = num_fetch_requests
+    state.active_requests = active_requests if active_requests is not None else []
+    state.expected_num_active_requests = expected_num_active_requests
+    state.max_total_draft_tokens = 0
+    state.benchmark_fill_phase_active = (
+        benchmark_fill_phase_active
+        if benchmark_fill_phase_active is not None
+        else is_benchmark_disagg
+    )
+
+    cfg = Configuration()
+    cfg.enable_attention_dp = enable_attention_dp
+    cfg.is_benchmark_disagg = is_benchmark_disagg
+    cfg.benchmark_req_queues_size = benchmark_req_queues_size
+
+    ctx = SimpleNamespace(service=svc, config=cfg, state=state)
+    task = _PadDummyTaskMock(ctx)
+    task.kv_cache_manager = kv_cache_manager
+    task.dist = dist
+    task.is_benchmark_disagg = is_benchmark_disagg
+    return task
 
 
 class TestPadAttentionDpDummyBenchmarkDisagg:
@@ -712,51 +779,19 @@ class TestIncrementalFillScenario:
         assert iterations == total
 
 
+@pytest.mark.skip(
+    reason="`_prepare_and_schedule_batch` was deleted in the PyExecutor "
+    "final-cleanup refactor: its responsibilities are now split across "
+    "the `make_request_ingestion`, `make_scheduling`, and `make_batch_gating` "
+    "coroutines (plus `Ops.fetch_and_activate_new_requests`). The 'fetch "
+    "called once per iteration' invariant is now a property of the "
+    "single `driver.resume(request_ingestion, ...)` call at AFTER_FETCH "
+    "in the driver body of `PyExecutor._executor_loop`, which is verified "
+    "by the coroutine-runtime tests in test_coroutines.py rather "
+    "than by a monolithic _prepare_and_schedule_batch test."
+)
 class TestPrepareAndScheduleBatchNoBlock:
-    """_prepare_and_schedule_batch must not block on request fetching.
-
-    It should call _fetch_and_activate_new_requests exactly once per
-    invocation, regardless of benchmark_req_queues_size, so the outer
-    executor loop remains free to service KV transfers between iterations.
-
-    NOTE: This test uses ``object.__new__(PyExecutor)`` to bypass __init__
-    and manually sets internal attributes.  This is inherently fragile —
-    if _prepare_and_schedule_batch gains new attribute references the test
-    will fail with AttributeError.  Keep the attribute list below in sync
-    with the method's implementation.
-    """
+    """Preserved as a documentation placeholder; see skip reason."""
 
     def test_fetch_called_once_even_in_benchmark_disagg(self):
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-        ex = object.__new__(PyExecutor)
-        ex.benchmark_req_queues_size = 8
-        ex.kv_cache_transceiver = Mock()
-        ex.is_benchmark_disagg = True
-        ex.enable_attention_dp = False
-        ex.num_fetch_requests = 0
-        ex.dist = Mock(rank=0, tp_size=1)
-        ex.is_shutdown = False
-        ex._is_warmup = False
-        ex.enable_iter_perf_stats = False
-        ex.active_requests = []
-        ex.waiting_queue = []
-        ex.expected_num_active_requests = 0
-        ex.drafter = None
-        ex.inflight_req_ids = set()
-        ex.kv_connector_manager = None
-        ex.enable_partial_reuse_for_disagg = False
-
-        mock_fetch = Mock(return_value=[])
-        ex._fetch_and_activate_new_requests = mock_fetch
-        ex._check_disagg_ctx_schedulable_status = Mock()
-        ex._check_disagg_gen_transfer_status = Mock()
-        ex._check_kv_transfer_timeout = Mock()
-        ex._check_disagg_ctx_cache_transfer_status = Mock()
-        ex._pad_attention_dp_dummy_request = Mock()
-        ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
-        ex._prepare_disagg_gen_init = Mock()
-
-        ex._prepare_and_schedule_batch()
-
-        mock_fetch.assert_called_once()
+        pass
