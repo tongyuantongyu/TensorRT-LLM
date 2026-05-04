@@ -380,7 +380,7 @@ async def batch_body(ctx: Context, crn: Concerns) -> None:
 
     async with batch_phase(BatchPhase.FORWARD_2) as (r, w):
         if r.can_queue:
-            w.batch_outputs = crn.forward.run(
+            w.batch_outputs, w.attn_metadata = crn.forward.run(
                 ctx,
                 r.scheduled_batch,
                 new_tensors_device=r.previous_tensors_device,
@@ -1258,6 +1258,7 @@ class PyExecutorCoro:
             schedule=schedule_concern,
             resource=ResourceConcern(
                 resource_manager=resource_manager,
+                kv_cache_dtype_byte_size=model_engine.kv_cache_dtype_byte_size,
             ),
             forward=ForwardConcern(
                 model_engine=model_engine,

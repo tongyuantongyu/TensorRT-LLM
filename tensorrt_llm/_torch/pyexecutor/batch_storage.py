@@ -46,6 +46,7 @@ from typing import AsyncIterator, Dict, List, Literal, Optional, Protocol, Tuple
 
 import torch
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.coroutines import (
     Driver,
     Batch,
@@ -462,6 +463,22 @@ class BatchStorage:
     batch_outputs: Optional[Dict[str, torch.Tensor]] = phased_field(BatchPhase.FORWARD_2)
     """Forward pass outputs: logits, hidden_states, additional outputs."""
 
+    # Producer: ``forward`` concern (``_forward_step`` populates
+    # ``model_engine.attn_metadata`` as a side effect of the call).
+    # Consumer: ``resource`` at RESPOND_8 -- forwarded to
+    # ``ResourceManager.update_resources`` so that
+    # ``_update_kv_cache_draft_token_location`` can shift accepted
+    # draft-token slots in the KV cache.
+    #
+    # The producer/consumer split exists because RESPOND_8 lives in a
+    # different concern than FORWARD_2 and the runtime forbids
+    # cross-concern reads at the same phase. ``model_engine.attn_metadata``
+    # is a single mutable object reused across iters; the storage simply
+    # threads its current handle through so the resource concern doesn't
+    # need to reach into the model engine.
+    attn_metadata: Optional[AttentionMetadata] = phased_field(BatchPhase.FORWARD_2)
+    """Attention metadata produced by this iter's forward pass."""
+
     # ===================== SAMPLE_3 =====================
 
     # Producer (loop / rank dependent):
@@ -602,6 +619,11 @@ class _ReadAtSample_3(_ReadAtForward_2, Protocol):
         """Forward pass outputs: logits, hidden_states, additional outputs."""
         ...
 
+    @property
+    def attn_metadata(self) -> AttentionMetadata:
+        """Attention metadata produced by this iter's forward pass."""
+        ...
+
 
 @runtime_checkable
 class _ReadAtStateUpd_4(_ReadAtSample_3, Protocol):
@@ -683,6 +705,8 @@ class _WriteAtForward_2:
 
     batch_outputs: Optional[Dict[str, torch.Tensor]] = None
     """Forward pass outputs: logits, hidden_states, additional outputs."""
+    attn_metadata: Optional[AttentionMetadata] = None
+    """Attention metadata produced by this iter's forward pass."""
 
 
 @dataclasses.dataclass

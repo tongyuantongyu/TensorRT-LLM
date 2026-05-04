@@ -14,7 +14,13 @@ Plain-loop scope:
     only handles the main scheduled_batch.
 * RESPOND_8
   - Free per-request resources for finished requests via
-    ``resource_manager.update_resources``.
+    ``resource_manager.update_resources``. ``attn_metadata`` is
+    read from the FORWARD_2 storage slot (produced by
+    ``ForwardConcern``) and forwarded to ``update_resources`` so
+    the KV cache manager can shift draft-token slots when
+    speculative decoding is enabled. ``kv_cache_dtype_byte_size``
+    is a static model property -- captured at construction so we
+    don't need to expose it through ``BatchStorage`` per iter.
 
 The legacy executor also calls ``revert_gen_alloc`` when can_queue
 flips False; that path is V2-scheduler-only and tied to its own
@@ -41,8 +47,13 @@ class ResourceConcern:
         self,
         *,
         resource_manager: "ResourceManager",
+        kv_cache_dtype_byte_size: float,
     ) -> None:
         self._resource_manager = resource_manager
+        # Static for the lifetime of the executor (set once on
+        # ``model_engine``); we cache it here instead of threading it
+        # through ``BatchStorage`` each iter.
+        self._kv_cache_dtype_byte_size = kv_cache_dtype_byte_size
 
     async def handle_batch(self, ctx: "Context") -> None:
         # RESOURCE_PREP_1 -- prepare resources for the main batch.
@@ -60,20 +71,18 @@ class ResourceConcern:
         self._resource_manager.prepare_resources(scheduled_batch)
 
         # RESPOND_8 -- update resources (free finished, rebalance
-        # attention metadata bookkeeping). The legacy code passes
-        # ``model_engine.attn_metadata`` and a ``kv_cache_dtype_byte_size``
-        # to handle the perf-metric / KV-events bookkeeping; for the
-        # plain-loop minimum we forward whatever ``ForwardConcern``
-        # has stashed via the read view's downstream slots. Since we
-        # don't yet plumb attn_metadata through BatchStorage, pass
-        # ``None`` -- ``update_resources`` accepts that and the
-        # downstream consumers (perf metrics etc.) are also gated
-        # on optional attribute presence.
+        # attention metadata bookkeeping). ``attn_metadata`` is
+        # threaded in by ``ForwardConcern`` via the FORWARD_2 write
+        # view; ``update_resources`` uses it for spec-decode KV
+        # draft-token shifting. ``update_resources`` accepts ``None``
+        # for both args (downstream consumers are gated on optional
+        # attribute presence), so empty-rank / non-spec paths still
+        # work cleanly.
         r8, _ = await enter_phase(BatchPhase.RESPOND_8)
         self._resource_manager.update_resources(
             scheduled_batch,
-            None,
-            None,
+            r8.attn_metadata,
+            self._kv_cache_dtype_byte_size,
         )
 
 

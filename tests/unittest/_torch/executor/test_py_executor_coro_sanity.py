@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import pytest
 
+from tensorrt_llm.llmapi import CudaGraphConfig
+
 # Skip cleanly if there's no GPU available -- the rest of the test
 # would just crash on torch.cuda.set_device.
 try:
@@ -62,7 +64,7 @@ def _patch_in_pyexecutor_coro(monkeypatch: pytest.MonkeyPatch) -> None:
     [
         (True, 1),
         (False, 1),
-        (True, 2),
+        (True, 4),
     ],
     ids=["plain", "overlap", "pp2"],
 )
@@ -109,15 +111,24 @@ def test_py_executor_coro_runs_tinyllama_end_to_end(
 
     sampling_params = SamplingParams(max_tokens=8)
 
+    model = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_path = "/home/scratch.trt_llm_data/llm-models/" + model
+
     llm_kwargs = dict(
-        model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        model=model_path,
         kv_cache_config=kv_cache_config,
         max_batch_size=2,
         max_num_tokens=8,
         disable_overlap_scheduler=disable_overlap_scheduler,
-        # No CUDA graph -- the resource concern doesn't yet wire the
-        # graph-capture-friendly attn_metadata path.
-        cuda_graph_config=None,
+        # Pin a single graph batch size so the bring-up exercises one
+        # capture / replay path. ``attn_metadata`` is threaded through
+        # ``BatchStorage`` (FORWARD_2 -> RESPOND_8) so the resource
+        # concern can update KV-cache draft slots after capture.
+        cuda_graph_config=CudaGraphConfig(
+            batch_sizes=[8],
+            max_batch_size=8,
+            enable_padding=True,
+        ),
     )
     if pipeline_parallel_size > 1:
         llm_kwargs["pipeline_parallel_size"] = pipeline_parallel_size
@@ -147,25 +158,26 @@ if __name__ == '__main__':
     # Default: overlap (the new code path). ``legacy-*`` modes run
     # the original PyExecutor with the matching variant, no monkey-
     # patching -- useful as reference runs.
-    mode = sys.argv[1] if len(sys.argv) > 1 else "overlap"
+    modes = sys.argv[1:] if len(sys.argv) > 1 else ["overlap"]
 
-    if mode in ("plain", "both"):
-        print("=== plain (PyExecutorCoro) ===", flush=True)
-        test_py_executor_coro_runs_tinyllama_end_to_end(
-            None,
-            disable_overlap_scheduler=True,
-            pipeline_parallel_size=1)
-    if mode in ("overlap", "both"):
-        print("=== overlap (PyExecutorCoro) ===", flush=True)
-        test_py_executor_coro_runs_tinyllama_end_to_end(
-            None,
-            disable_overlap_scheduler=False,
-            pipeline_parallel_size=1)
-    if mode.startswith("pp"):
-        pp = int(mode[2:])
-        print(f"=== {mode} (PyExecutorCoro) ===", flush=True)
-        test_py_executor_coro_runs_tinyllama_end_to_end(
-            None,
-            disable_overlap_scheduler=True,
-            pipeline_parallel_size=pp)
+    for mode in modes:
+        if mode == "plain":
+            print("=== plain (PyExecutorCoro) ===", flush=True)
+            test_py_executor_coro_runs_tinyllama_end_to_end(
+                None,
+                disable_overlap_scheduler=True,
+                pipeline_parallel_size=1)
+        elif mode == "overlap":
+            print("=== overlap (PyExecutorCoro) ===", flush=True)
+            test_py_executor_coro_runs_tinyllama_end_to_end(
+                None,
+                disable_overlap_scheduler=False,
+                pipeline_parallel_size=1)
+        elif mode.startswith("pp"):
+            pp = int(mode[2:])
+            print(f"=== {mode} (PyExecutorCoro) ===", flush=True)
+            test_py_executor_coro_runs_tinyllama_end_to_end(
+                None,
+                disable_overlap_scheduler=False,
+                pipeline_parallel_size=pp)
     print("=== done ===", flush=True)

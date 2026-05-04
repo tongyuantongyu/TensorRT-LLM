@@ -747,7 +747,7 @@ def test_close_unwinds_try_finally_in_scheduler():
 
     drv = Driver(scheduler())
     # Pump the scheduler manually until it suspends, then close.
-    drv._stack = [(drv._main_handle, None, None)]  # noqa: SLF001
+    drv._stack_push(drv._main_handle, None)  # noqa: SLF001
     request = drv._main_handle.coro.send(None)  # noqa: SLF001
     assert isinstance(request, _WaitRequest)
     drv._close_all()  # noqa: SLF001

@@ -2,8 +2,8 @@
 
 Single-phase per batch -> exposed as a plain method, not a coroutine.
 The BATCH body calls :meth:`run` directly inside its
-``async with batch_phase(BatchPhase.FORWARD_2)`` block and writes
-the returned outputs into the write view.
+``async with batch_phase(BatchPhase.FORWARD_2)`` block and unpacks
+the returned ``(outputs, attn_metadata)`` pair into the write view.
 
 Scope: single rank OR multi-PP-rank. PP NCCL p2p (HC7) lives
 inside ``model_engine.forward`` so this concern only needs to
@@ -24,11 +24,12 @@ always passes ``None`` for both; this concern is loop-agnostic.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 
 if TYPE_CHECKING:
+    from ...attention_backend.interface import AttentionMetadata
     from ..context import Context
     from ..model_engine import ModelEngine
     from ..resource_manager import ResourceManager
@@ -63,14 +64,17 @@ class ForwardConcern:
         *,
         new_tensors_device: Optional["SampleStateTensors"] = None,
         num_accepted_tokens_device: Optional[torch.Tensor] = None,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Tuple[Optional[Dict[str, Any]], Optional["AttentionMetadata"]]:
         """Run the model forward on ``scheduled_batch``.
 
-        Returns the model's output dict (``{"logits": ..., ...}``)
-        on success or ``None`` if the batch was empty (the BATCH
-        body short-circuits forward when ``can_queue`` is False, so
-        in practice this method is always called with non-empty
-        input).
+        Returns ``(outputs, attn_metadata)``. ``outputs`` is the
+        model's output dict (``{"logits": ..., ...}``) on the last PP
+        rank, or ``None`` on non-last PP ranks (forward still ran but
+        produced no logits this rank can sample from).
+        ``attn_metadata`` is ``model_engine.attn_metadata`` after the
+        forward pass -- threaded through ``BatchStorage`` so the
+        resource concern at RESPOND_8 can update KV-cache draft-token
+        slots without reaching into the model engine.
 
         Args:
             new_tensors_device: overlap-loop input -- the previous
@@ -119,15 +123,21 @@ class ForwardConcern:
                 num_accepted_tokens_device=num_accepted_tokens_device,
             )
         torch.cuda.current_stream().wait_stream(self._execution_stream)
+        # ``attn_metadata`` is the same mutable object across iters;
+        # we hand its current handle back so the BATCH body can stash
+        # it in the FORWARD_2 write view for RESPOND_8 readers.
+        attn_metadata = getattr(self._model_engine, "attn_metadata", None)
         if not ctx.svc.dist.is_last_pp_rank:
             # Non-last PP rank: ``model_engine.forward`` still ran
             # (its NCCL p2p sent activations to the next rank), but
             # the returned dict carries no logits this rank can
             # sample from. Drop it; SAMPLE_3 will produce a
             # placeholder ``sample_state`` so the slot ring sees a
-            # uniform shape.
-            return None
-        return outputs
+            # uniform shape. The KV cache and ``attn_metadata`` are
+            # rank-local, so we still surface ``attn_metadata`` for
+            # the resource concern.
+            return None, attn_metadata
+        return outputs, attn_metadata
 
 
 __all__ = ["ForwardConcern"]

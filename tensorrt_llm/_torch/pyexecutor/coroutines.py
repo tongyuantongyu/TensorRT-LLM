@@ -109,7 +109,12 @@ Set ``TLLM_COROUTINE_SHOW_FRAMES=1`` to keep them visible when
 debugging the runtime itself. Set ``TLLM_COROUTINE_TRACK_STORAGE=1``
 to have ``_views_at`` return tracked proxies that enforce
 happens-before at attribute access — useful in correctness-focused
-CI; default off in production for zero overhead.
+CI; default off in production for zero overhead. Set
+``TLLM_COROUTINE_NVTX=1`` to have the Driver open an NVTX range
+named after each coroutine's ``__qualname__`` for the duration of
+its time on the driver stack (push-to-pop, LIFO) — useful for
+visualizing the coroutine call hierarchy on the nsys host
+timeline; default off so production runs pay no NVTX overhead.
 
 Generic over phase enum and storage
 ===================================
@@ -135,6 +140,17 @@ import weakref
 from contextlib import asynccontextmanager
 from enum import IntEnum
 from typing import Any, AsyncIterator, Callable, Coroutine, Generator, List, Optional, Protocol, Tuple
+
+import nvtx
+
+# Optional NVTX annotation around each coroutine's lifetime on the
+# driver stack -- gated by ``TLLM_COROUTINE_NVTX=1`` so the default
+# is zero overhead. When enabled, every push to ``Driver._stack``
+# opens an NVTX range named after the coroutine's ``__qualname__``;
+# every pop closes the matching range in LIFO order, mirroring the
+# driver stack on the host timeline.
+_NVTX_DOMAIN = "TensorRT-LLM"
+_NVTX_ENABLED: bool = os.getenv("TLLM_COROUTINE_NVTX", "0") == "1"
 
 __all__ = [
     "Driver",
@@ -1381,10 +1397,14 @@ class Driver:
     ) -> None:
         self._main_handle: _RootHandle = _RootHandle(main)
         # Stack of currently-active handles:
-        #   (handle, target_phase_or_None, last_storage_or_None)
+        #   (handle, target_phase_or_None)
         # ``target_phase`` is the phase the parent asked the child to
         # reach via ``step`` / ``resume``; ``None`` marks the root.
-        self._stack: List[Tuple[_Handle, Optional[IntEnum], Optional[object]]] = []
+        # Pushed / popped exclusively via :meth:`_stack_push` /
+        # :meth:`_stack_pop` so the optional NVTX bookkeeping
+        # (``TLLM_COROUTINE_NVTX``) stays in lock-step with the
+        # stack's actual depth.
+        self._stack: List[Tuple[_Handle, Optional[IntEnum]]] = []
         # Handles whose coroutine has yielded a ``_WaitRequest`` and
         # are suspended at a known phase. Keyed by ``id(handle.coro)``.
         # Used for the "child already past target" short-circuit and
@@ -1446,14 +1466,52 @@ class Driver:
             if self._watchdog is not None:
                 self._watchdog.stop()
 
+    # ----------------------------------------------------- stack helpers #
+
+    def _stack_push(self, handle: _Handle,
+                    target: Optional[IntEnum]) -> None:
+        """Push ``(handle, target)`` and open the matching NVTX range.
+
+        All stack pushes go through this helper so the optional NVTX
+        annotation (gated by ``TLLM_COROUTINE_NVTX``) stays in
+        lock-step with the actual stack depth -- the NVTX range opens
+        when the coroutine enters the stack and is closed by the
+        paired :meth:`_stack_pop` when it leaves, so the host
+        timeline shows each coroutine's full lifetime on the stack.
+        """
+        self._stack.append((handle, target))
+        if _NVTX_ENABLED:
+            coro = handle.coro
+            name = getattr(coro, "__qualname__", None) or repr(coro)
+            # Suffix the parent-requested target phase (``->PHASE``)
+            # so the timeline distinguishes pushes that drive the
+            # same coroutine to different phases. Root (no parent,
+            # target is ``None``) carries no suffix.
+            if target is not None:
+                name = f"{name}->{target.name}"
+            nvtx.push_range(name, domain=_NVTX_DOMAIN)
+
+    def _stack_pop(self) -> Tuple[_Handle, Optional[IntEnum]]:
+        """Pop the stack top and close its NVTX range. Paired with
+        :meth:`_stack_push`. Per-domain LIFO ordering on the NVTX
+        side mirrors the driver stack's LIFO ordering, so nested
+        ranges show up correctly on the nsys timeline."""
+        entry = self._stack.pop()
+        if _NVTX_ENABLED:
+            nvtx.pop_range(domain=_NVTX_DOMAIN)
+        return entry
+
+    # --------------------------------------------------------------- drive #
+
     def _drive(self) -> None:
         """Main loop: pump the top of stack, dispatch on yielded requests."""
-        self._stack = [(self._main_handle, None, None)]
+        self._stack = []
+        self._stack_push(self._main_handle, None)
         send_value: object = None
         send_exc: Optional[BaseException] = None
 
         while self._stack:
-            handle, target, last_storage = self._stack[-1]
+            handle, target = self._stack[-1]
             coro = handle.coro
 
             # Watchdog heartbeat: send a ``notify(name, phase)``
@@ -1493,7 +1551,7 @@ class Driver:
                 # fast paths short-circuit on the next call; pop the
                 # stack and resume the parent (if any).
                 handle.done = True
-                self._stack.pop()
+                self._stack_pop()
                 self._suspensions.pop(id(coro), None)
                 # Parent's resume value is None — under the new design,
                 # advance/resume returns are unused (data exchange is
@@ -1505,7 +1563,7 @@ class Driver:
                 # exception is still terminated) and propagate to
                 # parent (if any), or out of run() at the root.
                 handle.done = True
-                self._stack.pop()
+                self._stack_pop()
                 self._suspensions.pop(id(coro), None)
                 if self._stack:
                     send_exc = e
@@ -1534,7 +1592,7 @@ class Driver:
                     send_value = None
                 else:
                     # Push child handle for pumping.
-                    self._stack.append((child_handle, new_target, None))
+                    self._stack_push(child_handle, new_target)
                     send_value = None
             elif isinstance(request, _WaitRequest):
                 phase_value = request.phase
@@ -1550,8 +1608,6 @@ class Driver:
                     )
                     continue
                 self._suspensions[id(coro)] = (phase_value, storage)
-                # Update the current stack entry's last_storage.
-                self._stack[-1] = (handle, target, storage)
                 if target is None:
                     # Root main coroutine yielded a wait. Treat as a
                     # no-op and keep pumping main.
@@ -1560,7 +1616,7 @@ class Driver:
                     # Child has moved past the target. Pop; parent
                     # resumes (with no view return — data exchange is
                     # via active state).
-                    self._stack.pop()
+                    self._stack_pop()
                     send_value = None
                 else:
                     # Child still needs more pumping to reach target.
@@ -1581,7 +1637,7 @@ class Driver:
                         "to retry against; root must complete or raise"
                     )
                     continue
-                self._stack.pop()
+                self._stack_pop()
                 send_value = _RETRY
             elif isinstance(request, _HangControl):
                 # ``async with disable_hang_detect(): ...`` -- enter or
@@ -1639,7 +1695,7 @@ class Driver:
         """
         main_closed = False
         while self._stack:
-            handle, _, _ = self._stack.pop()
+            handle, _ = self._stack_pop()
             if handle is self._main_handle:
                 main_closed = True
             try:
