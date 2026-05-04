@@ -39,6 +39,7 @@ from .llm_request import ExecutorResponse
 from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
+from .py_executor_coro import PyExecutorCoro
 from .resource_manager import (KVCacheManager, KVCacheManagerV2,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
@@ -1468,7 +1469,11 @@ def create_py_executor_instance(
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
 
-    return PyExecutor(
+    executor_cls = PyExecutor
+    if os.environ.get("TLLM_USE_CORO_EXECUTOR", "0") == "1":
+        executor_cls = PyExecutorCoro
+
+    return executor_cls(
         resource_manager,
         scheduler,
         model_engine=model_engine,

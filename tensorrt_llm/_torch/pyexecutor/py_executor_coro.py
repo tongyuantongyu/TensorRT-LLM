@@ -70,6 +70,8 @@ from typing import (TYPE_CHECKING, Any, List, Optional, Union)
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from .batch_storage import BatchPhase, BatchStorage, batch_phase, step, try_step
 from .concerns import (ClientChannel, Concerns, ForwardConcern,
                        PpScheduleConcern, RecvOffload, RequestPool,
@@ -264,6 +266,7 @@ async def scheduler_iter_plain(ctx: Context, crn: Concerns) -> None:
     ``ctx``). The orchestrator legitimately needs it to query the
     drain check and to construct the per-batch coroutine.
     """
+    logger.warning("PLAIN Coro executor")
     while True:
         if (ctx.port.is_shutdown
                 and ctx.svc.pool.is_drained()
@@ -359,6 +362,7 @@ async def scheduler_iter_overlap(ctx: Context, crn: Concerns) -> None:
     # can read it. Held across iters.
     previous_view = None
 
+    logger.warning("OVERLAP Coro executor")
     while True:
         # Termination: nothing to admit AND nothing parked. The loop
         # may still take one extra iter past the shutdown signal --
@@ -667,6 +671,7 @@ async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
             "scheduler_iter_pp: requires Concerns.ring_broadcast to be "
             "set (PyExecutorCoro.__init__ wires this when pp_size > 1).")
 
+    logger.warning("PP Coro executor")
     pp_size = ctx.svc.dist.pp_size
     # Per-rank in-flight batch ring. Left=oldest, right=newest.
     # Max size = n-1; current iter's opportunistic retirement may
@@ -944,6 +949,8 @@ class PyExecutorCoro:
                 "PyExecutorCoro: PP + overlap_scheduler is not yet "
                 "implemented; use disable_overlap_scheduler=True with "
                 "pp_size>1.")
+
+        logger.warning("Using prototype Coro Executor!")
 
         # Signature-only kwargs (parity but not used by the plain-
         # loop bring-up): max_draft_len, max_total_draft_tokens

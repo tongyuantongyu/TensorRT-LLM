@@ -149,12 +149,6 @@ if __name__ == '__main__':
     # patching -- useful as reference runs.
     mode = sys.argv[1] if len(sys.argv) > 1 else "overlap"
 
-    use_coro = mode not in ("legacy-plain", "legacy-overlap", "legacy-pp2")
-    if use_coro:
-        from tensorrt_llm._torch.pyexecutor import _util
-        from tensorrt_llm._torch.pyexecutor.py_executor_coro import PyExecutorCoro
-        setattr(_util, "PyExecutor", PyExecutorCoro)
-
     if mode in ("plain", "both"):
         print("=== plain (PyExecutorCoro) ===", flush=True)
         test_py_executor_coro_runs_tinyllama_end_to_end(
@@ -167,28 +161,11 @@ if __name__ == '__main__':
             None,
             disable_overlap_scheduler=False,
             pipeline_parallel_size=1)
-    if mode == "pp2":
-        print("=== pp2 (PyExecutorCoro) ===", flush=True)
+    if mode.startswith("pp"):
+        pp = int(mode[2:])
+        print(f"=== {mode} (PyExecutorCoro) ===", flush=True)
         test_py_executor_coro_runs_tinyllama_end_to_end(
             None,
             disable_overlap_scheduler=True,
-            pipeline_parallel_size=2)
-    if mode == "legacy-plain":
-        print("=== plain (legacy PyExecutor) ===", flush=True)
-        test_py_executor_coro_runs_tinyllama_end_to_end(
-            None,
-            disable_overlap_scheduler=True,
-            pipeline_parallel_size=1)
-    if mode == "legacy-overlap":
-        print("=== overlap (legacy PyExecutor) ===", flush=True)
-        test_py_executor_coro_runs_tinyllama_end_to_end(
-            None,
-            disable_overlap_scheduler=False,
-            pipeline_parallel_size=1)
-    if mode == "legacy-pp2":
-        print("=== pp2 (legacy PyExecutor) ===", flush=True)
-        test_py_executor_coro_runs_tinyllama_end_to_end(
-            None,
-            disable_overlap_scheduler=True,
-            pipeline_parallel_size=2)
+            pipeline_parallel_size=pp)
     print("=== done ===", flush=True)
