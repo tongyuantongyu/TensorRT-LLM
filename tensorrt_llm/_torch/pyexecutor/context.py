@@ -352,6 +352,26 @@ class MessagePort:
       forever past shutdown. NOT a one-shot event because both
       threads only READ it after the loop sets it -- a plain bool
       with the publishing happens-before the read covers it.
+    * ``is_warmup`` (bool) -- set by main thread via
+      :attr:`PyExecutorCoro.is_warmup` (used e.g. by
+      ``_util.py``'s KV-cache memory estimation pass to flag a
+      dummy run). The loop thread consumes it in two places:
+      :class:`ForwardConcern.run` reflects it onto
+      ``model_engine.is_warmup`` once per batch (just before
+      invoking ``forward()``) so model-internal gates see the same
+      value; the SCHEDULER-layer ``profiler`` drains a warmup pass
+      at the top of its try-body
+      (``while ctx.port.is_warmup: yield``) before the post-warmup
+      ``itertools.count`` block takes over. Plain bool -- the GIL
+      serializes the cross-thread attribute set / get, and the
+      only consumers read it after the main-thread write happens-
+      before (loop start AND per-batch FORWARD_2 boundary).
+      One-shot (caller-side; not runtime-enforced): callers
+      transition the value ``False -> True -> False`` at most
+      once over the executor's lifetime; ``profiler``'s warmup-
+      drain block relies on this to never re-enter warmup once
+      cleared. Matches the legacy ``PyExecutor.is_warmup``
+      (plain attribute, no runtime check).
 
     What does NOT belong here
     -------------------------
@@ -392,6 +412,7 @@ class MessagePort:
     shutdown_event: threading.Event = dataclasses.field(
         default_factory=threading.Event)
     is_shutdown: bool = False
+    is_warmup: bool = False
 
 
 @dataclasses.dataclass(frozen=True)

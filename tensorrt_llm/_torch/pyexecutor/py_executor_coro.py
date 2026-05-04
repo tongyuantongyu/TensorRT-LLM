@@ -65,12 +65,16 @@ from __future__ import annotations
 
 import collections
 import datetime
+import functools
+import itertools
+import os
 import threading
 from typing import (TYPE_CHECKING, Any, List, Optional, Union)
 
 import torch
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .batch_storage import BatchPhase, BatchStorage, batch_phase, step, try_step
 from .concerns import (ClientChannel, Concerns, ForwardConcern,
@@ -93,6 +97,190 @@ if TYPE_CHECKING:
     from .resource_manager import ResourceManager
     from .sampler import Sampler
     from .scheduler import RequestScheduler
+
+
+# --------------------------------------------------------------------------- #
+# Profile driver (per-iter; SCHEDULER-layer, not a concern)
+# --------------------------------------------------------------------------- #
+
+# Iteration ranges for profiling start/stop. Format:
+# ``"start1-stop1,start2-stop2,..."`` or single iters ``"iter1,iter2,..."``.
+PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
+
+# Path to save the torch profiler chrome trace. The rank is appended
+# to the filename (``<base>-rank-N<ext>``) so multi-rank runs do not
+# overwrite each other.
+PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
+
+
+@functools.cache
+def _load_iteration_indexes(env_var: str):
+    """Parse comma-separated iter spans from ``env_var``.
+
+    Returns ``(starts, stops)`` -- two ``frozenset``s of iter
+    indexes. Single iters become equal start/stop values; ``"a-b"``
+    ranges become matched start/stop pairs. Empty / unset env var
+    returns empty sets.
+
+    Mirrors ``py_executor._load_iteration_indexes`` so the new
+    coroutine executor honors the same ``TLLM_PROFILE_START_STOP``
+    contract as the legacy executor.
+    """
+    spans = os.environ.get(env_var, None)
+    starts, stops = [], []
+    if spans:
+        for span in spans.split(','):
+            try:
+                if '-' in span:
+                    start, stop = span.strip().split('-')
+                    starts.append(int(start))
+                    stops.append(int(stop))
+                else:
+                    it = int(span.strip())
+                    starts.append(it)
+                    stops.append(it)
+            except ValueError as e:
+                raise ValueError(
+                    f"Cannot parse span in environment variable "
+                    f"`{env_var}`: {e}") from None
+    return frozenset(starts), frozenset(stops)
+
+
+def profiler(ctx: Context):
+    """Per-iter profiler driver. Generator; yields once per scheduler iter.
+
+    Replaces the legacy ``PyExecutor._profiler`` context manager +
+    ``profile_step`` callback. The SCHEDULER iter drives this with a
+    plain ``for _ in profiler(ctx):`` loop. The legacy callback ran
+    "post(prev iter) -> advance counter -> pre(curr iter)" on each
+    invocation because it was a single function called from the iter
+    top; the generator splits naturally around the yield -- per-iter
+    pre / post bracket the body, with ``it`` advanced by
+    ``itertools.count`` starting at 0 for the first post-warmup iter
+    (so ``TLLM_PROFILE_START_STOP`` indexes are relative to the
+    post-warmup run, not the worker thread's lifetime).
+
+    "Iter" is a SCHEDULER-layer concept (concerns think in batches),
+    so the profile driver lives here as a module-level generator
+    rather than as a concern -- see :class:`Context` and
+    :mod:`concerns` for the layering rationale.
+
+    Drives three independent profilers, all gated on env vars / iter
+    ranges (no-op when nothing is configured):
+
+    * **CUDA profiler** (``cudaProfilerStart`` / ``cudaProfilerStop``)
+      -- toggles around iter ranges in
+      ``TLLM_PROFILE_START_STOP``.
+    * **Torch profiler** (``torch.profiler.profile``) -- enabled
+      when ``TLLM_TORCH_PROFILE_TRACE`` is set AND
+      ``TLLM_PROFILE_START_STOP`` is set. Exports a per-rank chrome
+      trace at the stop iter.
+    * **Layer-wise benchmark calibrator** -- per-iter
+      ``pre_step`` / ``post_step`` callbacks plus start / stop
+      bracket calls.
+
+    Warmup pass: a ``while ctx.port.is_warmup: yield`` block at the
+    top of the try-body drains warmup iters without touching any
+    profile state. Relies on the one-shot ``is_warmup`` invariant
+    (``False -> True -> False`` at most once over the executor
+    lifetime; see :attr:`MessagePort.is_warmup`) so warmup is
+    never re-entered once cleared, and the post-warmup
+    ``itertools.count`` block runs at most once.
+
+    Cleanup: on early exit (``return`` from / exception in the
+    for-loop body), the suspended generator's ``GeneratorExit``
+    runs the ``finally`` clause, which stops the profilers if they
+    are still enabled.
+    """
+    profile_start_iters, profile_stop_iters = _load_iteration_indexes(
+        PROFILE_START_STOP_ENV_VAR_NAME)
+
+    enabled = False
+
+    # Append the rank so each rank writes to its own file. Without
+    # this, TP/PP/DP > 1 runs have every rank calling
+    # ``torch_profiler.export_chrome_trace`` on the same path
+    # concurrently, producing interleaved output that fails to parse
+    # in Chrome tracing / Perfetto.
+    torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
+    if torch_trace_path is not None:
+        trace_base, trace_ext = os.path.splitext(torch_trace_path)
+        torch_trace_path = (
+            f"{trace_base}-rank-{ctx.svc.dist.rank}{trace_ext}")
+    profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME,
+                                        None)
+    enable_torch_trace = bool(torch_trace_path and profile_start_stop)
+    if torch_trace_path and profile_start_stop is None:
+        logger.warning(
+            f"{PROFILE_START_STOP_ENV_VAR_NAME} environment variable "
+            "needs to be set to enable the torch trace. Example to "
+            f"profile iteration 10-20: export "
+            f"{PROFILE_START_STOP_ENV_VAR_NAME}=10-20")
+
+    if enable_torch_trace:
+        torch_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+                torch.profiler.ProfilerActivity.XPU,
+            ],
+            record_shapes=True,
+            with_modules=True,
+        )
+
+    calibrator = get_calibrator()
+
+    try:
+        # Warmup drain: tick the SCHEDULER body without touching the
+        # profile state. ``is_warmup`` is one-shot (see the property
+        # / port docstrings), so this loop runs at most once over
+        # the generator's lifetime; the ``itertools.count`` block
+        # below then takes over with a fresh ``it = 0``.
+        while ctx.port.is_warmup:
+            yield
+
+        for it in itertools.count():
+            assert not ctx.port.is_warmup, "Cannot go back to warmup"
+
+            # Pre-iter: maybe start profiling; calibrator pre-step.
+            if it in profile_start_iters:
+                assert not enabled, "Inconsistent CUDA profiling state"
+                calibrator.start()
+                torch.cuda.cudart().cudaProfilerStart()
+                if enable_torch_trace:
+                    torch_profiler.start()
+                logger.info(f"Profiling started at iteration {it}.")
+                enabled = True
+            calibrator.pre_step(it)
+
+            yield it
+
+            # Post-iter: calibrator post-step; maybe stop profiling.
+            calibrator.post_step(it)
+            if it in profile_stop_iters:
+                assert enabled, "Inconsistent CUDA profiling state"
+                if enable_torch_trace:
+                    torch_profiler.stop()
+                    torch_profiler.export_chrome_trace(torch_trace_path)
+                    logger.info(f"Profiling stopped at iteration {it}, "
+                                f"trace saved to {torch_trace_path}")
+                torch.cuda.cudart().cudaProfilerStop()
+                calibrator.stop()
+                enabled = False
+    finally:
+        # Early exit (caller ``return`` / exception, or stop iter
+        # never reached): close the profilers if still on. ``it`` is
+        # always bound here when ``enabled`` is True -- enabling
+        # only happens inside the for-loop body, after ``it`` is
+        # set.
+        if enabled:
+            if enable_torch_trace:
+                torch_profiler.stop()
+                torch_profiler.export_chrome_trace(torch_trace_path)
+                logger.info(f"Profiling stopped at iteration {it}, "
+                            f"trace saved to {torch_trace_path}")
+            torch.cuda.cudart().cudaProfilerStop()
+            calibrator.stop()
 
 
 # --------------------------------------------------------------------------- #
@@ -265,9 +453,15 @@ async def scheduler_iter_plain(ctx: Context, crn: Concerns) -> None:
     ``crn`` is the concern bag, passed as a SEPARATE arg (not via
     ``ctx``). The orchestrator legitimately needs it to query the
     drain check and to construct the per-batch coroutine.
+
+    The outer ``for _ in profiler(ctx):`` drives the
+    SCHEDULER-layer profiler tick (env-var-gated torch / CUDA /
+    layer-wise calibrator drivers; warmup iters drained at the top
+    of :func:`profiler` before any profile state is touched). See
+    :func:`profiler`.
     """
     logger.warning("PLAIN Coro executor")
-    while True:
+    for _ in profiler(ctx):
         if (ctx.port.is_shutdown
                 and ctx.svc.pool.is_drained()
                 and crn.schedule.waiting_queue_empty()):
@@ -363,7 +557,7 @@ async def scheduler_iter_overlap(ctx: Context, crn: Concerns) -> None:
     previous_view = None
 
     logger.warning("OVERLAP Coro executor")
-    while True:
+    for _ in profiler(ctx):
         # Termination: nothing to admit AND nothing parked. The loop
         # may still take one extra iter past the shutdown signal --
         # see the docstring's "Shutdown drain" note: when ``previous``
@@ -698,7 +892,7 @@ async def scheduler_iter_pp(ctx: Context, crn: Concerns) -> None:
                 finished_count += 1
         return finished_count
 
-    while True:
+    for _ in profiler(ctx):
         more_to_admit = (not ctx.port.is_shutdown
                          or not ctx.svc.pool.is_drained()
                          or not crn.schedule.waiting_queue_empty())
@@ -1230,19 +1424,45 @@ class PyExecutorCoro:
     def is_warmup(self) -> bool:
         """Mirror of the legacy ``is_warmup`` flag.
 
-        The setter propagates to ``model_engine.is_warmup`` so any
-        in-model gating (torch.compile bootstrap path, MoE load-
-        balancer skip, etc.) sees the same value. The bool also
-        feeds the legacy ``configure_kv_cache_capacity`` toggle.
+        Single source of truth is ``self._port.is_warmup`` -- the
+        flag is a cross-thread signal between the main-thread
+        public API and the loop-thread consumers. The loop thread
+        picks it up via two paths:
+
+        * :class:`ForwardConcern.run` reflects
+          ``ctx.port.is_warmup`` onto ``model_engine.is_warmup``
+          once per batch (immediately before invoking
+          ``forward()``) so model-internal gating
+          (``torch.compile`` bootstrap, MoE load-balancer skip,
+          etc.) sees the same value.
+        * :func:`profiler` (SCHEDULER-layer iter generator) drains
+          a warmup pass at the top of its try-body
+          (``while ctx.port.is_warmup: yield``) so the loop body
+          runs through the warmup pass without enabling the
+          profiler; the post-warmup ``itertools.count`` block then
+          takes over with ``it = 0``.
+
+        Used e.g. by ``_util.py``'s KV-cache memory estimation
+        pass to flag the dummy-request run.
+
+        One-shot contract (caller-side; not runtime-enforced)
+        -----------------------------------------------------
+
+        Callers must transition ``is_warmup`` ``False -> True ->
+        False`` at most once over the executor's lifetime: once
+        cleared (``True -> False``), do not flip it back to True.
+        :func:`profiler`'s warmup-drain block (a plain
+        ``while ctx.port.is_warmup: yield``) relies on this so it
+        exits exactly once and the post-warmup
+        ``itertools.count`` block runs at most once. Matches the
+        legacy ``PyExecutor.is_warmup`` (plain attribute, no
+        runtime check).
         """
-        return getattr(self, "_is_warmup", False)
+        return self._port.is_warmup
 
     @is_warmup.setter
     def is_warmup(self, value: bool) -> None:
-        self._is_warmup = value
-        # Reach into the model_engine the same way the legacy
-        # executor's setter does.
-        self.model_engine.is_warmup = value
+        self._port.is_warmup = value
 
     def can_enqueue_requests(self) -> bool:
         """Indicates whether the current process can enqueue requests."""

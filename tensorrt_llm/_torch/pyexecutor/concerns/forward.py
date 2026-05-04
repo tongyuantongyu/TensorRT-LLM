@@ -89,6 +89,18 @@ class ForwardConcern:
         #   failures propagate as exceptions per the new design;
         #   per-request fail-fast is owned by the concern that
         #   detected the bad request, not by forward).
+        #
+        # Reflect the cross-thread warmup signal onto the engine
+        # so the model-internal gates that read ``is_warmup``
+        # (``torch.compile`` bootstrap path, MoE load-balancer
+        # skip, attn-metadata beam-width override, etc.) see the
+        # same value the SCHEDULER does. Main thread writes
+        # ``ctx.port.is_warmup`` via :attr:`PyExecutorCoro.is_warmup`
+        # (e.g. ``_util.py``'s KV-cache memory estimation pass);
+        # this concern is the bridge into the engine. Refreshed
+        # once per batch -- earlier writes from main thread
+        # propagate at the next FORWARD_2.
+        self._model_engine.is_warmup = ctx.port.is_warmup
         gather_context_logits = any(
             req.py_return_context_logits
             for req in scheduled_batch.context_requests)
