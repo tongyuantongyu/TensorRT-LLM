@@ -130,6 +130,12 @@ methods:
       prompt_logprobs:
         annotation: Optional[int]
         default: None
+      logprobs_simple_format:
+        annotation: bool
+        default: false
+      prompt_logprobs_simple_format:
+        annotation: bool
+        default: false
       return_context_logits:
         annotation: bool
         default: false
