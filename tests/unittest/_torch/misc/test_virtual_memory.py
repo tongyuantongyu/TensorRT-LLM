@@ -1,4 +1,5 @@
 import gc
+import json
 
 import pytest
 import torch
@@ -30,6 +31,12 @@ def clean_cache():
     yield
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def _find_info(tag: str):
+    return next(
+        (info for info in virtual_memory.get_info() if info["tag"] == tag),
+        None)
 
 
 def test_basic(process_gpu_memory_info_available):
@@ -69,6 +76,59 @@ def test_basic(process_gpu_memory_info_available):
     memory_usage_end = get_current_process_gpu_memory()
     if process_gpu_memory_info_available:
         assert memory_usage_begin == memory_usage_end
+
+
+def test_get_info_and_print_info(capfd):
+    alloc_size = 16 * 1024 * 1024
+    tag = "test_info_tag"
+
+    with virtual_memory.scope(tag) as pool:
+        tensor = torch.empty([alloc_size], dtype=torch.int8, device='cuda')
+        torch.cuda.synchronize()
+
+        tag_info = _find_info(tag)
+        assert tag_info is not None
+        assert tag_info["total_chunks"] == 1
+        assert tag_info["materialized_chunks"] == 1
+        assert tag_info["logical_bytes"] >= alloc_size
+        assert tag_info["physical_bytes"] == tag_info["logical_bytes"]
+        assert tag_info.tag == tag_info["tag"]
+        assert tag_info.physical_bytes == tag_info["physical_bytes"]
+        logical_bytes = tag_info["logical_bytes"]
+        json.dumps(virtual_memory.get_info())
+
+    torch.cuda.synchronize()
+    virtual_memory.release_with_tag(tag)
+    tag_info = _find_info(tag)
+    assert tag_info is not None
+    assert tag_info["total_chunks"] == 1
+    assert tag_info["materialized_chunks"] == 0
+    assert tag_info["logical_bytes"] == logical_bytes
+    assert tag_info["physical_bytes"] == 0
+
+    torch.cuda.synchronize()
+    virtual_memory.materialize_with_tag(tag)
+    tag_info = _find_info(tag)
+    assert tag_info is not None
+    assert tag_info["total_chunks"] == 1
+    assert tag_info["materialized_chunks"] == 1
+    assert tag_info["logical_bytes"] == logical_bytes
+    assert tag_info["physical_bytes"] == logical_bytes
+
+    formatted_info = virtual_memory.format_info()
+    assert tag in formatted_info
+    assert "Chunks (Materialized/Total)" in formatted_info
+    assert "Logical Size" in formatted_info
+    assert "Physical Size" in formatted_info
+    assert "1/1" in formatted_info
+    assert "MiB" in formatted_info
+
+    virtual_memory.print_info()
+    output = capfd.readouterr().out
+    assert output == formatted_info + "\n"
+
+    del tensor
+    del pool
 
 
 def test_nested_scope(process_gpu_memory_info_available):

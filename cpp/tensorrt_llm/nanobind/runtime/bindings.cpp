@@ -54,6 +54,7 @@
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/trampoline.h>
 #include <torch/extension.h>
@@ -119,11 +120,19 @@ void initBindings(nb::module_& m)
         .def_rw("scaling_vec_pointer", &tr::LoraCache::TaskLayerModuleConfig::scalingVecPointer)
         .def(nb::self == nb::self);
 
+    nb::class_<tr::CudaVirtualMemoryManager::TagInfo>(m, "CudaVirtualMemoryManagerTagInfo")
+        .def_ro("tag", &tr::CudaVirtualMemoryManager::TagInfo::tag)
+        .def_ro("materialized_chunks", &tr::CudaVirtualMemoryManager::TagInfo::materializedChunks)
+        .def_ro("total_chunks", &tr::CudaVirtualMemoryManager::TagInfo::totalChunks)
+        .def_ro("logical_bytes", &tr::CudaVirtualMemoryManager::TagInfo::logicalBytes)
+        .def_ro("physical_bytes", &tr::CudaVirtualMemoryManager::TagInfo::physicalBytes);
+
     nb::class_<tr::CudaVirtualMemoryManager>(m, "CudaVirtualMemoryManager")
         .def("release_with_tag", &tr::CudaVirtualMemoryManager::releaseWithTag, nb::arg("tag"),
             nb::call_guard<nb::gil_scoped_release>())
         .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, nb::arg("tag"),
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_info", &tr::CudaVirtualMemoryManager::getInfo, nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<tr::TllmRuntime>(m, "TllmRuntime")
         .def(

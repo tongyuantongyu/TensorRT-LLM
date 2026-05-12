@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,8 +27,10 @@
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <string>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 class VirtualMemoryManagerTest;
 
@@ -42,6 +44,12 @@ namespace tensorrt_llm::runtime
 class CUDAVirtualMemoryChunk
 {
 public:
+    struct Info
+    {
+        size_t logicalBytes{};
+        size_t physicalBytes{};
+    };
+
     /**
      * CUDAVirtualMemoryChunk::Creator is the interface to obtain a CUmemGenericAllocationHandle,
      * either by creating one locally, or importing one from remote.
@@ -61,6 +69,11 @@ public:
         // is being destructed.
         virtual CUmemGenericAllocationHandle create() = 0;
         virtual void release(CUmemGenericAllocationHandle handle, bool destructing) = 0;
+
+        [[nodiscard]] virtual Info getInfo() const noexcept
+        {
+            return {};
+        }
     };
 
     using CreatorPtr = std::unique_ptr<Creator>;
@@ -191,6 +204,16 @@ public:
         return mCreator != nullptr;
     }
 
+    [[nodiscard]] Info getInfo() const noexcept
+    {
+        if (mCreator == nullptr)
+        {
+            return {};
+        }
+
+        return mCreator->getInfo();
+    }
+
 private:
     void _release(bool destructing);
 
@@ -222,21 +245,30 @@ struct LocalCreator : CUDAVirtualMemoryChunk::Creator
             MemoryCounters::getInstance().allocate(
                 mProp.location.type == CU_MEM_LOCATION_TYPE_DEVICE ? MemoryType::kGPU : MemoryType::kPINNED, mSize);
         }
+        mMaterialized = true;
         return handle;
     }
 
     void release(CUmemGenericAllocationHandle handle, bool destructing) override
     {
+        static_cast<void>(destructing);
         TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(handle));
         if constexpr (count)
         {
             MemoryCounters::getInstance().deallocate(
                 mProp.location.type == CU_MEM_LOCATION_TYPE_DEVICE ? MemoryType::kGPU : MemoryType::kPINNED, mSize);
         }
+        mMaterialized = false;
+    }
+
+    [[nodiscard]] CUDAVirtualMemoryChunk::Info getInfo() const noexcept override
+    {
+        return {mSize, mMaterialized ? mSize : 0};
     }
 
     CUmemAllocationProp mProp{};
     size_t mSize{};
+    bool mMaterialized{};
 };
 
 /**
@@ -352,6 +384,15 @@ struct OffloadConfigurator : CUDAVirtualMemoryChunk::Configurator
 class CudaVirtualMemoryManager
 {
 public:
+    struct TagInfo
+    {
+        std::string tag{};
+        size_t materializedChunks{};
+        size_t totalChunks{};
+        size_t logicalBytes{};
+        size_t physicalBytes{};
+    };
+
     /**
      * Add memory to be managed by this manager.
      * @param handle  Unique handle provided to reference this memory in `remove`.
@@ -425,6 +466,12 @@ public:
      * @return The handle list.
      */
     std::vector<uintptr_t> retrieveBadHandles() noexcept;
+
+    /**
+     * Retrieve diagnostic information for virtual memory chunks grouped by tag.
+     * @return Per-tag chunk counts and memory sizes.
+     */
+    std::vector<TagInfo> getInfo();
 
 private:
     CUDAVirtualMemoryChunk unsafeRemove(uintptr_t handle) noexcept;

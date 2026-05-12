@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from typing import Generator
 
 import torch
+from tabulate import tabulate
 
 from tensorrt_llm.bindings.internal.runtime import \
     CudaVirtualMemoryAllocatorRestoreMode as RestoreMode
@@ -13,7 +14,7 @@ from tensorrt_llm.bindings.internal.runtime import (
 
 __all__ = [
     "RestoreMode", "maybe_scope", "scope", "release_with_tag",
-    "materialize_with_tag"
+    "materialize_with_tag", "get_info", "format_info", "print_info"
 ]
 
 
@@ -49,6 +50,15 @@ class _MultiPoolProxy:
 
 _pool_stack: list[tuple[contextlib.AbstractContextManager,
                         _MultiPoolProxy]] = []
+
+
+class _Info(dict):
+
+    def __getattr__(self, name: str) -> int | str:
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
 
 
 def _scope(
@@ -137,3 +147,61 @@ def materialize_with_tag(*tags: str) -> int:
     manager = get_virtual_memory_manager()
     materialized_blobs = sum(manager.materialize_with_tag(tag) for tag in tags)
     return materialized_blobs
+
+
+def get_info() -> list[dict[str, int | str]]:
+    """Return diagnostic information for virtual memory grouped by tag."""
+
+    manager = get_virtual_memory_manager()
+    return [
+        _Info({
+            "tag": tag_info.tag,
+            "materialized_chunks": tag_info.materialized_chunks,
+            "total_chunks": tag_info.total_chunks,
+            "logical_bytes": tag_info.logical_bytes,
+            "physical_bytes": tag_info.physical_bytes,
+        }) for tag_info in manager.get_info()
+    ]
+
+
+def _format_bytes(num_bytes: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    size = float(num_bytes)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{num_bytes} {unit}"
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{num_bytes} B"
+
+
+def format_info() -> str:
+    """Format diagnostic information for virtual memory grouped by tag."""
+
+    info = get_info()
+    if not info:
+        return "CudaVirtualMemoryManager: no tracked virtual memory chunks"
+
+    table = []
+    for tag_info in info:
+        table.append({
+            "Tag":
+            tag_info["tag"],
+            "Chunks (Materialized/Total)":
+            (f"{tag_info['materialized_chunks']}/"
+             f"{tag_info['total_chunks']}"),
+            "Logical Size":
+            _format_bytes(tag_info["logical_bytes"]),
+            "Physical Size":
+            _format_bytes(tag_info["physical_bytes"]),
+        })
+
+    return "CudaVirtualMemoryManager:\n" + tabulate(
+        table, headers="keys", tablefmt="github")
+
+
+def print_info() -> None:
+    """Print diagnostic information for virtual memory grouped by tag."""
+
+    print(format_info())

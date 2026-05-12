@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -237,6 +237,38 @@ void CudaVirtualMemoryManager::addBadHandle(uintptr_t handle) noexcept
 std::vector<uintptr_t> CudaVirtualMemoryManager::retrieveBadHandles() noexcept
 {
     return std::move(mBadHandles);
+}
+
+std::vector<CudaVirtualMemoryManager::TagInfo> CudaVirtualMemoryManager::getInfo()
+{
+    std::unique_lock lock(mMutex);
+
+    std::vector<TagInfo> info;
+    for (auto it = mEntries.begin(); it != mEntries.end();)
+    {
+        TagInfo tagInfo;
+        tagInfo.tag = it->first;
+
+        auto const [begin, end] = mEntries.equal_range(it->first);
+        for (auto tagIt = begin; tagIt != end; ++tagIt)
+        {
+            auto const& memory = tagIt->second->second.mMemory;
+            auto const memoryInfo = memory.getInfo();
+
+            ++tagInfo.totalChunks;
+            if (memory.status() == CUDAVirtualMemoryChunk::MATERIALIZED)
+            {
+                ++tagInfo.materializedChunks;
+            }
+            tagInfo.logicalBytes += memoryInfo.logicalBytes;
+            tagInfo.physicalBytes += memoryInfo.physicalBytes;
+        }
+
+        info.push_back(tagInfo);
+        it = end;
+    }
+
+    return info;
 }
 
 size_t CudaVirtualMemoryManager::releaseWithTag(std::string const& tag)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1138,6 +1138,93 @@ TEST_F(VirtualMemoryManagerTest, TestTags)
     mVMManager->remove(0x2000);
     mVMManager->remove(0x3000);
     mVMManager->remove(0x4000);
+}
+
+TEST_F(VirtualMemoryManagerTest, TestGetInfo)
+{
+    constexpr std::size_t sizeA = 4 * 1024 * 1024;
+    constexpr std::size_t sizeB = 8 * 1024 * 1024;
+    constexpr std::size_t sizeC = 16 * 1024 * 1024;
+
+    CUdeviceptr addressA{};
+    CUdeviceptr addressB{};
+    CUdeviceptr addressC{};
+    TLLM_CU_CHECK(cuMemAddressReserve(&addressA, sizeA, 0, {}, 0));
+    TLLM_CU_CHECK(cuMemAddressReserve(&addressB, sizeB, 0, {}, 0));
+    TLLM_CU_CHECK(cuMemAddressReserve(&addressC, sizeC, 0, {}, 0));
+
+    auto makeMemory = [](CUdeviceptr address, std::size_t size)
+    {
+        CUDAVirtualMemoryChunk::CreatorPtr creator
+            = std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED,
+                                                   CU_MEM_HANDLE_TYPE_NONE, {CU_MEM_LOCATION_TYPE_DEVICE, 0}},
+                size);
+
+        CUDAVirtualMemoryChunk::Configurators configurators;
+        configurators.push_back(std::make_unique<UnicastConfigurator>(
+            address, size, CUmemAccessDesc{{CU_MEM_LOCATION_TYPE_DEVICE, 0}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+
+        return CUDAVirtualMemoryChunk(std::move(creator), std::move(configurators));
+    };
+
+    auto memoryA = makeMemory(addressA, sizeA);
+    auto memoryB = makeMemory(addressB, sizeB);
+    auto memoryC = makeMemory(addressC, sizeC);
+    memoryA.materialize();
+    memoryC.materialize();
+
+    mVMManager->add(static_cast<uintptr_t>(addressA), "tag_A", std::move(memoryA));
+    mVMManager->add(static_cast<uintptr_t>(addressB), "tag_A", std::move(memoryB));
+    mVMManager->add(static_cast<uintptr_t>(addressC), "tag_B", std::move(memoryC));
+
+    auto findInfo = [](std::vector<CudaVirtualMemoryManager::TagInfo> const& info, std::string const& tag)
+    { return std::find_if(info.begin(), info.end(), [&](auto const& tagInfo) { return tagInfo.tag == tag; }); };
+
+    auto info = mVMManager->getInfo();
+    ASSERT_EQ(info.size(), 2);
+    auto tagA = findInfo(info, "tag_A");
+    ASSERT_NE(tagA, info.end());
+    EXPECT_EQ(tagA->totalChunks, 2);
+    EXPECT_EQ(tagA->materializedChunks, 1);
+    EXPECT_EQ(tagA->logicalBytes, sizeA + sizeB);
+    EXPECT_EQ(tagA->physicalBytes, sizeA);
+
+    auto tagB = findInfo(info, "tag_B");
+    ASSERT_NE(tagB, info.end());
+    EXPECT_EQ(tagB->totalChunks, 1);
+    EXPECT_EQ(tagB->materializedChunks, 1);
+    EXPECT_EQ(tagB->logicalBytes, sizeC);
+    EXPECT_EQ(tagB->physicalBytes, sizeC);
+
+    EXPECT_EQ(mVMManager->releaseWithTag("tag_A"), 1);
+    info = mVMManager->getInfo();
+    tagA = findInfo(info, "tag_A");
+    ASSERT_NE(tagA, info.end());
+    EXPECT_EQ(tagA->totalChunks, 2);
+    EXPECT_EQ(tagA->materializedChunks, 0);
+    EXPECT_EQ(tagA->logicalBytes, sizeA + sizeB);
+    EXPECT_EQ(tagA->physicalBytes, 0);
+
+    EXPECT_EQ(mVMManager->materializeWithTag("tag_A"), 2);
+    info = mVMManager->getInfo();
+    tagA = findInfo(info, "tag_A");
+    ASSERT_NE(tagA, info.end());
+    EXPECT_EQ(tagA->totalChunks, 2);
+    EXPECT_EQ(tagA->materializedChunks, 2);
+    EXPECT_EQ(tagA->logicalBytes, sizeA + sizeB);
+    EXPECT_EQ(tagA->physicalBytes, sizeA + sizeB);
+
+    auto cleanup = [&](CUdeviceptr address, std::size_t size)
+    {
+        {
+            auto removedMemory = mVMManager->remove(static_cast<uintptr_t>(address));
+            EXPECT_TRUE(removedMemory);
+        }
+        TLLM_CU_CHECK(cuMemAddressFree(address, size));
+    };
+    cleanup(addressA, sizeA);
+    cleanup(addressB, sizeB);
+    cleanup(addressC, sizeC);
 }
 
 TEST_F(VirtualMemoryManagerTest, TestAddException)
