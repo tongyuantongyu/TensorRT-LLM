@@ -1312,8 +1312,7 @@ directly. This is the mechanism that enforces it, plus the routing
 table for where any given piece of cross-concern data must go.
 
 The mechanism is simply that **a concern receives no `ctx`** (§4.4).
-The [`Concerns`](tensorrt_llm/_torch/pyexecutor/concerns/__init__.py#L138-L192)
-bag — a frozen dataclass with one field per concern instance, built
+The `Concerns` bag — a frozen dataclass with one field per concern instance, built
 once in `PyExecutorCoro.__init__` — lives on `ctx.crn`, and the
 orchestrators (`run_loop` / `scheduler_iter*` / `batch_body`) reach
 peers through it freely. A concern cannot: it has no `ctx`, so
@@ -1576,10 +1575,7 @@ been on `ctx` — it could call peers via `ctx.crn.X`. The design
 withholds `ctx` from concerns entirely and injects each
 dependency through `__init__` (§4.4): the surface becomes the
 constructor signature, least privilege holds, and peer access is
-structurally impossible. A useful side effect: with concerns unable
-to reach `ctx` at all, the `Concerns` bag can safely move back onto
-`ctx.crn` for the orchestrators (§5.1) — the protection no longer
-depends on keeping `crn` off `ctx`.
+structurally impossible.
 
 ---
 
@@ -1609,17 +1605,7 @@ the remaining concerns land.
 | `tensorrt_llm/_torch/pyexecutor/context.py` | 553 | `Context` (incl. the `Concerns` bag), `Service`, `Configuration`, and the cross-thread boundary services. (Prototype still has a `PersistentState`; the design drops it and the prototype keeps `Concerns` as a separate arg — see §6.) |
 | `tensorrt_llm/_torch/pyexecutor/py_executor_coro.py` | 1570 | `PyExecutorCoro`, `scheduler_iter_{plain,overlap,pp}`, `batch_body`, `profiler` |
 | `tensorrt_llm/_torch/pyexecutor/pp_helpers.py` | 575 | PP comm helpers shared between legacy and coro paths |
-| `tensorrt_llm/_torch/pyexecutor/concerns/__init__.py` | 227 | `Concerns` bag + module docstring with the four-homes rule |
-| `tensorrt_llm/_torch/pyexecutor/concerns/concerns.md` | 445 | Per-concern design notes (planned-concerns table, etc.) |
-| `tensorrt_llm/_torch/pyexecutor/concerns/services.py` | 515 | Loop-only services (request lifecycle, recv offload, dist) |
-| `tensorrt_llm/_torch/pyexecutor/concerns/forward.py` | 135 | `ForwardConcern` |
-| `tensorrt_llm/_torch/pyexecutor/concerns/resource.py` | 89 | `ResourceConcern` |
-| `tensorrt_llm/_torch/pyexecutor/concerns/response.py` | 156 | `ResponseConcern` |
-| `tensorrt_llm/_torch/pyexecutor/concerns/sample.py` | 157 | `SampleConcern` |
-| `tensorrt_llm/_torch/pyexecutor/concerns/schedule.py` | 402 | `ScheduleConcern`, `PpScheduleConcern` |
-| `tensorrt_llm/_torch/pyexecutor/concerns/state_advance.py` | 168 | `StateAdvanceConcern` |
-| `tensorrt_llm/_torch/pyexecutor/concerns/ring_broadcast.py` | 302 | `RingBroadcastSampleConcern` (PP sample-state ring broadcast) |
-| `tests/unittest/_torch/executor/test_py_executor_coro_sanity.py` | 183 | End-to-end sanity for `PyExecutorCoro` |
+| `tensorrt_llm/_torch/pyexecutor/concerns/*.py` | - | Concerns definition |
 
 Generic runtime (`coroutines.py`) and the concrete data model
 (`batch_storage.py`) are deliberately split. The runtime knows only
