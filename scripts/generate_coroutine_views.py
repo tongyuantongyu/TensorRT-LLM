@@ -60,6 +60,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 # pointless on that host anyway — the generator isn't a test, it's a
 # dev tool.
 from tensorrt_llm._torch.pyexecutor.batch_storage import BatchStorage, BatchPhase
+from tensorrt_llm._torch.pyexecutor.coroutines import UNSET
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TARGET = REPO_ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "batch_storage.py"
@@ -85,19 +86,18 @@ def _fields_by_phase(
     return result
 
 
-def _unwrap_optional(annotation: str) -> str:
-    """Try strip one ``Optional[X]`` wrapper.
+def _field_has_default(field: dataclasses.Field) -> bool:
+    """Return whether ``field`` declared a read-before-write default."""
+    return bool(field.metadata.get("has_default", False))
 
-    Fields are declared ``Optional`` so that "unset" is representable as
-    ``None``. The read-view property annotations drop the wrapper
-    because, by the happens-before contract, a field is guaranteed to
-    be set (non-``None``) once a reader at a later phase observes it.
-    """
-    stripped = annotation.strip()
-    prefix, suffix = "Optional[", "]"
-    if stripped.startswith(prefix) and stripped.endswith(suffix):
-        return stripped[len(prefix) : -len(suffix)]
-    return stripped
+
+def _field_default_expr(field: dataclasses.Field) -> str:
+    """Render the generated write-view default for ``field``."""
+    if not _field_has_default(field):
+        return "UNSET"
+    if field.default is None:
+        return "None"
+    return repr(field.default)
 
 
 def _sorted_phases() -> List[BatchPhase]:
@@ -231,7 +231,7 @@ def _render_read_protocol(
         f'cumulative through {prev_phase.name}."""'
     )
     for f in new_fields:
-        type_str = _unwrap_optional(f.type)
+        type_str = f.type
         lines.append("")
         lines.append("    @property")
         doc = field_docs.get(f.name)
@@ -262,7 +262,7 @@ def _render_write_dataclass(
     lines.append(f'    """Fields producible at phase {phase.name}."""')
     lines.append("")
     for f in fields:
-        lines.append(f"    {f.name}: {f.type} = None")
+        lines.append(f"    {f.name}: {f.type} = {_field_default_expr(f)}")
         doc = field_docs.get(f.name)
         if doc:
             # Trailing-string convention: dataclass field "docstring".
@@ -288,7 +288,7 @@ def _render_read_at_all(
         f'    """Readable after all phases — cumulative through {last_phase.name}."""',
     ]
     for f in last_phase_fields:
-        type_str = _unwrap_optional(f.type)
+        type_str = f.type
         lines.append("")
         lines.append("    @property")
         doc = field_docs.get(f.name)

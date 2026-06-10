@@ -163,6 +163,7 @@ __all__ = [
     "Driver",
     "Batch",
     "Concern",
+    "UNSET",
     "again",
     "disable_hang_detect",
     "enter_phase",
@@ -183,6 +184,11 @@ __all__ = [
 # yield / send / return types are intentionally unconstrained: the
 # runtime's contract is encoded by which primitives the coroutine uses.
 _CoroutineLike = Coroutine[Any, Any, Any]
+
+# Sentinel stored in phased fields that do not declare a default. A
+# read view turns this into a read-before-write error before callers
+# can observe it.
+UNSET = object()
 
 
 # --------------------------------------------------------------------------- #
@@ -219,7 +225,7 @@ def _hide_framework_frames(exc: BaseException) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def phased_field(phase: IntEnum, default: Any = None) -> Any:
+def phased_field(phase: IntEnum, default: Any = UNSET) -> Any:
     """Dataclass field tagged with the phase that produces it.
 
     The phase is stashed in the field's metadata so both the runtime
@@ -231,17 +237,31 @@ def phased_field(phase: IntEnum, default: Any = None) -> Any:
     Generic over the phase enum: any ``IntEnum`` whose values induce a
     consistent ordering works. Production uses ``batch_storage.BatchPhase``;
     tests use a local ``_TestPhase``.
+
+    ``default`` is intentionally not ``None`` by default: a field with
+    no explicit default starts as ``UNSET`` and trips tracked
+    read-before-write checks, while ``default=None`` means ``None`` is
+    a valid value to read before a producer writes the field.
     """
     return dataclasses.field(
         default=default,
-        metadata={"phase": phase},
+        metadata={"phase": phase, "has_default": default is not UNSET},
     )
 
 
-def _field_phases(storage_cls: Any) -> dict[str, IntEnum]:
-    """Extract the field-name -> phase map from a storage dataclass."""
+@dataclasses.dataclass(frozen=True)
+class _PhasedFieldMetadata:
+    phase: IntEnum
+    has_default: bool
+
+
+def _phased_field_metadata(storage_cls: Any) -> dict[str, _PhasedFieldMetadata]:
+    """Extract phased-field metadata from a storage dataclass."""
     return {
-        f.name: f.metadata["phase"]
+        f.name: _PhasedFieldMetadata(
+            phase=f.metadata["phase"],
+            has_default=bool(f.metadata.get("has_default", False)),
+        )
         for f in dataclasses.fields(storage_cls)
         if "phase" in f.metadata
     }
@@ -274,7 +294,9 @@ when the storage is garbage-collected, so debug runs don't leak
 tracking sets.
 
 Membership — not ``value is None`` — is what the read view uses to tell
-"never touched" apart from "touched, value happens to be ``None``".
+"never touched" apart from "touched, value happens to be ``None``". If
+the field declared an explicit default, "never touched" is allowed and
+the default value is returned.
 """
 
 
@@ -304,36 +326,37 @@ class _TrackedReadView:
     - The field exists on the underlying storage (else ``AttributeError``).
     - The field's declared phase is strictly less than ``phase`` (else
       ``AttributeError`` — that field is not readable yet).
-    - The field has been assigned via a tracked write view (else
-      ``RuntimeError`` — read before write).
+    - The field has been assigned via a tracked write view, unless it
+      declared an explicit default (else ``RuntimeError`` — read before
+      write).
 
     Writes raise unconditionally — a read view is not a write handle.
     """
 
-    __slots__ = ("_storage", "_phase", "_field_phase")
+    __slots__ = ("_storage", "_phase", "_fields")
 
     _storage: object
     _phase: IntEnum
-    _field_phase: dict[str, IntEnum]
+    _fields: dict[str, _PhasedFieldMetadata]
 
     def __init__(self, storage: object, phase: IntEnum) -> None:
         object.__setattr__(self, "_storage", storage)
         object.__setattr__(self, "_phase", phase)
-        object.__setattr__(self, "_field_phase", _field_phases(type(storage)))
+        object.__setattr__(self, "_fields", _phased_field_metadata(type(storage)))
 
     def __getattr__(self, name: str) -> object:
-        field_phase = self._field_phase.get(name)
-        if field_phase is None:
+        field = self._fields.get(name)
+        if field is None:
             raise AttributeError(f"{type(self._storage).__name__!r} has no field {name!r}")
-        if field_phase >= self._phase:
+        if field.phase >= self._phase:
             raise AttributeError(
                 f"field {name!r} is produced at phase "
-                f"{field_phase.name}; read view at phase "
+                f"{field.phase.name}; read view at phase "
                 f"{self._phase.name} does not expose it"
             )
-        if not _was_written(self._storage, name):
+        if not _was_written(self._storage, name) and not field.has_default:
             raise RuntimeError(
-                f"field {name!r} (produced at phase {field_phase.name}) "
+                f"field {name!r} (produced at phase {field.phase.name}) "
                 f"was never written but read at phase {self._phase.name}"
             )
         return getattr(self._storage, name)
@@ -363,16 +386,16 @@ class _TrackedWriteView:
     Reads raise unconditionally — a write view is not a read handle.
     """
 
-    __slots__ = ("_storage", "_phase", "_field_phase")
+    __slots__ = ("_storage", "_phase", "_fields")
 
     _storage: object
     _phase: IntEnum
-    _field_phase: dict[str, IntEnum]
+    _fields: dict[str, _PhasedFieldMetadata]
 
     def __init__(self, storage: object, phase: IntEnum) -> None:
         object.__setattr__(self, "_storage", storage)
         object.__setattr__(self, "_phase", phase)
-        object.__setattr__(self, "_field_phase", _field_phases(type(storage)))
+        object.__setattr__(self, "_fields", _phased_field_metadata(type(storage)))
 
     def __getattr__(self, name: str) -> object:
         raise AttributeError(
@@ -382,13 +405,13 @@ class _TrackedWriteView:
         )
 
     def __setattr__(self, name: str, value: object) -> None:
-        field_phase = self._field_phase.get(name)
-        if field_phase is None:
+        field = self._fields.get(name)
+        if field is None:
             raise AttributeError(f"{type(self._storage).__name__!r} has no field {name!r}")
-        if field_phase != self._phase:
+        if field.phase != self._phase:
             raise AttributeError(
                 f"field {name!r} belongs to phase "
-                f"{field_phase.name}; write view at phase "
+                f"{field.phase.name}; write view at phase "
                 f"{self._phase.name} does not accept it"
             )
         setattr(self._storage, name, value)
@@ -401,25 +424,26 @@ class _TrackedAllReadView:
     Returned by :func:`_all_read_view` for the terminal ``step()`` case
     — once a batch has completed, every field its body could have
     produced is in scope. Read enforcement is "the field exists and has
-    been written"; there's no phase ceiling to compare against.
+    been written or has a default"; there's no phase ceiling to compare
+    against.
     """
 
-    __slots__ = ("_storage", "_field_phase")
+    __slots__ = ("_storage", "_fields")
 
     _storage: object
-    _field_phase: dict[str, IntEnum]
+    _fields: dict[str, _PhasedFieldMetadata]
 
     def __init__(self, storage: object) -> None:
         object.__setattr__(self, "_storage", storage)
-        object.__setattr__(self, "_field_phase", _field_phases(type(storage)))
+        object.__setattr__(self, "_fields", _phased_field_metadata(type(storage)))
 
     def __getattr__(self, name: str) -> object:
-        field_phase = self._field_phase.get(name)
-        if field_phase is None:
+        field = self._fields.get(name)
+        if field is None:
             raise AttributeError(f"{type(self._storage).__name__!r} has no field {name!r}")
-        if not _was_written(self._storage, name):
+        if not _was_written(self._storage, name) and not field.has_default:
             raise RuntimeError(
-                f"field {name!r} (produced at phase {field_phase.name}) was never written"
+                f"field {name!r} (produced at phase {field.phase.name}) was never written"
             )
         return getattr(self._storage, name)
 

@@ -26,7 +26,9 @@ runtime tests that exercise the generic mechanics import directly from
 Adding a new field
 ==================
 
-1. Add ``Optional[T] = phased_field(BatchPhase.X)`` to ``BatchStorage``.
+1. Add ``T = phased_field(BatchPhase.X)`` to ``BatchStorage``. Use
+   ``Optional[T] = phased_field(BatchPhase.X, default=None)`` only when
+   ``None`` is a valid read-before-write default for the field.
 2. Run ``python scripts/generate_coroutine_views.py`` to refresh the
    ``# ===== BEGIN GENERATED =====`` ... ``# ===== END GENERATED =====``
    region below. Never edit that region by hand.
@@ -51,6 +53,7 @@ from tensorrt_llm._torch.pyexecutor.coroutines import (
     Driver,
     Batch,
     Concern,
+    UNSET,
     again,
     phased_field,
     resume,
@@ -339,13 +342,13 @@ class BatchStorage:
     #     iterates ``context_requests_last_chunk`` + ``generation_requests``
     #     during the ring traversal.
     #   - ``iter_stats`` at FINALIZE_9: ``_process_iter_stats``.
-    scheduled_batch: Optional[ScheduledRequests] = phased_field(BatchPhase.SCHEDULE_0)
+    scheduled_batch: ScheduledRequests = phased_field(BatchPhase.SCHEDULE_0)
     """The scheduled set of requests this batch will run."""
 
     # Producer: ``schedule`` concern (``_can_queue`` collective).
     # Consumer: BATCH at FORWARD_2 -- decides whether to spawn the
     # forward / sample / respond coroutines (skipped when ``False``).
-    can_queue: Optional[bool] = phased_field(BatchPhase.SCHEDULE_0)
+    can_queue: bool = phased_field(BatchPhase.SCHEDULE_0)
     """Whether every TP rank has a non-empty scheduled batch this iter."""
 
     # Producer: ``schedule`` concern at SCHEDULE_0 -- collected
@@ -361,7 +364,7 @@ class BatchStorage:
     # the field is fully consumed at RESPOND_8 and not read again.
     # Cross-iter retention for disagg lands as a service or as a
     # response-concern attribute when that path is wired.
-    canceled_req_ids: Optional[List[int]] = phased_field(BatchPhase.SCHEDULE_0)
+    canceled_req_ids: List[int] = phased_field(BatchPhase.SCHEDULE_0)
     """Request IDs cancelled by the API since the last iter."""
 
     # OVERLAP-ONLY. Plain and PP discard the second return value of
@@ -372,7 +375,7 @@ class BatchStorage:
     # compute ``should_process_previous_batch = can_queue or not
     # can_queue_this_rank`` and to set ``self.previous_batch = None``
     # on empty-rank (HC2 cleanup variant).
-    can_queue_this_rank: Optional[bool] = phased_field(BatchPhase.SCHEDULE_0)
+    can_queue_this_rank: Optional[bool] = phased_field(BatchPhase.SCHEDULE_0, default=None)
     """Whether THIS specific rank has a non-empty scheduled batch."""
 
     # Producer: ``schedule`` concern (return value of ``_schedule()``).
@@ -389,7 +392,9 @@ class BatchStorage:
     #   - ``resource`` at RESOURCE_PREP_1: see
     #     ``disagg_gen_init_to_prepare`` -- reads the holder and runs
     #     ``prepare_resources``.
-    fitting_disagg_gen_init_requests: Optional[List[LlmRequest]] = phased_field(BatchPhase.SCHEDULE_0)
+    fitting_disagg_gen_init_requests: Optional[List[LlmRequest]] = phased_field(
+        BatchPhase.SCHEDULE_0, default=None
+    )
     """Disagg gen-init requests that fit this iter."""
 
     # Producer: ``disagg`` concern at SCHEDULE_0 -- packages
@@ -408,7 +413,9 @@ class BatchStorage:
     # method body. Splitting them across SCHEDULE_0 -> RESOURCE_PREP_1
     # is the minimum-2-phase shape required for the cross-concern
     # data flow through ``BatchStorage``.
-    disagg_gen_init_to_prepare: Optional[ScheduledRequests] = phased_field(BatchPhase.SCHEDULE_0)
+    disagg_gen_init_to_prepare: Optional[ScheduledRequests] = phased_field(
+        BatchPhase.SCHEDULE_0, default=None
+    )
     """Disagg gen-init requests packaged as a ScheduledRequests holder for resource prep."""
 
     # Producer: ``schedule`` concern.
@@ -416,7 +423,7 @@ class BatchStorage:
     # ``_prepare_and_schedule_batch``: when ``num_fitting_reqs == 0``
     # AND no disagg-gen-init either, decides whether to block on
     # at-least-one ctx KV transfer or just opportunistically clean up.
-    num_fitting_reqs: Optional[int] = phased_field(BatchPhase.SCHEDULE_0)
+    num_fitting_reqs: Optional[int] = phased_field(BatchPhase.SCHEDULE_0, default=None)
     """Number of regular (non-disagg-gen-init) requests that fit."""
 
     # PP-ONLY.
@@ -431,7 +438,9 @@ class BatchStorage:
     #
     # Consumer: ``forward`` at FORWARD_2 -- passed as the
     # ``new_tensors_device`` arg to ``_forward_step``.
-    previous_tensors_device: Optional[SampleStateTensors] = phased_field(BatchPhase.SCHEDULE_0)
+    previous_tensors_device: Optional[SampleStateTensors] = phased_field(
+        BatchPhase.SCHEDULE_0, default=None
+    )
     """Forward-input device tensors threaded in from the previous batch."""
 
     # OVERLAP-ONLY. Produced only when the SCHEDULER decides
@@ -442,7 +451,9 @@ class BatchStorage:
     # accepted-token tensor).
     # Consumer: ``forward`` at FORWARD_2 -- passed as the
     # ``num_accepted_tokens_device`` arg to ``_forward_step``.
-    num_accepted_tokens_device: Optional[torch.Tensor] = phased_field(BatchPhase.SCHEDULE_0)
+    num_accepted_tokens_device: Optional[torch.Tensor] = phased_field(
+        BatchPhase.SCHEDULE_0, default=None
+    )
     """Per-request accepted-token counts from the in-bridge draft model."""
 
     # ===================== FORWARD_2 =====================
@@ -460,7 +471,7 @@ class BatchStorage:
     #     ``guided_decoder_failed_requests`` as a Python local in the
     #     guided_decoder coroutine.
     #   - ``sample.sample_async(scheduled_batch, batch_outputs)``.
-    batch_outputs: Optional[Dict[str, torch.Tensor]] = phased_field(BatchPhase.FORWARD_2)
+    batch_outputs: Dict[str, torch.Tensor] = phased_field(BatchPhase.FORWARD_2)
     """Forward pass outputs: logits, hidden_states, additional outputs."""
 
     # Producer: ``forward`` concern (``_forward_step`` populates
@@ -476,7 +487,7 @@ class BatchStorage:
     # is a single mutable object reused across iters; the storage simply
     # threads its current handle through so the resource concern doesn't
     # need to reach into the model engine.
-    attn_metadata: Optional[AttentionMetadata] = phased_field(BatchPhase.FORWARD_2)
+    attn_metadata: Optional[AttentionMetadata] = phased_field(BatchPhase.FORWARD_2, default=None)
     """Attention metadata produced by this iter's forward pass."""
 
     # ===================== SAMPLE_3 =====================
@@ -516,7 +527,7 @@ class BatchStorage:
     # NOTE: in the plain loop ``sample_state`` is intra-concern in isolation
     # (``sample`` produces and consumes); it could legally be a Python local
     # there. It's kept as a storage field for uniformity with overlap and PP.
-    sample_state: Optional[SampleState] = phased_field(BatchPhase.SAMPLE_3)
+    sample_state: Optional[SampleState] = phased_field(BatchPhase.SAMPLE_3, default=None)
     """Sampler state: ``sampler_event``, host tokens, device tensors."""
 
     # ===================== RESPOND_8 =====================
@@ -530,7 +541,7 @@ class BatchStorage:
     # as production are forbidden (read view at phase P sees writes at < P
     # only). FINALIZE_9 is the smallest phase split that resolves the
     # conflict.
-    finished_requests: Optional[List[LlmRequest]] = phased_field(BatchPhase.RESPOND_8)
+    finished_requests: List[LlmRequest] = phased_field(BatchPhase.RESPOND_8)
     """Requests that finished (terminated) during this batch's response."""
 
 
@@ -575,32 +586,32 @@ class _ReadAtResourcePrep_1(_ReadAtSchedule_0, Protocol):
         ...
 
     @property
-    def can_queue_this_rank(self) -> bool:
+    def can_queue_this_rank(self) -> Optional[bool]:
         """Whether THIS specific rank has a non-empty scheduled batch."""
         ...
 
     @property
-    def fitting_disagg_gen_init_requests(self) -> List[LlmRequest]:
+    def fitting_disagg_gen_init_requests(self) -> Optional[List[LlmRequest]]:
         """Disagg gen-init requests that fit this iter."""
         ...
 
     @property
-    def disagg_gen_init_to_prepare(self) -> ScheduledRequests:
+    def disagg_gen_init_to_prepare(self) -> Optional[ScheduledRequests]:
         """Disagg gen-init requests packaged as a ScheduledRequests holder for resource prep."""
         ...
 
     @property
-    def num_fitting_reqs(self) -> int:
+    def num_fitting_reqs(self) -> Optional[int]:
         """Number of regular (non-disagg-gen-init) requests that fit."""
         ...
 
     @property
-    def previous_tensors_device(self) -> SampleStateTensors:
+    def previous_tensors_device(self) -> Optional[SampleStateTensors]:
         """Forward-input device tensors threaded in from the previous batch."""
         ...
 
     @property
-    def num_accepted_tokens_device(self) -> torch.Tensor:
+    def num_accepted_tokens_device(self) -> Optional[torch.Tensor]:
         """Per-request accepted-token counts from the in-bridge draft model."""
         ...
 
@@ -620,7 +631,7 @@ class _ReadAtSample_3(_ReadAtForward_2, Protocol):
         ...
 
     @property
-    def attn_metadata(self) -> AttentionMetadata:
+    def attn_metadata(self) -> Optional[AttentionMetadata]:
         """Attention metadata produced by this iter's forward pass."""
         ...
 
@@ -630,7 +641,7 @@ class _ReadAtStateUpd_4(_ReadAtSample_3, Protocol):
     """Readable fields at phase STATE_UPD_4 — cumulative through SAMPLE_3."""
 
     @property
-    def sample_state(self) -> SampleState:
+    def sample_state(self) -> Optional[SampleState]:
         """Sampler state: ``sampler_event``, host tokens, device tensors."""
         ...
 
@@ -674,11 +685,11 @@ class _ReadAtAll(_ReadAtFinalize_9, Protocol):
 class _WriteAtSchedule_0:
     """Fields producible at phase SCHEDULE_0."""
 
-    scheduled_batch: Optional[ScheduledRequests] = None
+    scheduled_batch: ScheduledRequests = UNSET
     """The scheduled set of requests this batch will run."""
-    can_queue: Optional[bool] = None
+    can_queue: bool = UNSET
     """Whether every TP rank has a non-empty scheduled batch this iter."""
-    canceled_req_ids: Optional[List[int]] = None
+    canceled_req_ids: List[int] = UNSET
     """Request IDs cancelled by the API since the last iter."""
     can_queue_this_rank: Optional[bool] = None
     """Whether THIS specific rank has a non-empty scheduled batch."""
@@ -703,7 +714,7 @@ class _WriteAtResourcePrep_1:
 class _WriteAtForward_2:
     """Fields producible at phase FORWARD_2."""
 
-    batch_outputs: Optional[Dict[str, torch.Tensor]] = None
+    batch_outputs: Dict[str, torch.Tensor] = UNSET
     """Forward pass outputs: logits, hidden_states, additional outputs."""
     attn_metadata: Optional[AttentionMetadata] = None
     """Attention metadata produced by this iter's forward pass."""
@@ -741,7 +752,7 @@ class _WriteAtApply_7:
 class _WriteAtRespond_8:
     """Fields producible at phase RESPOND_8."""
 
-    finished_requests: Optional[List[LlmRequest]] = None
+    finished_requests: List[LlmRequest] = UNSET
     """Requests that finished (terminated) during this batch's response."""
 
 

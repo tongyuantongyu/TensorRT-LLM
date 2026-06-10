@@ -77,12 +77,12 @@ class SampleConcern:
         # SAMPLE_3 -- queue the sampling kernel, record sampler_event.
         r3, w3 = await enter_phase(BatchPhase.SAMPLE_3)
         scheduled_batch = r3.scheduled_batch
-        batch_outputs = r3.batch_outputs
 
         sample_state: Optional["SampleState"] = None
         if r3.can_queue:
-            if batch_outputs is not None:
+            if ctx.svc.dist.is_last_pp_rank:
                 # Real sampling: last PP rank or single-rank.
+                batch_outputs = r3.batch_outputs
                 num_context_logits_prefix_sum = [0]
                 prefix_sum = 0
                 num_context_tokens = 0
@@ -114,7 +114,7 @@ class SampleConcern:
                     batch_outputs,
                     num_context_logits_prefix_sum,
                 )
-            elif not ctx.svc.dist.is_last_pp_rank:
+            else:
                 # Non-last PP rank: produce a placeholder
                 # sample_state so the slot-ring carries the same
                 # shape across ranks. Mirrors the legacy

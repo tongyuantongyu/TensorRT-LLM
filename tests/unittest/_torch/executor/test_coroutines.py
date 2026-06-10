@@ -83,10 +83,11 @@ class _TestStorage:
     publication" from "concern's publication" within the same phase.
     """
 
-    p0_out: Optional[int] = phased_field(_TestPhase.P0)
-    p1_out: Optional[str] = phased_field(_TestPhase.P1)
-    batch_label: Optional[str] = phased_field(_TestPhase.P1)
-    p2_out: Optional[bytes] = phased_field(_TestPhase.P2)
+    p0_out: int = phased_field(_TestPhase.P0)
+    p1_out: str = phased_field(_TestPhase.P1)
+    batch_label: str = phased_field(_TestPhase.P1)
+    defaulted_p1_out: Optional[str] = phased_field(_TestPhase.P1, default=None)
+    p2_out: bytes = phased_field(_TestPhase.P2)
     # _TestPhase.P3 has no field — exercises "terminal phase produces
     # nothing" / write-view-with-no-fields cases.
 
@@ -997,6 +998,25 @@ def test_tracked_read_of_unwritten_field_raises(tracked_storage):
 
     with pytest.raises(RuntimeError, match=r"p0_out.*never written"):
         Driver(scheduler()).run()
+
+
+def test_tracked_read_of_defaulted_unwritten_field_returns_default(tracked_storage):
+    """An unwritten field with an explicit default reads as that default."""
+    captured = {}
+
+    async def batch():
+        async with batch_phase(_TestPhase.P1):
+            pass
+        async with batch_phase(_TestPhase.P2) as (r, _):
+            captured["defaulted"] = r.defaulted_p1_out
+
+    handle = Batch(batch(), _TestStorage())
+
+    async def scheduler():
+        await step(handle, through=_TestPhase.P3)
+
+    Driver(scheduler()).run()
+    assert captured == {"defaulted": None}
 
 
 def test_tracked_step_returns_views_at_correct_phases(tracked_storage):

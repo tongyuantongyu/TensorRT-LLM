@@ -77,6 +77,8 @@ class ForwardConcern:
         """
         r, w = await enter_phase(BatchPhase.FORWARD_2)
         if not r.can_queue:
+            w.batch_outputs = {}
+            w.attn_metadata = None
             return
 
         # Reflect the cross-thread warmup signal onto the engine
@@ -124,10 +126,11 @@ class ForwardConcern:
         if not ctx.svc.dist.is_last_pp_rank:
             # Non-last PP rank: ``model_engine.forward`` still ran
             # (its NCCL p2p sent activations to the next rank), but
-            # the returned dict carries no logits this rank can
-            # sample from. Leave ``batch_outputs`` unset; SAMPLE_3
-            # will produce a placeholder ``sample_state`` so the
-            # slot ring sees a uniform shape.
+            # the outputs carry no logits this rank can sample from.
+            # Publish an empty dict so ``batch_outputs`` satisfies the
+            # required write contract; SAMPLE_3 ignores it and
+            # produces a placeholder ``sample_state``.
+            w.batch_outputs = {}
             return
         w.batch_outputs = outputs
 
