@@ -7,7 +7,7 @@ This design has two parts that are at very different maturity
 levels, and the rest of the doc should be read with that split in
 mind:
 
-- **The coroutine runtime** a custom runtime fully tailored to express the executor's logic, but nothing more — keeps the overhead minimal. This part should already in a fairly good shape: its design decisions are backed by observations from actually implementing the prototype `PyExecutorCoro` on top of it.
+- **The coroutine runtime** is a custom runtime fully tailored to express the executor's logic, but nothing more — keeping the overhead minimal. This part should be in a fairly good shape already: its design decisions are backed by observations from actually implementing the prototype `PyExecutorCoro` on top of it.
 
 - **The executor layer** was built on top of the runtime to **verify that this design actually works end-to-end** — and it does, for all three executor loops. But the prototype is a **reference implementation, not production code**: it predates
   several of the decisions documented here, it cuts corners the
@@ -25,7 +25,8 @@ The legacy `PyExecutor` runs the forward loop in three variants —
 plus a helper thread, `_broadcast_sample_state_loop`. The three do
 the **same work**: schedule requests, prepare the KV cache, run the
 model forward, sample tokens, build responses, transfer KV cache,
-and so on. In this doc, we call rach of these domain area as a **concern**. What differs is
+and so on. In this doc, we call each of these domain areas a
+**concern**. What differs is
 the **order** — plain, overlap, and pipeline-parallel execution
 interleave the concerns differently to keep the GPU busy. Each loop
 is a few hundred lines, and every helper they call
@@ -33,7 +34,7 @@ is a few hundred lines, and every helper they call
 …) is a method on `PyExecutor` itself: ~4300 lines and ~120 methods
 on one class.
 
-All kinds of state, as long as being cross-iteration, all lives on `self` as scattered fields
+Cross-iteration state lives on `self` as scattered fields
 (`previous_batch`, `has_previous_draft_tokens`, `can_forward`, several
 `send_*_handles[microbatch_id]` slot lists, …). Two consequences:
 
@@ -50,7 +51,7 @@ All kinds of state, as long as being cross-iteration, all lives on `self` as sca
   added a `self.<flag>`, a new `_handle_<x>` method, and a call
   spliced into every loop at the right point. The right point differs
   per loop, so a contributor must understand all three orderings
-  to add some feature. Everyone have to pay this burden.
+  to add some feature. Everyone has to pay this burden.
 
 The refactor's headline goal is **one linear story per concern**: a
 concern's logic, today scattered and reordered across three loops,
@@ -122,7 +123,7 @@ microbenchmark with that adapter confirms that the same
 `scheduler_iter_overlap`, `batch_body`, and concern coroutines run
 **unmodified** against either the asyncio adapter or the custom
 driver. So coroutine bodies are portable across runtimes by
-construction. But I still consider asyncio not the right choice, for 2 reasons:
+construction. But I still consider asyncio not the right choice, for two reasons:
 
 1. **Cost.** Benchmarked on the exact scheduler logic with empty concern body, the asyncio path is more than ~2× slower in steady state:
 
@@ -149,7 +150,7 @@ The schedule is fully spelled out by the top-level coroutine; the
 runtime just pumps. No event loop, no callback registration, no
 future scheduling. Coroutine bodies stay portable to asyncio if a
 future use case ever needs it (one adapter file away), but
-production runs against the bare driver.
+the design builds upon the bare driver.
 
 ---
 
@@ -164,9 +165,12 @@ cover how each concept is realized in code.
 ### 2.1 Three layers: scheduler, batch, concern
 
 The **concern** layer is the obvious one. A concern is one of the
-cross-cutting responsibilities the forward loop interleaves:
-scheduling, request fetch, KV-cache prep, model forward, sampling,
-response build, KV transfer, and so on. Each concern's own work is
+cross-cutting responsibilities the forward loop interleaves: request
+admission, request fetch, KV-cache prep, model forward, sampling,
+response build, KV transfer, and so on. To avoid a naming trap:
+`ScheduleConcern` schedules **requests into a batch**, while the
+**scheduler** layer below schedules **batches across iterations**.
+Each concern's own work is
 sequential per batch (resource management prepares the KV cache,
 then later updates and frees it), even though concerns are
 multiplexed across the loop. The legacy executor already gropes
@@ -239,20 +243,23 @@ forward, but no further" or "drive batch N−1 through respond now".
 Without a name for "to forward" or "through respond", these
 decisions can't be expressed.
 
-A **phase** is exactly that name: an enumerated point in a
-coroutine's lifecycle where it can be suspended, named so the
-scheduler can refer to it. Both batch coroutines and concern
-coroutines yield at phase boundaries; the scheduler asks for
-advancement to a specific phase.
+A **phase** is exactly that name: an enumerated span of a
+coroutine's lifecycle. In prose, we also use the same word for the
+span's end barrier: `FORWARD_2` means "the forward work" and also
+"the point after forward work has completed." Batch and concern
+coroutines enter a phase, run that phase's work, and then park at the
+next phase boundary. The scheduler does not suspend at phase
+boundaries itself; it refers to the same names when it asks to drive a
+batch **through** a phase.
 
-The phases form a **single ordered timeline** shared across all
-three layers. Every layer ultimately suspends at the same boundaries
-— a batch suspends between schedule and forward; a concern in that
-batch yields at the same boundary; the scheduler asking for
-"advance to forward" picks the same name. Collapsing onto one
-ordering removes the duplication of having per-layer enums; "code at
-phase A happens before code at phase B" becomes a single integer
-comparison across the entire design.
+The phases form a **single ordered timeline** shared by batch and
+concern coroutines and referenced by the scheduler. A batch's
+`FORWARD_2` block and a concern's `FORWARD_2` work use the same name;
+the scheduler's `step(..., through=FORWARD_2)` asks for that named
+span to be completed. Collapsing onto one ordering removes the
+duplication of having per-layer enums; "code at phase A happens before
+code at phase B" becomes a single integer comparison across the
+entire design.
 
 ### 2.3 Data flow
 
@@ -281,24 +288,23 @@ their data dependencies happen to satisfy.
 
 In explicit scheduling, the relationship is reversed: the schedule
 order **defines** what data is visible. The scheduler decides
-"concern A runs at phase P", and from that the runtime can derive
-"data produced at phases earlier than P is visible to A; data A
-produces is visible to whoever runs at phases later than P". A
-field's lifecycle is determined by the phase that produces it; the
-scheduler's order of resume calls is what produces a coherent
-dataflow.
+"concern A runs in phase P", and from that the runtime can derive
+"fields whose producer phases completed before P are visible to A;
+fields A writes in P become visible after P's end barrier". A field's
+lifecycle is determined by that producer-phase tag; the scheduler's
+order of resume calls is what produces a coherent dataflow.
 
 Two consequences fall out of this:
 
 - **The current phase determines what data is available now and
-  what data the current code is expected to produce.** A concern at
-  phase P sees all fields owned by earlier phases (they were
-  produced before P) and writes only fields owned by P (later
-  concerns will read them at later phases).
+  what data the current code is expected to produce.** A concern in
+  phase P sees all fields owned by earlier phases (their end
+  barriers have passed) and writes only fields owned by P (available
+  after P's end barrier, for later phases to read).
 - **Time never goes backward.** A coroutine cannot
   yield a phase **earlier** than its previous suspension — that
-  would mean reading data that hasn't been produced yet (the
-  would-be producers run at later phases). And, assuming forward
+  would mean reading data whose producer phase has not completed yet
+  (the would-be producers run at later phases). And, assuming forward
   progress, it shouldn't yield the **same** phase twice either —
   each phase is reached exactly once per batch. The backward-phase
   rule is **hard**: data availability forbids it always. The
@@ -307,11 +313,11 @@ Two consequences fall out of this:
 
 #### Cross-batch: scheduler-mediated
 
-When one batch's terminal output is the input to the next batch
-(the canonical example: in the overlap loop, batch N−1's sampled
-tokens become batch N's forward input), the handoff is the
-**scheduler's** job. The scheduler reads batch N−1's terminal phase
-data, computes the bridge value, and stuffs it into batch N's
+When one batch's phase output is the input to the next batch (the
+canonical example: in the overlap loop, batch N−1's sampled tokens
+become batch N's forward input), the handoff is the **scheduler's**
+job. The scheduler reads batch N−1's handoff data from the relevant
+phase view, computes the bridge value, and stuffs it into batch N's
 first-phase data slot.
 
 Batches do not reach across to each other directly. If they did,
@@ -359,9 +365,12 @@ The fourth data-flow category (§2.3) — the one piece that crosses out
 of the loop thread — is what makes the threading boundary something
 to state explicitly rather than leave implicit.
 
-Both the legacy executor and the new design run on two threads — a
-main thread for the public API and a dedicated loop thread for the
-forward loop. The threading shape itself is inherited.
+Both the legacy executor and the new design have two core ownership
+threads — a main thread for the public API and a dedicated loop
+thread for the forward loop. PP may also use an auxiliary worker to
+run blocking MPI operations without blocking the loop thread; that
+worker owns no scheduler state and is not a third owner in this
+model. The threading shape itself is inherited.
 
 What's new is **a clear cut about which side owns what**.
 
@@ -439,11 +448,21 @@ data model and the concerns that use these primitives are §4.
 
 ### 3.1 The coroutine surface
 
-The runtime provides six primitives. They split into two roles: a
+The runtime provides six primitive families, two of which have strict
+and tolerant variants. They split into two roles: a
 coroutine **announces where it wants to suspend** (`enter_phase`,
 `batch_phase`, `again`), and the layer above **drives a child
 forward** to a phase (`resume`, `step`). `disable_hang_detect` is a
 side utility for the watchdog.
+
+The runtime keeps the active storage and active phase internally, not
+in executor `ctx`, because those values are part of the
+scheduler-agnostic primitive contract: any scheduler that drives a
+batch through `step` should get the same `enter_phase` / `batch_phase`
+behavior. Scheduler-specific data — iteration counters, in-flight
+queues, profiling state, warmup drain state, retire votes — stays in
+the scheduler coroutine or in executor `ctx`, not in runtime ambient
+state.
 
 | Layer | Primitive | Purpose |
 |---|---|---|
@@ -527,14 +546,15 @@ the return, and that is why they aren't one call:
   and returns `None`. Whatever the concern published is read back by
   the batch through its *next* `batch_phase(...)` views, not from
   `resume`.
-- `step(handle, through=P)` drives a batch and returns
-  `(read_view, write_view)` at `P`, so the scheduler can read what
-  the batch produced and inject anything the next phase needs (the
-  batch-to-batch handoff of §4.5 uses this).
+- `step(handle, through=P)` drives a batch through `P` and returns
+  `(read_view_after_P, write_view_at_P)`, so the scheduler can read
+  what the batch produced and inject anything the next phase needs
+  (the batch-to-batch handoff of §4.5 uses this).
 
 Keeping them separate also lets the type checker narrow `step`'s
-return to the right `(_ReadAtP, _WriteAtP)` per call site via the
-overload chain (§4.3); a single merged primitive would lose that.
+return to the right `(post-P read view, P write view)` per call site
+via the overload chain (§4.3); a single merged primitive would lose
+that.
 
 #### `batch_phase` — declare the phase, then enter it
 
@@ -643,8 +663,8 @@ coroutines.
 
 ### 3.2 The Driver
 
-A concern author rarely touches the internal of the Driver directly; this is
-the minimum worth knowing they exist.
+A concern author rarely touches the internals of the Driver directly;
+this is the minimum worth knowing.
 
 **Handles.** Every coroutine the runtime drives is wrapped in a
 handle — a `Batch` for a batch coroutine, a `Concern` for a concern
@@ -654,7 +674,7 @@ already returned is a no-op; that is why the batch body can `resume`
 a concern at every phase even after the concern's last `enter_phase`.
 
 **The Driver.** The `Driver` pumps the top-level coroutine, interpreting
-each primitive acoroutine awaits and advancing the appropriate coroutine
+each primitive a coroutine awaits and advancing the appropriate coroutine
 in response. It does the dirty work to implement the primitives. 
 
 **Shutdown.** `Driver.close()` closes every live coroutine, which
@@ -705,7 +725,8 @@ lookup per handle; subsequent pushes are cached.
 
 `TLLM_COROUTINE_TRACK_STORAGE=1` enables the `_TrackedReadView` /
 `_TrackedWriteView` proxies (§4.3). Default off so production runs
-get zero overhead; the `@overload` chain plus mypy guard production.
+get zero overhead; static check via the `@overload` chain is always
+available.
 
 #### Traceback hiding
 
@@ -734,40 +755,40 @@ The loop layer is a strict three-layer hierarchy:
 ┌─────────────────────────────────────────────────────────────────┐
 │ PyExecutorCoro (main thread)                                    │
 │   public API: enqueue / await / cancel / shutdown               │
-│   holds direct refs to the boundary services                    │
+│   communicate via boundary services                             │
 └──────────────────────────────┬──────────────────────────────────┘
-                               │ ctx.io.* (cross-thread surface)
-┌──────────────────────────────▼──────────────────────────────────┐
+                               │ boundary services
+┌──────────────────────────────▼─────────────────────────────────┐
 │ Scheduler         scheduler_iter_{plain,overlap,pp}             │
 │ ─────────                                                       │
 │   pumps Batch handles in some interleave; owns iter counter,    │
 │   in-flight ring, batch-to-batch handoffs                       │
 └──────────────────────────────┬──────────────────────────────────┘
-                               │ await step(handle, through=Py)
-┌──────────────────────────────▼──────────────────────────────────┐
+                               │ await step(handle, through=P)
+┌──────────────────────────────▼─────────────────────────────────┐
 │ Batch             batch_body                                    │
 │ ─────────                                                       │
 │   one coroutine per batch of requests; drives concerns through  │
 │   the batch's lifecycle phases                                  │
 └──────────────────────────────┬──────────────────────────────────┘
                                │ await resume(handle)
-┌──────────────────────────────▼──────────────────────────────────┐
+┌──────────────────────────────▼─────────────────────────────────┐
 │ Concern           XxxConcern.handle_batch                       │
 │ ─────────                                                       │
 │   one coroutine per concern per batch; reads / writes typed     │
 │   views over BatchStorage; holds the services it needs,         │
-│   injected at construction (receives no ctx)                    │
+│   injected at construction                                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 Each layer talks only to its immediate neighbor. Why three layers
-rather than fewer is covered in §6.
+rather than fewer is covered in §2.1.
 
 **The two threads.** `PyExecutorCoro` instance methods run on the
 main thread; everything below the scheduler runs on the loop thread.
 The cut is enforced by what each side can reach: the main thread
 holds direct references to the **boundary services** (see §4.4 for
-the inventory) and uses only their thread-safe methods; the loop
+the detail) and uses only their thread-safe methods; the loop
 thread reaches the same boundary services — orchestrators via
 `ctx.io.*`, concerns via the refs injected into them — plus the
 loop-only services in `ctx.svc.*`. The main thread never touches
@@ -776,13 +797,12 @@ loop-only services in `ctx.svc.*`. The main thread never touches
 *entire* cross-thread surface — anything else lives strictly on one
 side.
 
-**`ctx` is the orchestrators' environment, not the concerns'.**
-Only the loop's orchestrators — `run_loop`, the scheduler iters,
-`batch_body` — receive `ctx`. A **concern receives no `ctx` at
-all**; every dependency it needs (services, config values) is
-handed to it through `__init__` (§4.4). This is what lets `ctx`
-carry the `Concerns` bag (`ctx.crn`) without re-opening peer access:
-a concern simply has no `ctx` to reach `ctx.crn` through (§5.1).
+**`ctx` is the orchestrators' environment.**
+The loop's orchestrators — `run_loop`, the scheduler iters,
+`batch_body` — use `ctx` to reach the services, configuration, and
+concern bag they need to wire the loop. Concern dependencies
+(services, config values) are handed through `__init__` (see §4.4 for
+example).
 
 **Where state lives.**
 
@@ -792,29 +812,31 @@ a concern simply has no `ctx` to reach `ctx.crn` through (§5.1).
 | Loop-thread-only services (request lifecycle, recv offload, dist communicator) | `ctx.svc.*` (orchestrators); injected into concerns |
 | Immutable configuration | `Configuration` (`ctx.conf`); concerns get the specific values via `__init__` |
 | Per-batch fields shared between concerns | `BatchStorage` (per batch; reached only via typed views, never via `ctx`) |
-| The bag of concern instances | `Concerns` (`ctx.crn`) — used by the orchestrators; concerns can't reach it (no `ctx`), see §5.1 |
+| The bag of concern instances | `Concerns` (`ctx.crn`) — used by the orchestrators to wire the batch body, see §5.1 |
 | Cross-iter scheduler bookkeeping (`previous_batch`, in-flight deque, vote isend slot) | Locals on the scheduler iter |
 | A concern's private cross-batch latch | Instance attribute on the concern class |
 | A concern's per-batch intermediate (CUDA event, matcher result) | Coroutine local |
 
 There is no "mutable state nobody owns" bucket: every piece of
-cross-batch mutable state is owned by a service, so a concern reads
-and writes it only through that service's methods. (The prototype
-still has an empty `PersistentState`; the design drops it.)
+cross-batch shared mutable state is owned by a service, so a concern
+reads and writes it only through that service's methods. Private
+cross-batch state remains on the concern instance; scheduler
+bookkeeping remains local to the scheduler iter.
 
-Discipline: **`ctx` is reachable only by the orchestrators.** A
-concern holds exactly the dependencies it was constructed with —
-nothing ambient. This is the lever that keeps cross-concern data
-flow honest and understandable (§5.1).
+Discipline: **`ctx` is the orchestration surface.** A concern holds
+exactly the dependencies it was constructed with — nothing ambient.
+This is the lever that keeps cross-concern data flow honest and
+understandable (§5.1).
 
 ### 4.2 The phase timeline
 
-Every layer ultimately yields at the same phase boundaries: a batch
-suspends between schedule and forward; a concern that participates in
-schedule and forward yields at the same two boundaries; the scheduler
-that drives a batch through `SCHEDULE_0` is asking it to reach the
-same boundary the concern just yielded at. So one ordered enum is
-enough for the entire timeline, and that's what `BatchPhase` is:
+Batch and concern coroutines use the same phase boundaries: a batch
+parks between request admission and resource prep; a concern that
+participates in those phases parks at the same named boundaries. The
+scheduler references those names when it drives a batch through a
+phase, but it is not itself another phase-yielding layer. So one
+ordered enum is enough for the whole loop, and that's what
+`BatchPhase` is:
 
 ```python
 class BatchPhase(IntEnum):
@@ -867,7 +889,7 @@ simplest path until a real reason to fork appears.
 
 Per-batch fields live on a single `BatchStorage`
 dataclass — one instance per `Batch` handle. Each field carries the
-phase that produces it:
+phase whose end barrier makes it available:
 
 ```python
 @dataclasses.dataclass
@@ -880,14 +902,15 @@ class BatchStorage:
     # ...
 ```
 
-`phased_field(phase)` tags a field with the phase that produces it —
-the single declaration the views and the generator below read off.
-Its optional `default=` governs read-before-write:
+`phased_field(phase)` tags a field with the phase span that writes it;
+the field becomes readable after that phase's end barrier. This is the
+single declaration the views and the generator below read off. Its
+optional `default=` governs read-before-write:
 
 - **No `default`** (the common case): the field starts as a sentinel
   that makes any read before its producer has written it a hard
-  error. A field should be read only after the phase that produces
-  it has run, and the sentinel catches violations of that.
+  error. A field should be read only after the producing phase has
+  completed, and the sentinel catches violations of that.
 - **`default=<value>`**: the field is initialized to `<value>` and
   may be read with no producer having written it, returning the
   default. Loop-specific fields use `default=None` for exactly this
@@ -901,7 +924,8 @@ The runtime gives a coroutine at phase `P` two distinct views over
 the storage:
 
 - **Read view at P** — exposes only fields whose `phased_field`
-  declared a phase **strictly less than** `P`. Cumulative.
+  declared a phase **strictly less than** `P`; those earlier phase
+  barriers have already passed. Cumulative.
 - **Write view at P** — exposes only fields whose `phased_field`
   declared exactly `P`. Phase-local.
 
@@ -915,6 +939,28 @@ assign and the read view still won't surface it. Guiding the author
 toward the right fields is what keeps the producer / consumer
 ordering hard to get wrong by accident; actual runtime checking is
 the opt-in tracked views below.
+
+Only available fields are defined in the view type, so IDE completion
+shows both what is available and what is intentionally absent. Cut
+down to the generated shape:
+
+```python
+class _ReadAtForward_2(_ReadAtResourcePrep_1, Protocol):
+    # Cumulative through RESOURCE_PREP_1.
+    ...
+
+
+@dataclasses.dataclass
+class _WriteAtForward_2:
+    # UNSET is the read-before-write sentinel described above.
+    # NO _Unset type, because UNSET is not expected value.
+    batch_outputs: Dict[str, torch.Tensor] = UNSET
+
+
+class _ReadAtSample_3(_ReadAtForward_2, Protocol):
+    @property
+    def batch_outputs(self) -> Dict[str, torch.Tensor]: ...
+```
 
 #### Generated views, single source of truth
 
@@ -930,6 +976,30 @@ Hand-maintained view types and `phased_field` declarations would
 duplicate the same information; one would inevitably drift from the
 other. Generation is the cheapest way to keep them in lockstep.
 
+A representative slice of the generated code looks like this:
+
+```python
+@overload
+async def enter_phase(
+    phase: Literal[BatchPhase.FORWARD_2],
+) -> tuple[_ReadAtForward_2, _WriteAtForward_2]: ...
+
+
+@overload
+async def step(
+    handle: Batch,
+    *,
+    through: Literal[BatchPhase.FORWARD_2],
+) -> tuple[_ReadAtSample_3, _WriteAtForward_2]: ...
+```
+
+The `enter_phase(FORWARD_2)` overload is what a concern uses while it
+is doing `FORWARD_2` work: reads expose `< FORWARD_2`, writes expose
+`FORWARD_2`. The `step(..., through=FORWARD_2)` overload is what the
+scheduler uses after driving the batch through that phase: the write
+view is still `FORWARD_2`, but the read view is the post-forward view
+that can see `batch_outputs`.
+
 #### Optional runtime enforcement
 
 Production runs return the storage object aliased as both views (zero
@@ -942,18 +1012,31 @@ and distinguish "never written" from "explicitly written `None`"
 (via a per-storage write set with `weakref.finalize` cleanup). Useful
 on correctness-focused CI and when chasing dataflow bugs.
 
+For example, with tracking enabled:
+
+```python
+r, w = await enter_phase(BatchPhase.FORWARD_2)
+
+r.scheduled_batch          # OK
+w.batch_outputs = outputs  # OK
+
+r.batch_outputs            # error: FORWARD_2 output is not readable yet
+w.sample_state = state     # error: SAMPLE_3 field written in FORWARD_2
+```
+
+And for a field without a default, a later read fails if the producer
+never wrote it; if the producer explicitly wrote `None`, the later
+read returns `None`. That distinction catches missing producers
+without confusing them with intentional `None` values.
+
 ### 4.4 Concerns and services
 
 A concern is a coroutine class; the rules an implementer follows
 when adding one — how concerns coordinate without reaching for each
-other, when a coroutine should instead be a context manager — are in
-§5. This section covers the shapes: what a concern is and the two
-service buckets. A concern
-receives **no `ctx`**: every dependency arrives through `__init__`
-(below), and `handle_batch` takes no arguments. The bag of concern
-instances lives on `ctx.crn` for the orchestrators; concerns can't
-reach it precisely because they have no `ctx`, which is what keeps
-them from calling peers (§5.1).
+other, and how to organize automaton-like sequencing — are in §5.
+This section covers the shapes: what a concern is and the two service
+buckets. Every dependency arrives through `__init__` (below), and
+`handle_batch` takes no arguments.
 
 #### Concern shape
 
@@ -1016,24 +1099,24 @@ attributes that secretly only matter for one batch — the class
 shape does the separation, the coroutine lifetime does the
 cleanup.
 
-Construction takes plain kwargs and is the concern's *only* channel
-for dependencies — there is no `ctx` to fall back on at runtime.
-`PyExecutorCoro.__init__` builds each service once and passes the
-ones a concern needs into its constructor by name; the same service
-instance handed to two concerns is how they share it, and that
-sharing is visible at the single wiring site. Each concern's full
-dependency surface is therefore its `__init__` signature — `rg` it
-and you see everything it can touch — and a unit test builds the
-concern with mock services and drives `handle_batch()` with no `ctx`
-to assemble.
+Construction takes plain kwargs and is the concern's dependency
+channel. `PyExecutorCoro.__init__` builds each service once and
+passes the ones a concern needs into its constructor by name; the
+same service instance handed to two concerns is how they share it,
+and that sharing is visible at the single wiring site. Each concern's
+full dependency surface is therefore its `__init__` signature — `rg`
+it and you see everything it can touch — and a unit test builds the
+concern with mock services and drives `handle_batch()` directly.
 
 #### Services — two buckets
 
 Cross-cutting state that doesn't belong to any single concern lives
-in service objects, split into two buckets by threading scope. A
-service earns a bucket when its state outlives any single batch AND
-no one concern can naturally own it (multiple concerns touch it).
-Which bucket depends only on threading scope.
+in service objects, split into two buckets by threading scope.
+Loop-thread services earn a bucket when their state outlives any
+single batch and no one concern can naturally own it (multiple
+concerns touch it). Boundary services earn a bucket when the state
+crosses the main-thread / loop-thread boundary. Which bucket a service
+uses depends only on threading scope.
 
 **Loop-thread services (`ctx.svc.*`)** own state that never leaves
 the loop thread; their methods are not thread-safe and aren't
@@ -1057,16 +1140,17 @@ inbound flag when it dequeues a shutdown marker (`mark_inbound`) and
 a done event when teardown finishes (`signal_done`); the main thread
 blocks on `wait_done`, and anyone reads `is_marked`.
 
-Member-count discipline is **HIGH** in both buckets: anything new
-must be touched by multiple concerns AND have no natural
-single-owner concern. The legacy `model_engine`, `sampler`,
-`scheduler`, `drafter`, `kv_cache_transceiver`, etc. each fit a
-single concern and live as instance attributes there.
+Member-count discipline is **HIGH** in both buckets. A new
+loop-thread service must be touched by multiple concerns and have no
+natural single-owner concern. A new boundary service must own state
+that truly crosses the main-thread / loop-thread boundary. The legacy
+`model_engine`, `sampler`, `scheduler`, `drafter`,
+`kv_cache_transceiver`, etc. each fit a single concern and live as
+instance attributes there.
 
 ### 4.5 Scheduler variants
 
-Three top-level scheduler-iter coroutines live in
-[`py_executor_coro.py`](tensorrt_llm/_torch/pyexecutor/py_executor_coro.py).
+Three top-level scheduler-iter coroutines live in `py_executor_coro.py`.
 The same `batch_body` is shared across all three — only the
 interleave changes.
 
@@ -1109,8 +1193,7 @@ Optional concerns are `None` in the bag and the `resume(None)` /
 `try_resume(None)` no-op fast path carries the body through unchanged
 when they aren't wired. This is what makes the same body work across
 loops: every loop variant participates in the same script;
-configurations differ only in which concerns are present and which
-phases are folded by yielded subset (§4.2).
+configurations differ only in which concerns are present (§4.2).
 
 #### Plain — one batch per iter
 
@@ -1131,6 +1214,14 @@ for it in profiler(ctx):
 
 One batch in flight, every phase. No batch-to-batch handoff.
 
+`profiler(ctx)` is deliberately scheduler-layer code, not a concern.
+Profiling and warmup draining are iteration-scoped: they bracket whole
+scheduler iterations, need the scheduler's post-warmup iter counter,
+and must run even if a particular batch has no concern work to do. A
+concern is batch-scoped and phase-driven, so putting profiler or warmup
+state there would make an iteration policy look like per-batch domain
+work.
+
 #### Overlap — two batches in flight, three barriers
 
 Each iter splits `current`'s phases at three barrier points so
@@ -1139,11 +1230,11 @@ can interleave **and** the cross-batch ordering invariants are
 honored:
 
 1. **`previous_tensors_device` for curr's `FORWARD_2`** — the
-   SCHEDULER reads prev's `sample_state.device` (produced at prev's
-   `SAMPLE_3` last iter) and writes it into curr's `SCHEDULE_0`
-   write view as `previous_tensors_device`; `ForwardConcern` reads
-   it back through the `FORWARD_2` read view to feed prev's
-   just-sampled tokens into curr's forward.
+   scheduler reads prev's `sample_state.device` (available after
+   prev's `SAMPLE_3` last iter) and writes it into curr's
+   `SCHEDULE_0` write view as `previous_tensors_device`;
+   `ForwardConcern` reads it back through the `FORWARD_2` read view
+   to feed prev's just-sampled tokens into curr's forward.
 2. **Fresh `seq_lens` at curr's `SAMPLE_3`** — requires `prev.APPLY_7`
    first so the sampler kernel sees fresh `num_tokens` and tags
    the iter's last-eligible token for `GENERATION_COMPLETE`
@@ -1171,10 +1262,13 @@ previous, previous_view = current, r_sample
 
 The batch-to-batch bridge — write `previous_tensors_device` on
 curr's `SCHEDULE_0` slot using prev's `sample_state.device` — is
-the only place the SCHEDULER writes directly into a batch's
-storage rather than going through the batch's own coroutine. This
-is where the "scheduler-only batch-to-batch handoff" home for
-cross-concern data (§5.1) materializes.
+the only place the scheduler writes directly into a batch's storage
+rather than going through the batch's own coroutine. This is where
+the "scheduler-only batch-to-batch handoff" home for cross-concern
+data (§5.1) materializes: `step(current, through=SCHEDULE_0)` returns
+curr's `SCHEDULE_0` write view after the batch's own `SCHEDULE_0`
+work has run, and the scheduler uses that still-open write view to
+inject the cross-batch bridge before `FORWARD_2` reads it.
 
 Shutdown drain: when no more work to admit AND `previous` is still
 parked, `current=None`; the per-step `step(None, …)` no-op carries
@@ -1187,13 +1281,13 @@ Works for any `pp_size >= 2`. Each rank runs an identical scheduler
 iter; cross-rank coordination happens inside per-batch concerns and
 inside two scheduler-direct calls.
 
-The SCHEDULER holds a `collections.deque` of in-flight `Batch`
+The scheduler holds a `collections.deque` of in-flight `Batch`
 handles, age order **left=oldest, right=newest**, max size
 `pp_size − 1`. The improvement over the legacy slot ring isn't
 that it's explicit (the legacy ring was an explicit list too) —
 it's **bundling**. A `Batch` handle holds everything that belongs
 to that batch: its storage, its concern coroutines, the per-batch
-isend handles those coroutines own as locals. So the SCHEDULER
+isend handles those coroutines own as locals. So the scheduler
 needs **one** deque indexed by batch identity instead of the
 legacy's set of parallel slot lists keyed by `microbatch_id`
 (`send_handles[mid]`, `send_schedule_handles[mid]`,
@@ -1303,7 +1397,7 @@ loop-thread coroutine can treat it as an async MPI operation.
 The shapes in §4 say what the pieces are. This section is the
 rulebook an implementer follows when adding or changing a concern —
 the conventions that keep the pieces honest. Most are mechanically
-checkable (§5.4).
+checkable (§5.3).
 
 ### 5.1 No peer calls: the four homes for cross-concern data
 
@@ -1311,22 +1405,25 @@ checkable (§5.4).
 directly. This is the mechanism that enforces it, plus the routing
 table for where any given piece of cross-concern data must go.
 
-The mechanism is simply that **a concern receives no `ctx`** (§4.4).
-The `Concerns` bag — a frozen dataclass with one field per concern instance, built
-once in `PyExecutorCoro.__init__` — lives on `ctx.crn`, and the
-orchestrators (`run_loop` / `scheduler_iter*` / `batch_body`) reach
-peers through it freely. A concern cannot: it has no `ctx`, so
-`ctx.crn.X` is unreachable from inside `handle_batch`. There is no
-peer-call syntax to write. Every cross-concern interaction must
-therefore fall into one of **four homes**:
+The `Concerns` bag — a frozen dataclass with one field per concern
+instance, built once in `PyExecutorCoro.__init__` — lives on `ctx.crn`
+for the orchestrators (`run_loop` / `scheduler_iter*` / `batch_body`)
+to wire the batch lifecycle. Concern bodies coordinate through the
+data homes below rather than calling peer concern methods directly.
+Every **cross-concern** interaction must therefore fall into one of
+**four homes**:
 
 | Case | Home |
 |---|---|
 | Within-batch concern → concern data (e.g., `schedule` writes `scheduled_batch`; `forward` reads it) | `BatchStorage` via the typed `enter_phase` views |
-| Batch-to-batch handoff (one batch's terminal output is the next batch's input — e.g., the overlap loop feeding prev's just-sampled tokens into curr's forward) | SCHEDULER iter local; reads prev's terminal read view, stuffs into curr's `SCHEDULE_0` write view |
+| Batch-to-batch handoff (one batch's phase output is the next batch's input — e.g., the overlap loop feeding prev's just-sampled tokens into curr's forward) | Scheduler iter local; reads prev's handoff read view, stuffs into curr's `SCHEDULE_0` write view |
 | Cross-batch shared state, loop-thread only (rolling acceptance gate, …) | A loop-only service on `ctx.svc.*` |
 | Cross-batch shared state that also crosses threads (request inbox, response channel, lifecycle signals) | A boundary service on `ctx.io.*` |
-| A concern's PRIVATE cross-batch state (one-way latch only this concern observes) | Instance attribute on the concern class |
+
+The adjacent non-cross-concern case is a concern's **private**
+cross-batch state, such as a one-way latch only that concern observes.
+That belongs on the concern instance, not in `BatchStorage` or a
+service.
 
 Two of those homes are services (`ctx.svc.*` / `ctx.io.*`), and they
 carry a sharp negative rule: **a service is not a data channel.** A
@@ -1341,154 +1438,73 @@ from one batch's storage. Per-batch concern→concern data belongs in
 `BatchStorage` (row 1); cross-batch handoff is scheduler-mediated
 (row 2). A service holds state and effects, not in-flight data.
 
-The shape is deliberately inconvenient. The tempting shortcut is
-`ctx.crn.X.method()` — "the state I need is already on that other
-concern" — easy to type, easy to merge, easy to leave there.
-Withholding `ctx` from concerns makes that shortcut not merely
-discouraged but *unwritable*: there is no `ctx` in scope, so the
-peer call won't even type-check. The author has to find the right
-home for the data (one of the rows in the table above), or add a
-dependency to `__init__` in a way that's structurally obvious in
-review. Friction is the point. AI coding assistants in particular
-are prone to take the local-minimum path when a quick
-import / one-line peer call works, even when the right answer is
-to add a `BatchStorage` field and route the data through the typed
-views — trading long-term maintainability for short-term
-implementation effort. Making the local-minimum path *absent*
-rather than just discouraged keeps the long-term-maintainability
-shape self-enforcing.
+The author has to find the right home for the data (one of the rows
+in the table above), or add a dependency to `__init__` in a way that's
+structurally obvious in review. A quick peer call may look cheaper
+locally, but it hides who produced the data, when it became available,
+and which ordering invariant protects it.
 
-### 5.2 Sequence-coupled methods are coroutines in disguise
+### 5.2 Organizing automaton-like code
 
-Coroutinization is the theme of this refactor: the legacy
-hand-written automatons (three forward loops, the broadcast thread,
-the implicit per-batch state machine encoded in scattered `self.*`
-fields) become coroutines whose bodies read top-to-bottom in
-lifecycle order. The same lens applies in the other direction
-when designing new state — we should avoid *reintroducing* the
-shape we just removed.
+The legacy loops are hand-written automatons: state is scattered on
+`self`, and a reader has to know which helper is allowed to run after
+which other helper. The refactor should not recreate that shape in
+smaller classes.
 
-The signature smell of a hand-written class automaton:
+The smell to look for is simple:
 
-> Method `B` on a class must be called only after method `A`, and
-> calling them out of order silently corrupts state rather than
-> raising. The class is encoding a state machine; the methods are
-> events that drive it.
+> Method `B` must be called after method `A` for correctness, and
+> calling them out of order would silently corrupt state. The class is
+> encoding a state machine; the methods are events that drive it.
 
-The rule:
+When refactoring code in old `PyExecutor` or adding new features in
+the future, if a new service or concern starts to look like that,
+choose a shape that makes the sequence visible:
 
-> **For every pair of public methods on a new service, ask: does
-> one need to be called before the other for correctness? If yes,
-> express the sequence as a coroutine, an async / sync context
-> manager, or an owner-controlled per-batch concern — not as two
-> exposed methods on the class.**
+- **Plain methods** are fine when there is no hidden protocol:
+  single-method APIs, pure container operations (`add` / `remove`,
+  `put` / `get`), and methods whose ordering is either irrelevant or
+  checked locally with a clear error.
+- **A context manager** fits state lifetime. Use it when one owning
+  coroutine needs to open a piece of state, run some work, and close it
+  by lexical scope. The setup / cleanup order is carried by Python
+  syntax rather than by a caller remembering to invoke two public
+  methods in sequence.
+- **A concern coroutine** fits independently-drivable phase work. Use
+  it when the BATCH body needs to advance this work separately from
+  its peers, other concerns interleave with it at intermediate phases,
+  and the work stands as a domain in the executor (forward, sample,
+  response, ring broadcast).
+- **Another concern** is usually the right answer if understanding the
+  logic seems to require interleaving multiple coroutine bodies. That
+  is a signal that multiple independently-drivable domains are present,
+  not that one concern should host a private mini-scheduler.
+- **Inline local phase work into `handle_batch`.** Do not extract a
+  helper merely because `handle_batch` is long; fragmentation is more
+  damaging here than method body size.
 
-Three patterns are exempt because their sequencing is bounded by
-language constructs, not by API contract:
+The boundary test between a context manager and a concern is: **does
+the BATCH body need to drive this thing through phases independently
+of its peers?** If yes, make it a concern. If no, and the issue is only
+the lifetime of local state, make it a context manager. If the issue
+is only local phase work, inline it in `handle_batch`.
 
-- **Pure container operations.** `add` / `remove`, `put` / `get` —
-  individually meaningful, commutative-ish, no protocol.
-- **Constructor / destructor / CM enter / CM exit.** The order is
-  enforced by Python's object lifecycle. A `start()` / `stop()`
-  pair exposed as separate public methods *would* fail the test
-  and should be reshaped as a CM.
-- **Single-method APIs.** Trivially can't have ordering.
+Inlining phase work is what keeps a concern readable as one lifecycle:
+`handle_batch` should show the phase sequence and the meaningful work
+done at each phase. Helper methods are still fine for mechanics that
+do not carry phase semantics — small pure calculations, format
+conversion, validation predicates, or calls that wrap a single
+external API — but not for hiding most of a phase or reintroducing a
+call-order protocol inside the concern.
 
-The request-lifecycle design in §4.4 is the first concrete
-application: the alternative shape — separate `mark_inflight` /
-`unmark_inflight` methods — is a genuine 2-state automaton across
-batch phases. The design uses a `track_inflight` context manager
-instead, whose `__enter__` / `__exit__` halves are paired by
-syntax and impossible to mis-sequence.
-
-### 5.3 CM for state lifetime, concern for phase work
-
-§5.2's rule offers three coroutinization tools (a coroutine, an
-async / sync context manager, or an owner-controlled per-batch
-concern). The choice between *concern* and *context manager* isn't
-arbitrary — each fits a different shape, and conflating them
-either bloats the BATCH body with phantom concerns or buries
-real cross-phase work inside CMs that can't express it.
-
-The distinction:
-
-- **Concern** = a participant the BATCH body drives. Its
-  coroutine yields at each batch phase it cares about; the
-  BATCH body's `await resume(handle)` calls advance it. Right
-  shape when there is non-trivial *work* to do at multiple
-  phases, the work at each phase reads top-to-bottom, and the
-  thing can stand alone as a domain (forward, sample, schedule,
-  response).
-
-- **Context manager** = a tool a single owning coroutine uses to
-  bracket the lifetime of one piece of *state* across phases.
-  Entered by one coroutine (a concern, or the BATCH body
-  itself); the contained "..." is whatever the owning coroutine
-  does between entry and exit. Right shape when the thing
-  manages one piece of state with short setup and cleanup, the
-  state's lifetime is bounded by phases of one coroutine, and
-  no external work depends on this state being open at
-  specific intermediate phases.
-
-The two are not substitutes:
-
-- **A CM can't be a concern.** The BATCH body drives Concern
-  handles via `resume`; a CM can't yield at multiple phases
-  independently of its containing body. Forcing a CM into the
-  concern role means nesting it over the BATCH body's phase
-  blocks — inverting the orchestration so one would-be-concern
-  wraps every other concern's phase work.
-- **A concern can't replace some CMs.** State managed at phase
-  boundaries inside a single coroutine (a CUDA stream context,
-  a recorded NVTX range, the inflight set across SCHEDULE_0 –
-  RESPOND_8) doesn't need a Concern handle on the BATCH body's
-  roster. It needs `with` / `async with` inside the coroutine
-  that owns it.
-
-The boundary test: **does the BATCH body need to drive this thing
-through phases independently of its peers?** If yes (other
-concerns interleave with it at intermediate phases), it's a
-concern. If no (it's local to one body), it's a CM.
-
-Examples from this design:
-
-- `track_inflight(scheduled)` is a CM. The inflight set's
-  lifetime is owned by PpScheduleConcern alone; no other
-  concern's work depends on the set being open at intermediate
-  phases. (An alternative `InflightTrackingConcern` was
-  considered — it works, but it places a one-line phantom
-  concern on the BATCH body's roster solely to manage a set,
-  and loses the syntactic pairing.)
-- `RingBroadcastSampleConcern` is a concern. The BATCH body
-  drives it at SYNC_EVT_5 separately from HANDOFF_6, with the
-  scheduler running other batches' phases in between. The
-  work-at-each-phase is structurally interleavable; the
-  per-phase bodies are non-trivial.
-- `disable_hang_detect()` and `torch.cuda.stream(...)` are CMs.
-  Each manages runtime context for one block of code inside
-  one coroutine body.
-
-The same test applied across the existing concern set
-(ScheduleConcern, ResourceConcern, ForwardConcern,
-SampleConcern, StateAdvanceConcern, ResponseConcern,
-PpScheduleConcern, RingBroadcastSampleConcern) returns "concern"
-for every one. None of the eight is degenerate enough to be a
-CM. Future concerns from the planned set whose shape might
-*look* CM-ish at first glance (IterStatsConcern with its
-SCHEDULE_0 / FINALIZE_9 yields, PerfMetricConcern with its
-event-recording bookends) still fail the test: in each case
-the BATCH body interleaves other concerns with them at
-intermediate phases, so they must be drivable independently.
-
-### 5.4 The extension checklist
+### 5.3 The extension checklist
 
 The mechanical checks the design relies on stay green only if new
 work follows the rules. Most are catchable at PR review by grep:
 
-- `rg "\bctx\b" tensorrt_llm/_torch/pyexecutor/concerns/` should be
-  empty: a concern receives no `ctx`, so it can't reach peers or
-  ambient services — every dependency comes through `__init__`
-  (§4.4, §5.1).
+- Concern dependencies come through `__init__`; new ambient service
+  lookups or peer concern calls inside concern bodies should be
+  treated as design violations (§4.4, §5.1).
 - `python scripts/generate_coroutine_views.py --check` must pass
   (`BatchStorage` field metadata is the single source of truth for
   views).
@@ -1503,11 +1519,13 @@ work follows the rules. Most are catchable at PR review by grep:
   cross-batch state is always service-owned.
 - Concerns are coroutines, even single-phase ones, so NVTX tracing
   and stack-uniformity hold (§4.4).
-- **Sequence-coupled methods on a class** (method B requires method
-  A to have been called first; calling out of order silently
-  corrupts) are coroutines / context managers in disguise. Express
-  the pair as a CM or extract into a per-batch concern; do not
-  expose two methods that must be paired by convention (§5.2, §5.3).
+- Automaton-like method sequences (method B requires method A first;
+  calling out of order silently corrupts) should use one of the
+  organizing shapes in §5.2 rather than exposing a hidden public
+  protocol.
+- Do not split phase bodies into private helpers just to shorten
+  `handle_batch`; the concern lifecycle should remain readable from
+  that method (§5.2).
 
 ---
 
@@ -1570,19 +1588,21 @@ The prototype passed `ctx` into every `handle_batch`, so a concern
 reached its services as `ctx.svc.*` / `ctx.io.*`. It works, but it
 makes a concern's dependency surface ambient and invisible: you
 read the body to discover what it touches, it can reach *any*
-service whether it needs it or not, and — had the `Concerns` bag
-been on `ctx` — it could call peers via `ctx.crn.X`. The design
-withholds `ctx` from concerns entirely and injects each
-dependency through `__init__` (§4.4): the surface becomes the
-constructor signature, least privilege holds, and peer access is
-structurally impossible.
+service whether it needs it or not, and because the design's `ctx`
+contains the orchestrator-only `Concerns` bag, passing it to concerns
+would also reopen peer calls via `ctx.crn.X`. The design withholds
+`ctx` from concerns entirely and injects each dependency through
+`__init__` (§4.4): the surface becomes the constructor signature,
+least privilege holds, and peer access is structurally impossible.
 
 ---
 
 ## 7. File layout
 
-LoC counts are snapshots of the prototype tree. The files split
-into two tiers with very different maturity — see the introduction.
+This section is a prototype snapshot, not the source of truth for the
+design. LoC counts include inline docstring lines, and paths may move
+as the executor layer is reimplemented. The files split into two tiers
+with very different maturity — see the introduction.
 
 **Runtime + tooling — feature-complete and exhaustively tested.**
 This is the foundation; its shape is backed by the prototype
@@ -1602,7 +1622,7 @@ the remaining concerns land.
 | Path | LoC | Role |
 |---|---|---|
 | `tensorrt_llm/_torch/pyexecutor/batch_storage.py` | 1029 | Data model: `BatchPhase`, `BatchStorage`, generated views + overloads |
-| `tensorrt_llm/_torch/pyexecutor/context.py` | 553 | `Context` (incl. the `Concerns` bag), `Service`, `Configuration`, and the cross-thread boundary services. (Prototype still has a `PersistentState`; the design drops it and the prototype keeps `Concerns` as a separate arg — see §6.) |
+| `tensorrt_llm/_torch/pyexecutor/context.py` | 553 | Prototype context/service definitions and boundary-service experiments; the design rules are the ones in §4.1, §4.4, and §5.1. |
 | `tensorrt_llm/_torch/pyexecutor/py_executor_coro.py` | 1570 | `PyExecutorCoro`, `scheduler_iter_{plain,overlap,pp}`, `batch_body`, `profiler` |
 | `tensorrt_llm/_torch/pyexecutor/pp_helpers.py` | 575 | PP comm helpers shared between legacy and coro paths |
 | `tensorrt_llm/_torch/pyexecutor/concerns/*.py` | - | Concerns definition |
@@ -1626,7 +1646,7 @@ payoffs:
 ### 8.1 Validation status
 
 **The runtime is exhaustively tested.**
-[`tests/unittest/_torch/executor/test_coroutines.py`](tests/unittest/_torch/executor/test_coroutines.py)
+`test_coroutines.py`
 exercises the generic mechanics against a test-local `_TestPhase`
 and `_TestStorage`: step comparison logic, strict progression at the
 suspension point, two-branch shared step, voluntary opt-out via
@@ -1643,10 +1663,9 @@ in the same file imports the concrete `BatchPhase` / `BatchStorage`
 and asserts the generated view block matches the field metadata
 (the generator's `--check` invariant).
 
-**The executor prototype is validated end-to-end at single rank,
-as a design proof.**
-[`tests/unittest/_torch/executor/test_py_executor_coro_sanity.py`](tests/unittest/_torch/executor/test_py_executor_coro_sanity.py)
-drives the plain and overlap loops end-to-end. That is enough to
+**The executor prototype is validated end-to-end as a design proof.**
+`test_py_executor_coro_sanity.py`
+drives the three loops end-to-end. That is enough to
 demonstrate the design holds together — concerns, services,
 `BatchStorage` dataflow, and the scheduler-iter shape all compose
 and produce correct output. It is **not** a production test bar:
@@ -1654,13 +1673,29 @@ the prototype's executor code is reference-grade, and the
 reimplementation is where production-quality coverage (parity
 suites below, multi-rank, multi-feature) gets built out.
 
-Behavioral-parity suites still to be wired against the new
-executor (these guard the reimplementation, not the prototype):
+### 8.2 Native concerns after migration
 
-- `test_overlap_scheduler.py` — overlap / non-overlap behavioral
-  parity.
-- `test_disaggregated_serving.py`,
-  `test_dwdp_disaggregated_serving.py` — gated on the disagg /
-  `DwdpConcern` work landing.
-- `tests/unittest/disaggregated/` — KV-transfer / connector coverage,
-  gated similarly.
+The first migration can wrap existing owner classes (`model_engine`,
+`sampler`, `scheduler`, `drafter`, `kv_cache_transceiver`, …) inside
+concern classes so the loop shape changes without rewriting every
+domain object at once. After the migration is stable, some of those
+owner classes should be reconsidered as **native concerns** rather
+than long-lived helpers called by a concern wrapper.
+
+Take `Sampler` as example. Today `update_requests` must be
+called with state generated by `sample_async`, which is the smell from
+§5.2: two public methods form an automaton, and calling them out of
+order would corrupt the request lifecycle. A native `SampleConcern`
+can express that sequence as one coroutine: launch sampling at
+`SAMPLE_3`, keep private intermediate state in coroutine locals, then
+apply tokens at `APPLY_7`. Only data that other concerns or the
+scheduler need should be published to `BatchStorage`; state used only
+by the later `update_requests` step does not need to be packed into a
+public dataclass just to survive across phases.
+
+This is a post-migration cleanup, not a prerequisite for the first
+cutover. The migration should first establish the scheduler / batch /
+concern structure around existing collaborators; then we can collapse
+automaton-shaped collaborators into native concerns where doing so
+removes artificial state containers and makes the lifecycle easier to
+read.
