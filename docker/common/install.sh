@@ -15,6 +15,7 @@ cuda_libs=0
 polygraphy=0
 mpi4py=0
 pytorch=0
+openmpi_patch=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -50,6 +51,10 @@ while [[ $# -gt 0 ]]; do
             pytorch=1
             shift 1
             ;;
+        --openmpi_patch)
+            openmpi_patch=1
+            shift 1
+            ;;
         --all)
             base=1
             cmake=1
@@ -59,6 +64,7 @@ while [[ $# -gt 0 ]]; do
             polygraphy=1
             mpi4py=1
             pytorch=1
+            openmpi_patch=1
             shift 1
             ;;
         *)
@@ -114,4 +120,9 @@ fi
 if [ $pytorch -eq 1 ]; then
     echo "Installing PyTorch..."
     bash $SCRIPT_DIR/install_pytorch.sh $TORCH_INSTALL_TYPE
+fi
+
+if [ $openmpi_patch -eq 1 ]; then
+    echo "Patching OpenMPI singleton spawn buffer..."
+    bash $SCRIPT_DIR/install_openmpi_singleton_patch.sh
 fi
