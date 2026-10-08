@@ -303,10 +303,6 @@ function(setup_cuda_architectures)
     else()
       message(STATUS "Detecting native CUDA compute capability - done")
       set(CMAKE_CUDA_ARCHITECTURES_RAW "${CUDA_ARCH_OUTPUT}")
-      # SM 121 runs the kernels built for SM 120.
-      if(CMAKE_CUDA_ARCHITECTURES_RAW STREQUAL "121")
-        set(CMAKE_CUDA_ARCHITECTURES_RAW 120)
-      endif()
     endif()
   elseif(CMAKE_CUDA_ARCHITECTURES_RAW STREQUAL "all")
     unset(CMAKE_CUDA_ARCHITECTURES_RAW)
@@ -363,7 +359,8 @@ function(setup_cuda_architectures)
       100
       103
       107
-      120)
+      120
+      121)
   foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES_RAW)
     if(NOT CUDA_ARCH IN_LIST ARCHITECTURES_WITH_KERNELS)
       list(JOIN ARCHITECTURES_WITH_KERNELS ";" SUPPORTED_ARCHITECTURES)
